@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	pathpkg "path"
@@ -113,13 +114,25 @@ func (r Repo) PrepareWorkspace(ctx context.Context, target model.Target) (Worksp
 	if !target.Dirty && currentHead == target.HeadSHA {
 		return Workspace{Root: r.Root, repository: r}, nil
 	}
+	return r.createTemporaryWorkspace(ctx, target.HeadSHA)
+}
 
+// PrepareDisposableWorkspace always creates a detached worktree. Checks can
+// modify or delete files there without mutating the user's checkout.
+func (r Repo) PrepareDisposableWorkspace(ctx context.Context, target model.Target) (Workspace, error) {
+	if target.Mode == "uncommitted" {
+		return Workspace{}, errors.New("disposable checks require a committed target")
+	}
+	return r.createTemporaryWorkspace(ctx, target.HeadSHA)
+}
+
+func (r Repo) createTemporaryWorkspace(ctx context.Context, headSHA string) (Workspace, error) {
 	parent, err := os.MkdirTemp("", "cora-review-")
 	if err != nil {
 		return Workspace{}, fmt.Errorf("create temporary review directory: %w", err)
 	}
 	worktree := filepath.Join(parent, "worktree")
-	if _, err := gitBytes(ctx, r.Root, "worktree", "add", "--detach", worktree, target.HeadSHA); err != nil {
+	if _, err := gitBytes(ctx, r.Root, "worktree", "add", "--detach", worktree, headSHA); err != nil {
 		_ = os.RemoveAll(parent)
 		return Workspace{}, fmt.Errorf("create temporary review worktree: %w", err)
 	}
@@ -298,6 +311,56 @@ func (r Repo) DetectBase(ctx context.Context) (string, error) {
 		}
 	}
 	return "", errors.New("could not detect a base branch; pass --base or configure base")
+}
+
+// StableIdentity returns a credential-free remote identity such as
+// github.com/owner/repository. Repositories without a remote fall back to a
+// root-commit identity that remains stable across clones of the same history.
+func (r Repo) StableIdentity(ctx context.Context) (string, error) {
+	for _, remote := range []string{"origin", "upstream"} {
+		value, err := gitOutput(ctx, r.Root, "config", "--get", "remote."+remote+".url")
+		if err == nil && strings.TrimSpace(value) != "" {
+			if identity := normalizeRemoteIdentity(value); identity != "" {
+				return identity, nil
+			}
+		}
+	}
+	roots, err := gitOutput(ctx, r.Root, "rev-list", "--max-parents=0", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("resolve repository identity: %w", err)
+	}
+	root := strings.Fields(roots)
+	if len(root) == 0 {
+		return "", errors.New("resolve repository identity: repository has no root commit")
+	}
+	sort.Strings(root)
+	return "git:" + root[0], nil
+}
+
+func normalizeRemoteIdentity(remote string) string {
+	remote = strings.TrimSpace(remote)
+	if at := strings.LastIndex(remote, "@"); at >= 0 && !strings.Contains(remote[:at], "://") {
+		if colon := strings.Index(remote[at+1:], ":"); colon >= 0 {
+			host := remote[at+1 : at+1+colon]
+			path := remote[at+1+colon+1:]
+			return cleanRemoteIdentity(host, path)
+		}
+	}
+	parsed, err := url.Parse(remote)
+	if err == nil && parsed.Hostname() != "" {
+		return cleanRemoteIdentity(parsed.Hostname(), parsed.Path)
+	}
+	return ""
+}
+
+func cleanRemoteIdentity(host, repositoryPath string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	repositoryPath = strings.Trim(strings.TrimSpace(repositoryPath), "/")
+	repositoryPath = strings.TrimSuffix(repositoryPath, ".git")
+	if host == "" || repositoryPath == "" || strings.Contains(repositoryPath, "..") {
+		return ""
+	}
+	return host + "/" + repositoryPath
 }
 
 func (r Repo) ResolveRevision(ctx context.Context, revision string) (string, error) {

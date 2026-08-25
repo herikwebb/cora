@@ -29,11 +29,12 @@ func (d Duration) MarshalText() ([]byte, error) {
 }
 
 type Reviewer struct {
-	Enabled  bool   `toml:"enabled"`
-	Command  string `toml:"command"`
-	Model    string `toml:"model"`
-	Effort   string `toml:"effort"`
-	MaxTurns int    `toml:"max_turns"`
+	Enabled        bool   `toml:"enabled"`
+	Command        string `toml:"command"`
+	Model          string `toml:"model"`
+	Effort         string `toml:"effort"`
+	MaxTurns       int    `toml:"max_turns"`
+	MaxConcurrency int    `toml:"max_concurrency"`
 }
 
 type Reviewers struct {
@@ -46,30 +47,38 @@ type Check struct {
 	Command      []string `toml:"command"`
 	Timeout      Duration `toml:"timeout"`
 	EnvAllowlist []string `toml:"env_allowlist"`
+	Profile      string   `toml:"-"`
+}
+
+type ValidationProfile struct {
+	Name   string  `toml:"name"`
+	Checks []Check `toml:"checks"`
 }
 
 type Escalation struct {
-	Enabled                bool     `toml:"enabled"`
-	Model                  string   `toml:"model"`
-	Effort                 string   `toml:"effort"`
-	SecurityPathMarkers    []string `toml:"security_path_markers"`
-	ForceSecuritySensitive bool     `toml:"-"`
+	Enabled                 bool     `toml:"enabled"`
+	Model                   string   `toml:"model"`
+	Effort                  string   `toml:"effort"`
+	SecurityPathMarkers     []string `toml:"security_path_markers"`
+	ForceSecuritySensitive  bool     `toml:"-"`
+	AdjudicateDisagreements bool     `toml:"adjudicate_disagreements"`
 }
 
 type Config struct {
-	Base               string     `toml:"base"`
-	ReviewerTimeout    Duration   `toml:"reviewer_timeout"`
-	OverallTimeout     Duration   `toml:"overall_timeout"`
-	RequireCleanTree   bool       `toml:"require_clean_tree"`
-	AllowAPIBilling    bool       `toml:"allow_api_billing"`
-	AllowUnsafeChecks  bool       `toml:"allow_unsafe_host_checks"`
-	MinimumApprovals   int        `toml:"minimum_approvals"`
-	BlockingSeverities []string   `toml:"blocking_severities"`
-	PromptFile         string     `toml:"prompt_file"`
-	Reviewers          Reviewers  `toml:"reviewers"`
-	Escalation         Escalation `toml:"escalation"`
-	Checks             []Check    `toml:"checks"`
-	LoadedFiles        []string   `toml:"-"`
+	Base               string              `toml:"base"`
+	ReviewerTimeout    Duration            `toml:"reviewer_timeout"`
+	OverallTimeout     Duration            `toml:"overall_timeout"`
+	RequireCleanTree   bool                `toml:"require_clean_tree"`
+	AllowAPIBilling    bool                `toml:"allow_api_billing"`
+	AllowUnsafeChecks  bool                `toml:"allow_unsafe_host_checks"`
+	MinimumApprovals   int                 `toml:"minimum_approvals"`
+	BlockingSeverities []string            `toml:"blocking_severities"`
+	PromptFile         string              `toml:"prompt_file"`
+	Reviewers          Reviewers           `toml:"reviewers"`
+	Escalation         Escalation          `toml:"escalation"`
+	Checks             []Check             `toml:"checks"`
+	ValidationProfiles []ValidationProfile `toml:"validation_profiles"`
+	LoadedFiles        []string            `toml:"-"`
 }
 
 func Defaults() Config {
@@ -84,23 +93,26 @@ func Defaults() Config {
 		},
 		Reviewers: Reviewers{
 			Codex: Reviewer{
-				Enabled: true,
-				Command: "codex",
-				Model:   "gpt-5.6",
-				Effort:  "high",
+				Enabled:        true,
+				Command:        "codex",
+				Model:          "gpt-5.6",
+				Effort:         "high",
+				MaxConcurrency: 2,
 			},
 			Claude: Reviewer{
-				Enabled:  true,
-				Command:  "claude",
-				Model:    "opus",
-				Effort:   "high",
-				MaxTurns: 50,
+				Enabled:        true,
+				Command:        "claude",
+				Model:          "opus",
+				Effort:         "high",
+				MaxTurns:       50,
+				MaxConcurrency: 1,
 			},
 		},
 		Escalation: Escalation{
-			Enabled: true,
-			Model:   "fable",
-			Effort:  "high",
+			Enabled:                 true,
+			Model:                   "fable",
+			Effort:                  "high",
+			AdjudicateDisagreements: true,
 			SecurityPathMarkers: []string{
 				"/.cora/", "/.codex/", "/.claude/", "/.github/workflows/",
 				"/auth/", "/authentication/", "/authorization/", "/security/",
@@ -199,6 +211,14 @@ func finalize(cfg Config) (Config, error) {
 			cfg.Checks[i].Timeout.Duration = 10 * time.Minute
 		}
 	}
+	for profileIndex := range cfg.ValidationProfiles {
+		for checkIndex := range cfg.ValidationProfiles[profileIndex].Checks {
+			check := &cfg.ValidationProfiles[profileIndex].Checks[checkIndex]
+			if check.Timeout.Duration == 0 {
+				check.Timeout.Duration = 10 * time.Minute
+			}
+		}
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -234,6 +254,12 @@ func (c Config) Validate() error {
 	if c.Reviewers.Claude.MaxTurns < 1 {
 		return errors.New("reviewers.claude.max_turns must be positive")
 	}
+	if c.Reviewers.Codex.Enabled && c.Reviewers.Codex.MaxConcurrency < 1 {
+		return errors.New("reviewers.codex.max_concurrency must be positive")
+	}
+	if c.Reviewers.Claude.Enabled && c.Reviewers.Claude.MaxConcurrency < 1 {
+		return errors.New("reviewers.claude.max_concurrency must be positive")
+	}
 	if err := validateEffort("reviewers.codex.effort", c.Reviewers.Codex.Effort, true); err != nil {
 		return err
 	}
@@ -253,31 +279,92 @@ func (c Config) Validate() error {
 	}
 	checkNames := make(map[string]bool, len(c.Checks))
 	for i, check := range c.Checks {
-		if strings.TrimSpace(check.Name) == "" {
-			return fmt.Errorf("checks[%d].name cannot be empty", i)
-		}
-		if len(check.Command) == 0 || strings.TrimSpace(check.Command[0]) == "" {
-			return fmt.Errorf("checks[%d].command cannot be empty", i)
-		}
-		if check.Timeout.Duration <= 0 {
-			return fmt.Errorf("checks[%d].timeout must be positive", i)
+		if err := validateCheck(check, fmt.Sprintf("checks[%d]", i)); err != nil {
+			return err
 		}
 		if checkNames[check.Name] {
 			return fmt.Errorf("checks[%d].name duplicates %q", i, check.Name)
 		}
-		environmentNames := make(map[string]bool, len(check.EnvAllowlist))
-		for _, name := range check.EnvAllowlist {
-			if !validEnvironmentName(name) {
-				return fmt.Errorf("checks[%d].env_allowlist contains invalid environment variable %q", i, name)
-			}
-			if environmentNames[name] {
-				return fmt.Errorf("checks[%d].env_allowlist duplicates %q", i, name)
-			}
-			environmentNames[name] = true
-		}
 		checkNames[check.Name] = true
 	}
+	profileNames := make(map[string]bool, len(c.ValidationProfiles))
+	for profileIndex, profile := range c.ValidationProfiles {
+		if strings.TrimSpace(profile.Name) == "" {
+			return fmt.Errorf("validation_profiles[%d].name cannot be empty", profileIndex)
+		}
+		if profileNames[profile.Name] {
+			return fmt.Errorf("validation_profiles[%d].name duplicates %q", profileIndex, profile.Name)
+		}
+		if len(profile.Checks) == 0 {
+			return fmt.Errorf("validation_profiles[%d].checks cannot be empty", profileIndex)
+		}
+		for checkIndex, check := range profile.Checks {
+			if err := validateCheck(check, fmt.Sprintf("validation_profiles[%d].checks[%d]", profileIndex, checkIndex)); err != nil {
+				return err
+			}
+		}
+		profileNames[profile.Name] = true
+	}
 	return nil
+}
+
+func validateCheck(check Check, location string) error {
+	if strings.TrimSpace(check.Name) == "" {
+		return fmt.Errorf("%s.name cannot be empty", location)
+	}
+	if len(check.Command) == 0 || strings.TrimSpace(check.Command[0]) == "" {
+		return fmt.Errorf("%s.command cannot be empty", location)
+	}
+	if check.Timeout.Duration <= 0 {
+		return fmt.Errorf("%s.timeout must be positive", location)
+	}
+	environmentNames := make(map[string]bool, len(check.EnvAllowlist))
+	for _, name := range check.EnvAllowlist {
+		if !validEnvironmentName(name) {
+			return fmt.Errorf("%s.env_allowlist contains invalid environment variable %q", location, name)
+		}
+		if environmentNames[name] {
+			return fmt.Errorf("%s.env_allowlist duplicates %q", location, name)
+		}
+		environmentNames[name] = true
+	}
+	return nil
+}
+
+// ApplyProfiles appends trusted named validation profiles. Built-in profiles
+// remain available when a repository has no .cora/config.toml.
+func ApplyProfiles(cfg Config, names []string) (Config, error) {
+	profiles := map[string]ValidationProfile{
+		"go": {
+			Name: "go",
+			Checks: []Check{
+				{Name: "go-test", Command: []string{"go", "test", "./..."}, Timeout: Duration{Duration: 15 * time.Minute}},
+				{Name: "go-vet", Command: []string{"go", "vet", "./..."}, Timeout: Duration{Duration: 10 * time.Minute}},
+			},
+		},
+	}
+	for _, profile := range cfg.ValidationProfiles {
+		profiles[profile.Name] = profile
+	}
+	seenChecks := make(map[string]bool, len(cfg.Checks))
+	for _, check := range cfg.Checks {
+		seenChecks[check.Name] = true
+	}
+	for _, name := range names {
+		profile, found := profiles[name]
+		if !found {
+			return Config{}, fmt.Errorf("unknown validation profile %q", name)
+		}
+		for _, check := range profile.Checks {
+			if seenChecks[check.Name] {
+				continue
+			}
+			check.Profile = profile.Name
+			cfg.Checks = append(cfg.Checks, check)
+			seenChecks[check.Name] = true
+		}
+	}
+	return finalize(cfg)
 }
 
 func validateEffort(name, effort string, allowMinimal bool) error {

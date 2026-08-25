@@ -145,3 +145,15 @@ func writeGitFile(t *testing.T, path, contents string) {
 		t.Fatal(err)
 	}
 }
+
+func TestNormalizeRemoteIdentityRemovesCredentialsAndGitSuffix(t *testing.T) {
+	tests := map[string]string{
+		"git@github.com:herikwebb/cora.git":                 "github.com/herikwebb/cora",
+		"https://token@github.com/herikwebb/cora.git?x=one": "github.com/herikwebb/cora",
+	}
+	for remote, want := range tests {
+		if got := normalizeRemoteIdentity(remote); got != want {
+			t.Errorf("normalizeRemoteIdentity(%q) = %q, want %q", remote, got, want)
+		}
+	}
+}

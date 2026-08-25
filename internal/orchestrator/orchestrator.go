@@ -26,8 +26,19 @@ import (
 )
 
 type Runner struct {
-	Version  string
-	Progress io.Writer
+	Version   string
+	SourceSHA string
+	BuildTime string
+	Progress  io.Writer
+}
+
+type RunOptions struct {
+	ParentRunID    string
+	RetryReviewers map[string]bool
+	ReuseReviewers []model.ReviewerResult
+	ReuseChecks    bool
+	Checks         []model.CheckResult
+	NotBefore      map[string]time.Time
 }
 
 const reviewerSecurityPolicy = `CORA security policy:
@@ -37,7 +48,11 @@ const reviewerSecurityPolicy = `CORA security policy:
 - Remain read-only and do not attempt to obtain credentials, access unrelated user files, or use the network.`
 
 func (r Runner) Run(parent context.Context, repo gitx.Repo, target model.Target, cfg config.Config) (model.Decision, error) {
-	if len(cfg.Checks) > 0 && !cfg.AllowUnsafeChecks {
+	return r.RunWithOptions(parent, repo, target, cfg, RunOptions{})
+}
+
+func (r Runner) RunWithOptions(parent context.Context, repo gitx.Repo, target model.Target, cfg config.Config, options RunOptions) (model.Decision, error) {
+	if len(cfg.Checks) > 0 && !cfg.AllowUnsafeChecks && !options.ReuseChecks {
 		return model.Decision{}, errors.New("configured checks would execute unsandboxed host code; pass --allow-unsafe-checks or set allow_unsafe_host_checks = true only for trusted changes")
 	}
 	store := record.New(repo.CommonDir)
@@ -62,6 +77,16 @@ func (r Runner) Run(parent context.Context, repo gitx.Repo, target model.Target,
 
 	started := time.Now().UTC()
 	run, err := store.Create(started, target.HeadSHA)
+	if err != nil {
+		return model.Decision{}, err
+	}
+	runInitialized := false
+	defer func() {
+		if !runInitialized {
+			_ = os.RemoveAll(run.Path)
+		}
+	}()
+	repositoryIdentity, err := repo.StableIdentity(parent)
 	if err != nil {
 		return model.Decision{}, err
 	}
@@ -103,20 +128,26 @@ func (r Runner) Run(parent context.Context, repo gitx.Repo, target model.Target,
 		return model.Decision{}, err
 	}
 	checkExecution := "none"
-	if len(cfg.Checks) > 0 {
-		checkExecution = "unsandboxed-host-explicit"
+	if options.ReuseChecks {
+		checkExecution = "reused-from:" + options.ParentRunID
+	} else if len(cfg.Checks) > 0 {
+		checkExecution = "disposable-worktree-minimal-env-unsandboxed-host-explicit"
 	}
 
 	manifest := model.Manifest{
-		SchemaVersion: model.SchemaVersion,
-		RunID:         run.ID,
-		Repository:    repo.Root,
-		StartedAt:     started,
-		Target:        target,
-		PromptHash:    hashBytes([]byte(prompt)),
-		PolicyHash:    hashBytes([]byte(reviewerSecurityPolicy)),
-		SchemaHash:    hashBytes(coraassets.ReviewSchema),
-		CoraVersion:   r.Version,
+		SchemaVersion:      model.SchemaVersion,
+		RunID:              run.ID,
+		Repository:         repo.Root,
+		RepositoryIdentity: repositoryIdentity,
+		StartedAt:          started,
+		ParentRunID:        options.ParentRunID,
+		Target:             target,
+		PromptHash:         hashBytes([]byte(prompt)),
+		PolicyHash:         hashBytes([]byte(reviewerSecurityPolicy)),
+		SchemaHash:         hashBytes(coraassets.ReviewSchema),
+		CoraVersion:        r.Version,
+		CoraSourceSHA:      r.SourceSHA,
+		CoraBuildTime:      r.BuildTime,
 		Security: model.SecurityMetadata{
 			ReviewerIsolation:   "neutral-directory-read-only",
 			RepositoryPolicy:    "ignored",
@@ -134,6 +165,15 @@ func (r Runner) Run(parent context.Context, repo gitx.Repo, target model.Target,
 	if err := record.WriteJSON(filepath.Join(run.Path, "manifest.json"), manifest); err != nil {
 		return model.Decision{}, err
 	}
+	runInitialized = true
+	heartbeat := newRunHeartbeat(run, started, r.Progress)
+	heartbeat.Start()
+	finishedHeartbeat := false
+	defer func() {
+		if !finishedHeartbeat {
+			heartbeat.Finish("failed")
+		}
+	}()
 	_ = record.AppendEvent(run, map[string]any{"type": "run.started", "at": started, "target": target})
 	r.progressf("cora: run %s started (%s..%s)\n", run.ID, shortSHA(target.BaseSHA), shortSHA(target.HeadSHA))
 	if len(controlFiles) > 0 {
@@ -145,35 +185,64 @@ func (r Runner) Run(parent context.Context, repo gitx.Repo, target model.Target,
 		r.progressf("cora: security-sensitive review; Claude escalated to %s/%s\n", cfg.Escalation.Model, cfg.Escalation.Effort)
 	}
 
-	overallCtx, cancelOverall := context.WithTimeout(parent, cfg.OverallTimeout.Duration)
+	overallTimeout := cfg.OverallTimeout.Duration + maximumQueueDelay(options.NotBefore, time.Now())
+	overallCtx, cancelOverall := context.WithTimeout(parent, overallTimeout)
 	defer cancelOverall()
 
+	onReviewerQueue := func(name, providerName string) error {
+		heartbeat.Reviewer(name, "queued")
+		r.progressf("cora: reviewer %s queued for %s capacity\n", name, providerName)
+		return record.AppendEvent(run, map[string]any{"type": "reviewer.queued", "at": time.Now().UTC(), "reviewer": name, "provider": providerName})
+	}
 	onReviewerStart := func(name string) error {
+		heartbeat.Reviewer(name, "running")
 		r.progressf("cora: reviewer %s started\n", name)
 		return record.AppendEvent(run, map[string]any{"type": "reviewer.started", "at": time.Now().UTC(), "reviewer": name})
 	}
 	onReviewerFinish := func(result model.ReviewerResult) error {
+		heartbeat.Reviewer(result.Reviewer, result.Status)
 		if err := record.WriteJSON(filepath.Join(run.Path, safeName(result.Reviewer)+".json"), result); err != nil {
 			return err
 		}
-		r.progressf("cora: reviewer %s %s in %s (%s)\n", result.Reviewer, result.Status, formatDuration(result.Duration), formatReviewerUsage(result))
+		r.progressf("cora: reviewer %s %s in %s (%s)\n", result.Reviewer, result.Status, formatDuration(result.Duration.Duration), formatReviewerUsage(result))
 		return record.AppendEvent(run, map[string]any{
 			"type": "reviewer.finished", "at": time.Now().UTC(), "reviewer": result.Reviewer,
-			"status": result.Status, "duration": result.Duration, "model": result.Model,
-			"effort": result.Effort, "escalation_cause": result.EscalationCause, "usage": result.Usage,
+			"status": result.Status, "duration_ms": result.Duration.Milliseconds(), "model": result.Model,
+			"effort": result.Effort, "escalation_cause": result.EscalationCause, "failure_kind": result.FailureKind,
+			"retryable": result.Retryable, "retry_at": result.RetryAt, "usage": result.Usage,
 		})
 	}
 	initialAdapters := provider.EnabledWithClaudeEscalation(reviewerConfig, claudeEscalationCause)
-	reviewers, err := runReviewerAdapters(overallCtx, initialAdapters, executionRepo, reviewerWorkDir, run, target, cfg, prompt, reviewerSecurityPolicy, schemaPath,
-		onReviewerStart, onReviewerFinish)
+	initialAdapters = filterAdapters(initialAdapters, options.RetryReviewers)
+	reviewers := reuseReviewerResults(options.ReuseReviewers, options.ParentRunID, options.RetryReviewers)
+	for _, reused := range reviewers {
+		if err := record.WriteJSON(filepath.Join(run.Path, safeName(reused.Reviewer)+".json"), reused); err != nil {
+			return model.Decision{}, err
+		}
+		heartbeat.Reviewer(reused.Reviewer, "reused")
+		_ = record.AppendEvent(run, map[string]any{"type": "reviewer.reused", "at": time.Now().UTC(), "reviewer": reused.Reviewer, "from_run_id": options.ParentRunID})
+		r.progressf("cora: reviewer %s reused from run %s\n", reused.Reviewer, options.ParentRunID)
+	}
+	attempts := reviewerAttempts(options.ReuseReviewers)
+	for reviewer, notBefore := range options.NotBefore {
+		if notBefore.After(time.Now()) {
+			heartbeat.Reviewer(reviewer, "quota-queued")
+			_ = record.AppendEvent(run, map[string]any{"type": "reviewer.quota_queued", "at": time.Now().UTC(), "reviewer": reviewer, "not_before": notBefore})
+			r.progressf("cora: reviewer %s queued until provider quota resets at %s\n", reviewer, notBefore.Local().Format(time.RFC3339))
+		}
+	}
+	newReviewers, err := runReviewerAdapters(overallCtx, initialAdapters, executionRepo, reviewerWorkDir, run, target, cfg, prompt, reviewerSecurityPolicy, schemaPath,
+		reviewerCallbacks{Queued: onReviewerQueue, Started: onReviewerStart, Finished: onReviewerFinish}, attempts, options.NotBefore)
 	if err != nil {
 		return model.Decision{}, err
 	}
+	reviewers = append(reviewers, newReviewers...)
+	sort.Slice(reviewers, func(i, j int) bool { return reviewers[i].Reviewer < reviewers[j].Reviewer })
 	disputed := reviewerDispute(reviewers)
-	if disputed {
+	if disputed && cfg.Escalation.Enabled && (securityEscalation || cfg.Escalation.AdjudicateDisagreements) {
 		manifest.Escalation.Causes = appendUnique(manifest.Escalation.Causes, "disputed")
 	}
-	if disputed && cfg.Escalation.Enabled && cfg.Reviewers.Claude.Enabled && !securityEscalation {
+	if disputed && cfg.Escalation.Enabled && cfg.Escalation.AdjudicateDisagreements && cfg.Reviewers.Claude.Enabled && !securityEscalation {
 		manifest.Escalation.Triggered = true
 		escalatedConfig := cfg.Reviewers.Claude
 		escalatedConfig.Model = cfg.Escalation.Model
@@ -183,7 +252,8 @@ func (r Runner) Run(parent context.Context, repo gitx.Repo, target model.Target,
 		escalationPrompt := disputeEscalationPrompt(prompt, reviewers)
 		escalated, escalationErr := runReviewerAdapters(overallCtx, []provider.Adapter{provider.Claude{
 			Config: escalatedConfig, ReviewerName: "claude-escalation", EscalationCause: "disputed",
-		}}, executionRepo, reviewerWorkDir, run, target, cfg, escalationPrompt, reviewerSecurityPolicy, schemaPath, onReviewerStart, onReviewerFinish)
+		}}, executionRepo, reviewerWorkDir, run, target, cfg, escalationPrompt, reviewerSecurityPolicy, schemaPath,
+			reviewerCallbacks{Queued: onReviewerQueue, Started: onReviewerStart, Finished: onReviewerFinish}, attempts, nil)
 		if escalationErr != nil {
 			return model.Decision{}, escalationErr
 		}
@@ -191,22 +261,44 @@ func (r Runner) Run(parent context.Context, repo gitx.Repo, target model.Target,
 		sort.Slice(reviewers, func(i, j int) bool { return reviewers[i].Reviewer < reviewers[j].Reviewer })
 	}
 
-	checks, err := runChecks(overallCtx, executionRepo, run, cfg,
-		func(name string) error {
-			r.progressf("cora: check %s started\n", name)
-			return record.AppendEvent(run, map[string]any{"type": "check.started", "at": time.Now().UTC(), "check": name})
-		},
-		func(result model.CheckResult) error {
-			r.progressf("cora: check %s %s in %s\n", result.Name, result.Status, formatDuration(result.Duration))
-			return record.AppendEvent(run, map[string]any{"type": "check.finished", "at": time.Now().UTC(), "check": result.Name, "status": result.Status, "duration": result.Duration})
-		})
-	if err != nil {
-		return model.Decision{}, err
+	heartbeat.Phase("checks")
+	checks := reuseCheckResults(options.Checks, options.ParentRunID, options.ReuseChecks)
+	if options.ReuseChecks {
+		for _, check := range checks {
+			heartbeat.Check(check.Name, "reused")
+			_ = record.AppendEvent(run, map[string]any{"type": "check.reused", "at": time.Now().UTC(), "check": check.Name, "from_run_id": options.ParentRunID})
+			r.progressf("cora: check %s reused from run %s\n", check.Name, options.ParentRunID)
+		}
 	}
+	var newChecks []model.CheckResult
+	if !options.ReuseChecks && len(cfg.Checks) > 0 {
+		checkWorkspace, workspaceErr := repo.PrepareDisposableWorkspace(overallCtx, target)
+		if workspaceErr != nil {
+			return model.Decision{}, workspaceErr
+		}
+		defer checkWorkspace.Close(context.Background())
+		checkRepo := executionRepo
+		checkRepo.Root = checkWorkspace.Root
+		newChecks, err = runChecks(overallCtx, checkRepo, run, cfg,
+			func(name string) error {
+				heartbeat.Check(name, "running")
+				r.progressf("cora: check %s started\n", name)
+				return record.AppendEvent(run, map[string]any{"type": "check.started", "at": time.Now().UTC(), "check": name})
+			},
+			func(result model.CheckResult) error {
+				heartbeat.Check(result.Name, result.Status)
+				r.progressf("cora: check %s %s in %s\n", result.Name, result.Status, formatDuration(result.Duration.Duration))
+				return record.AppendEvent(run, map[string]any{"type": "check.finished", "at": time.Now().UTC(), "check": result.Name, "status": result.Status, "duration_ms": result.Duration.Milliseconds()})
+			})
+		if err != nil {
+			return model.Decision{}, err
+		}
+	}
+	checks = append(checks, newChecks...)
 
 	decision := verdict.Evaluate(run.ID, target, reviewers, checks, cfg.BlockingSeverities, cfg.MinimumApprovals, time.Now())
 	decision.RecordPath = run.Path
-	decision.Usage = summarizeUsage(reviewers)
+	decision.Usage = summarizeNewUsage(reviewers)
 	manifest.Reviewers = reviewers
 	manifest.Checks = checks
 	manifest.Usage = decision.Usage
@@ -222,22 +314,53 @@ func (r Runner) Run(parent context.Context, repo gitx.Repo, target model.Target,
 	if err := store.Finalize(run); err != nil {
 		return model.Decision{}, err
 	}
+	heartbeat.Finish(decision.State)
+	finishedHeartbeat = true
 	return decision, nil
 }
 
-func runReviewerAdapters(ctx context.Context, adapters []provider.Adapter, repo gitx.Repo, workDir string, run record.Run, target model.Target, cfg config.Config, prompt, policy, schemaPath string, onStart func(string) error, onFinish func(model.ReviewerResult) error) ([]model.ReviewerResult, error) {
+type reviewerCallbacks struct {
+	Queued   func(string, string) error
+	Started  func(string) error
+	Finished func(model.ReviewerResult) error
+}
+
+func runReviewerAdapters(ctx context.Context, adapters []provider.Adapter, repo gitx.Repo, workDir string, run record.Run, target model.Target, cfg config.Config, prompt, policy, schemaPath string, callbacks reviewerCallbacks, attempts map[string]int, notBefore map[string]time.Time) ([]model.ReviewerResult, error) {
 	results := make(chan model.ReviewerResult, len(adapters))
 	var group sync.WaitGroup
-	for _, adapter := range adapters {
-		if err := onStart(adapter.Name()); err != nil {
-			return nil, err
-		}
-	}
 	for _, adapter := range adapters {
 		adapter := adapter
 		group.Add(1)
 		go func() {
 			defer group.Done()
+			if err := waitUntil(ctx, notBefore[adapter.Name()]); err != nil {
+				results <- model.ReviewerResult{
+					Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()),
+					FailureKind: "quota_queue", Retryable: true, Error: "wait for provider quota reset: " + err.Error(),
+				}
+				return
+			}
+			if callbacks.Queued != nil {
+				if err := callbacks.Queued(adapter.Name(), adapter.Provider()); err != nil {
+					results <- model.ReviewerResult{Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()), Error: err.Error()}
+					return
+				}
+			}
+			lease, err := record.AcquireProvider(ctx, adapter.Provider(), providerConcurrency(cfg, adapter.Provider()), nil)
+			if err != nil {
+				results <- model.ReviewerResult{
+					Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()),
+					FailureKind: "provider_queue", Retryable: true, Error: "wait for provider capacity: " + err.Error(),
+				}
+				return
+			}
+			defer lease.Release()
+			if callbacks.Started != nil {
+				if err := callbacks.Started(adapter.Name()); err != nil {
+					results <- model.ReviewerResult{Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()), Error: err.Error()}
+					return
+				}
+			}
 			results <- adapter.Review(ctx, provider.Request{
 				RepoRoot:        repo.Root,
 				WorkDir:         workDir,
@@ -249,6 +372,7 @@ func runReviewerAdapters(ctx context.Context, adapters []provider.Adapter, repo 
 				Policy:          policy,
 				Timeout:         cfg.ReviewerTimeout.Duration,
 				AllowAPIBilling: cfg.AllowAPIBilling,
+				Attempt:         attemptFor(attempts, adapter.Name()),
 			})
 		}()
 	}
@@ -260,12 +384,107 @@ func runReviewerAdapters(ctx context.Context, adapters []provider.Adapter, repo 
 	var callbackErr error
 	for result := range results {
 		collected = append(collected, result)
-		if callbackErr == nil {
-			callbackErr = onFinish(result)
+		if callbackErr == nil && callbacks.Finished != nil {
+			callbackErr = callbacks.Finished(result)
 		}
 	}
 	sort.Slice(collected, func(i, j int) bool { return collected[i].Reviewer < collected[j].Reviewer })
 	return collected, callbackErr
+}
+
+func waitUntil(ctx context.Context, notBefore time.Time) error {
+	if notBefore.IsZero() || !notBefore.After(time.Now()) {
+		return nil
+	}
+	timer := time.NewTimer(time.Until(notBefore))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func maximumQueueDelay(notBefore map[string]time.Time, now time.Time) time.Duration {
+	var maximum time.Duration
+	for _, start := range notBefore {
+		if delay := start.Sub(now); delay > maximum {
+			maximum = delay
+		}
+	}
+	return maximum
+}
+
+func providerConcurrency(cfg config.Config, name string) int {
+	switch name {
+	case "claude":
+		return cfg.Reviewers.Claude.MaxConcurrency
+	case "codex":
+		return cfg.Reviewers.Codex.MaxConcurrency
+	default:
+		return 1
+	}
+}
+
+func attemptFor(attempts map[string]int, reviewer string) int {
+	if attempt := attempts[reviewer]; attempt > 0 {
+		return attempt
+	}
+	return 1
+}
+
+func filterAdapters(adapters []provider.Adapter, selected map[string]bool) []provider.Adapter {
+	if len(selected) == 0 {
+		return adapters
+	}
+	filtered := make([]provider.Adapter, 0, len(adapters))
+	for _, adapter := range adapters {
+		if selected[adapter.Name()] {
+			filtered = append(filtered, adapter)
+		}
+	}
+	return filtered
+}
+
+func reuseReviewerResults(results []model.ReviewerResult, parentRunID string, selected map[string]bool) []model.ReviewerResult {
+	reused := make([]model.ReviewerResult, 0, len(results))
+	for _, result := range results {
+		if selected[result.Reviewer] || result.Reviewer == "claude-escalation" {
+			continue
+		}
+		if result.Attempt < 1 {
+			result.Attempt = 1
+		}
+		result.ReusedFromRunID = parentRunID
+		reused = append(reused, result)
+	}
+	sort.Slice(reused, func(i, j int) bool { return reused[i].Reviewer < reused[j].Reviewer })
+	return reused
+}
+
+func reviewerAttempts(results []model.ReviewerResult) map[string]int {
+	attempts := make(map[string]int, len(results)+1)
+	for _, result := range results {
+		attempt := result.Attempt
+		if attempt < 1 {
+			attempt = 1
+		}
+		attempts[result.Reviewer] = attempt + 1
+	}
+	return attempts
+}
+
+func reuseCheckResults(checks []model.CheckResult, parentRunID string, enabled bool) []model.CheckResult {
+	if !enabled {
+		return nil
+	}
+	reused := make([]model.CheckResult, len(checks))
+	copy(reused, checks)
+	for index := range reused {
+		reused[index].ReusedFromRunID = parentRunID
+	}
+	return reused
 }
 
 func runChecks(ctx context.Context, repo gitx.Repo, run record.Run, cfg config.Config, onStart func(string) error, onFinish func(model.CheckResult) error) ([]model.CheckResult, error) {
@@ -276,7 +495,7 @@ func runChecks(ctx context.Context, repo gitx.Repo, run record.Run, cfg config.C
 		}
 		environmentRoot, err := os.MkdirTemp("", "cora-check-environment-")
 		if err != nil {
-			result := model.CheckResult{Name: check.Name, Status: "incomplete", ExitCode: -1, Error: fmt.Sprintf("create isolated check environment: %v", err)}
+			result := model.CheckResult{Name: check.Name, Profile: check.Profile, Status: "incomplete", ExitCode: -1, Error: fmt.Sprintf("create isolated check environment: %v", err), Isolation: "disposable-worktree-minimal-env"}
 			results = append(results, result)
 			if err := onFinish(result); err != nil {
 				return nil, err
@@ -286,7 +505,7 @@ func runChecks(ctx context.Context, repo gitx.Repo, run record.Run, cfg config.C
 		environment, envErr := processx.MinimalEnvironment(environmentRoot, check.EnvAllowlist)
 		if envErr != nil {
 			_ = os.RemoveAll(environmentRoot)
-			result := model.CheckResult{Name: check.Name, Status: "incomplete", ExitCode: -1, Error: envErr.Error()}
+			result := model.CheckResult{Name: check.Name, Profile: check.Profile, Status: "incomplete", ExitCode: -1, Error: envErr.Error(), Isolation: "disposable-worktree-minimal-env"}
 			results = append(results, result)
 			if err := onFinish(result); err != nil {
 				return nil, err
@@ -304,7 +523,7 @@ func runChecks(ctx context.Context, repo gitx.Repo, run record.Run, cfg config.C
 		})
 		cancel()
 		_ = os.RemoveAll(environmentRoot)
-		result := model.CheckResult{Name: check.Name, Duration: processResult.Duration, ExitCode: processResult.ExitCode}
+		result := model.CheckResult{Name: check.Name, Profile: check.Profile, Duration: model.NewDuration(processResult.Duration), ExitCode: processResult.ExitCode, Isolation: "disposable-worktree-minimal-env"}
 		switch {
 		case processResult.Err == nil:
 			result.Status = "passed"
@@ -444,15 +663,20 @@ func appendUnique(values []string, value string) []string {
 	return append(values, value)
 }
 
-func summarizeUsage(results []model.ReviewerResult) model.Usage {
+func summarizeNewUsage(results []model.ReviewerResult) model.Usage {
 	var total model.Usage
-	allTurnsKnown := len(results) > 0
-	allThinkingKnown := len(results) > 0
-	allCostsKnown := len(results) > 0
+	newResultCount := 0
+	allTurnsKnown := true
+	allThinkingKnown := true
+	allCostsKnown := true
 	anyTurnsKnown := false
 	anyThinkingKnown := false
 	anyCostsKnown := false
 	for _, result := range results {
+		if result.ReusedFromRunID != "" {
+			continue
+		}
+		newResultCount++
 		usage := result.Usage
 		total.Turns += usage.Turns
 		total.InputTokens += usage.InputTokens
@@ -466,6 +690,11 @@ func summarizeUsage(results []model.ReviewerResult) model.Usage {
 		anyTurnsKnown = anyTurnsKnown || usage.TurnsKnown
 		anyThinkingKnown = anyThinkingKnown || usage.ThinkingTokensKnown
 		anyCostsKnown = anyCostsKnown || usage.APIEquivalentCostKnown
+	}
+	if newResultCount == 0 {
+		allTurnsKnown = false
+		allThinkingKnown = false
+		allCostsKnown = false
 	}
 	total.TurnsKnown = allTurnsKnown
 	total.TurnsPartial = anyTurnsKnown && !allTurnsKnown

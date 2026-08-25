@@ -71,6 +71,39 @@ func TestDefaultsUseHighEffortClaudeOpusAndFableEscalation(t *testing.T) {
 	if !cfg.Escalation.Enabled || cfg.Escalation.Model != "fable" || cfg.Escalation.Effort != "high" {
 		t.Fatalf("escalation defaults = %#v", cfg.Escalation)
 	}
+	if cfg.Reviewers.Claude.MaxConcurrency != 1 || cfg.Reviewers.Codex.MaxConcurrency != 2 {
+		t.Fatalf("provider concurrency defaults = %#v", cfg.Reviewers)
+	}
+	if !cfg.Escalation.AdjudicateDisagreements {
+		t.Fatal("disagreement adjudication should default on")
+	}
+}
+
+func TestApplyBuiltInGoValidationProfile(t *testing.T) {
+	cfg, err := ApplyProfiles(Defaults(), []string{"go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Checks) != 2 || cfg.Checks[0].Profile != "go" || cfg.Checks[1].Profile != "go" {
+		t.Fatalf("Go profile checks = %#v", cfg.Checks)
+	}
+	if cfg.Checks[0].Name != "go-test" || cfg.Checks[1].Name != "go-vet" {
+		t.Fatalf("Go profile check names = %#v", cfg.Checks)
+	}
+}
+
+func TestExampleConfigurationParses(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "examples", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ApplyRepository(Defaults(), "examples/config.toml", contents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ValidationProfiles) != 1 || cfg.ValidationProfiles[0].Name != "go-fast" {
+		t.Fatalf("validation profiles = %#v", cfg.ValidationProfiles)
+	}
 }
 
 func TestValidateRejectsUnsupportedReviewerEffort(t *testing.T) {

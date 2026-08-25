@@ -45,6 +45,27 @@ func TestEvaluate(t *testing.T) {
 	}
 }
 
+func TestEvaluateDeduplicatesEquivalentFindings(t *testing.T) {
+	codex := completedReview("codex", "request_changes")
+	codex.Report.Findings = []model.Finding{{
+		ID: "C1", Severity: "major", Confidence: 0.9, File: "app.go", Line: 42,
+		Claim: "Concurrent writes can corrupt the shared cache", Evidence: "Both goroutines write the map", SuggestedFix: "Add a mutex",
+	}}
+	claude := completedReview("claude", "request_changes")
+	claude.Report.Findings = []model.Finding{{
+		ID: "A1", Severity: "minor", Confidence: 0.8, File: "app.go", Line: 43,
+		Claim: "Shared cache can be corrupted by concurrent writes", Evidence: "The map is written without synchronization", SuggestedFix: "Protect it with a lock",
+	}}
+	decision := Evaluate("run", finalTarget(), []model.ReviewerResult{codex, claude}, nil, []string{"blocker", "major"}, 2, time.Unix(1, 0))
+	if len(decision.Findings) != 1 || decision.OpenFindings["major"] != 1 || decision.OpenFindings["minor"] != 0 {
+		t.Fatalf("consolidated findings = %#v, counts = %#v", decision.Findings, decision.OpenFindings)
+	}
+	finding := decision.Findings[0]
+	if len(finding.Reviewers) != 2 || len(finding.Evidence) != 2 || len(finding.SuggestedFixes) != 2 {
+		t.Fatalf("merged finding lost source detail: %#v", finding)
+	}
+}
+
 func completedReview(name, reportVerdict string) model.ReviewerResult {
 	return model.ReviewerResult{
 		Reviewer: name,

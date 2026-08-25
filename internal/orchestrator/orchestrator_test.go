@@ -54,14 +54,22 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	cfg.ReviewerTimeout.Duration = 5 * time.Second
 	cfg.OverallTimeout.Duration = 10 * time.Second
 	cfg.AllowUnsafeChecks = true
-	cfg.Checks = []config.Check{{
-		Name:    "diff-check",
-		Command: []string{"git", "diff", "--check", target.BaseSHA, target.HeadSHA},
-		Timeout: config.Duration{Duration: 5 * time.Second},
-	}}
+	cfg.Checks = []config.Check{
+		{
+			Name:    "diff-check",
+			Command: []string{"git", "diff", "--check", target.BaseSHA, target.HeadSHA},
+			Timeout: config.Duration{Duration: 5 * time.Second},
+		},
+		{
+			Name:    "mutation-check",
+			Command: []string{"sh", "-c", "printf tampered > app.txt"},
+			Timeout: config.Duration{Duration: 5 * time.Second},
+		},
+	}
 
 	var progress bytes.Buffer
-	decision, err := (Runner{Version: "test", Progress: &progress}).Run(context.Background(), repo, target, cfg)
+	runner := Runner{Version: "test", SourceSHA: "source-sha", BuildTime: "2026-08-25T12:00:00Z", Progress: &progress}
+	decision, err := runner.Run(context.Background(), repo, target, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,8 +79,11 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	if decision.Reviewers["codex"] != "approve" || decision.Reviewers["claude"] != "approve" {
 		t.Fatalf("reviewer decisions = %#v", decision.Reviewers)
 	}
-	if decision.Checks["diff-check"] != "passed" {
+	if decision.Checks["diff-check"] != "passed" || decision.Checks["mutation-check"] != "passed" {
 		t.Fatalf("checks = %#v", decision.Checks)
+	}
+	if contents, readErr := os.ReadFile(filepath.Join(repoRoot, "app.txt")); readErr != nil || string(contents) != "base\nfeature\n" {
+		t.Fatalf("disposable check modified caller checkout: contents=%q err=%v", contents, readErr)
 	}
 	for _, message := range []string{
 		"cora: run ",
@@ -102,8 +113,16 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	if manifest.PromptHash == "" || manifest.PolicyHash == "" || manifest.SchemaHash == "" || len(manifest.Reviewers) != 2 {
 		t.Fatalf("manifest is incomplete: %#v", manifest)
 	}
+	if manifest.CoraSourceSHA != "source-sha" || manifest.CoraBuildTime != "2026-08-25T12:00:00Z" || manifest.RepositoryIdentity == "" {
+		t.Fatalf("build/repository identity = %#v", manifest)
+	}
 	if manifest.Security.ReviewerIsolation != "neutral-directory-read-only" || manifest.Security.RepositoryPolicy != "ignored" {
 		t.Fatalf("reviewer isolation metadata = %#v", manifest.Security)
+	}
+	for _, check := range manifest.Checks {
+		if check.Isolation != "disposable-worktree-minimal-env" {
+			t.Fatalf("check isolation metadata = %#v", check)
+		}
 	}
 	if len(manifest.Security.ControlFilesChanged) != 1 || manifest.Security.ControlFilesChanged[0] != "AGENTS.md" {
 		t.Fatalf("changed control files = %v", manifest.Security.ControlFilesChanged)
@@ -136,6 +155,71 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 		t.Errorf("missing Codex raw record: %v", err)
 	} else if got := info.Mode().Perm(); got != 0o600 {
 		t.Errorf("Codex raw record permissions = %#o, want 0600", got)
+	}
+	manifestJSON, err := os.ReadFile(filepath.Join(latest.Path, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(manifestJSON), `"duration_ms"`) || strings.Contains(string(manifestJSON), `"duration":`) {
+		t.Fatalf("manifest duration encoding is not milliseconds:\n%s", manifestJSON)
+	}
+
+	previous := make([]model.ReviewerResult, len(manifest.Reviewers))
+	copy(previous, manifest.Reviewers)
+	for index := range previous {
+		if previous[index].Reviewer == "claude" {
+			previous[index].Status = "incomplete"
+			previous[index].Report = nil
+		}
+	}
+	retryDecision, err := runner.RunWithOptions(context.Background(), repo, target, cfg, RunOptions{
+		ParentRunID: latest.ID, RetryReviewers: map[string]bool{"claude": true}, ReuseReviewers: previous,
+		ReuseChecks: true, Checks: manifest.Checks,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retryDecision.State != model.StateApproved {
+		t.Fatalf("retry decision = %#v", retryDecision)
+	}
+	retryRun, err := store.Resolve("latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryManifest, err := record.LoadManifest(retryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retryManifest.ParentRunID != latest.ID || len(retryManifest.Reviewers) != 2 {
+		t.Fatalf("retry manifest = %#v", retryManifest)
+	}
+	for _, reviewer := range retryManifest.Reviewers {
+		switch reviewer.Reviewer {
+		case "codex":
+			if reviewer.ReusedFromRunID != latest.ID {
+				t.Fatalf("Codex was not reused: %#v", reviewer)
+			}
+		case "claude":
+			if reviewer.ReusedFromRunID != "" || reviewer.Attempt != 2 {
+				t.Fatalf("Claude retry metadata = %#v", reviewer)
+			}
+		}
+	}
+}
+
+func TestReuseReviewerResultsPreservesUnselectedIncompleteReviewer(t *testing.T) {
+	results := []model.ReviewerResult{
+		{Reviewer: "claude", Status: "incomplete", Attempt: 1},
+		{Reviewer: "codex", Status: "incomplete", Attempt: 2},
+		{Reviewer: "claude-escalation", Status: "completed", Attempt: 1},
+	}
+
+	reused := reuseReviewerResults(results, "parent-run", map[string]bool{"claude": true})
+	if len(reused) != 1 {
+		t.Fatalf("reused reviewers = %#v", reused)
+	}
+	if reused[0].Reviewer != "codex" || reused[0].Status != "incomplete" || reused[0].ReusedFromRunID != "parent-run" {
+		t.Fatalf("unselected incomplete reviewer was not preserved: %#v", reused[0])
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -30,10 +31,12 @@ type Request struct {
 	Policy          string
 	Timeout         time.Duration
 	AllowAPIBilling bool
+	Attempt         int
 }
 
 type Adapter interface {
 	Name() string
+	Provider() string
 	Review(context.Context, Request) model.ReviewerResult
 }
 
@@ -56,12 +59,13 @@ type Codex struct {
 	Config config.Reviewer
 }
 
-func (Codex) Name() string { return "codex" }
+func (Codex) Name() string     { return "codex" }
+func (Codex) Provider() string { return "codex" }
 
 func (c Codex) Review(parent context.Context, request Request) model.ReviewerResult {
 	started := time.Now()
 	result := model.ReviewerResult{
-		Reviewer: c.Name(), Status: "incomplete", Tool: c.Config.Command,
+		Reviewer: c.Name(), Status: "incomplete", Tool: c.Config.Command, Attempt: normalizedAttempt(request.Attempt),
 		Model: c.Config.Model, ModelSource: "configured", Effort: c.Config.Effort,
 	}
 	env := processx.ReviewerEnvironment(request.AllowAPIBilling)
@@ -69,7 +73,7 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 	path, err := lookPathWithFallback(c.Config.Command, codexFallbackPaths())
 	if err != nil {
 		result.Error = fmt.Sprintf("find Codex CLI: %v", err)
-		result.Duration = time.Since(started)
+		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
 	result.Tool = path
@@ -83,7 +87,7 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 	cancelAuth()
 	if authResult.Err != nil {
 		result.Error = "Codex authentication check failed: " + firstNonEmpty(string(authErrOut), authResult.Err.Error())
-		result.Duration = time.Since(started)
+		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
 	if codexUsesChatGPT(authOut, authErrOut) {
@@ -92,14 +96,14 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 		result.Auth = "api-or-other"
 	} else {
 		result.Error = "Codex is not authenticated with ChatGPT; refusing possible API billing"
-		result.Duration = time.Since(started)
+		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
 
 	rawPath := filepath.Join(request.RunDir, "codex.raw.json")
 	if err := preparePrivateFile(rawPath); err != nil {
 		result.Error = "prepare Codex output: " + err.Error()
-		result.Duration = time.Since(started)
+		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
 	args := codexReviewArgs(c.Config, request, rawPath)
@@ -117,13 +121,14 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 		StderrPath: stderrPath,
 	})
 	cancelReview()
-	result.Duration = time.Since(started)
+	result.Duration = model.NewDuration(time.Since(started))
 	result.ExitCode = processResult.ExitCode
 	if telemetry, err := readCodexTelemetry(eventsPath, result.Model); err == nil {
 		applyTelemetry(&result, telemetry)
 	}
 	if processResult.Err != nil {
 		result.Error = "Codex review failed: " + stderrFailure(stderrPath, processResult.Err)
+		classifyFailure(&result, time.Now())
 		return result
 	}
 	report, err := readReport(rawPath)
@@ -184,10 +189,12 @@ func (c Claude) Name() string {
 	return "claude"
 }
 
+func (Claude) Provider() string { return "claude" }
+
 func (c Claude) Review(parent context.Context, request Request) model.ReviewerResult {
 	started := time.Now()
 	result := model.ReviewerResult{
-		Reviewer: c.Name(), Status: "incomplete", Tool: c.Config.Command,
+		Reviewer: c.Name(), Status: "incomplete", Tool: c.Config.Command, Attempt: normalizedAttempt(request.Attempt),
 		Model: c.Config.Model, ModelSource: "configured", Effort: c.Config.Effort,
 		EscalationCause: c.EscalationCause,
 	}
@@ -196,7 +203,7 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	path, err := exec.LookPath(c.Config.Command)
 	if err != nil {
 		result.Error = fmt.Sprintf("find Claude CLI: %v", err)
-		result.Duration = time.Since(started)
+		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
 	result.Tool = path
@@ -210,7 +217,7 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	cancelAuth()
 	if authResult.Err != nil {
 		result.Error = "Claude authentication check failed: " + firstNonEmpty(string(authErrOut), authResult.Err.Error())
-		result.Duration = time.Since(started)
+		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
 	var auth struct {
@@ -221,7 +228,7 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	}
 	if err := json.Unmarshal(authOut, &auth); err != nil {
 		result.Error = "parse Claude authentication status: " + err.Error()
-		result.Duration = time.Since(started)
+		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
 	if auth.LoggedIn && auth.AuthMethod == "claude.ai" && strings.EqualFold(auth.APIProvider, "firstParty") && auth.SubscriptionType != "" {
@@ -230,14 +237,14 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 		result.Auth = "api-or-other"
 	} else {
 		result.Error = "Claude is not authenticated with a Claude.ai subscription; refusing possible API billing"
-		result.Duration = time.Since(started)
+		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
 
 	compactSchema, err := schemaForClaude(request.Schema)
 	if err != nil {
 		result.Error = "prepare Claude output schema: " + err.Error()
-		result.Duration = time.Since(started)
+		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
 	args := []string{
@@ -273,16 +280,18 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 		StderrPath: stderrPath,
 	})
 	cancelReview()
-	result.Duration = time.Since(started)
+	result.Duration = model.NewDuration(time.Since(started))
 	result.ExitCode = processResult.ExitCode
 	parsed, parseErr := readClaudeOutput(rawPath, result.Model)
 	applyTelemetry(&result, parsed.Telemetry)
 	if processResult.Err != nil {
 		result.Error = "Claude review failed: " + claudeFailure(rawPath, stderrPath, processResult.Err)
+		classifyFailure(&result, time.Now())
 		return result
 	}
 	if parseErr != nil {
 		result.Error = "parse Claude report: " + parseErr.Error()
+		classifyFailure(&result, time.Now())
 		return result
 	}
 	report := parsed.Report
@@ -294,6 +303,62 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	result.Status = "completed"
 	result.Report = &report
 	return result
+}
+
+var (
+	quotaResetPattern    = regexp.MustCompile(`(?i)reset(?:s)?(?:\s+at)?\s+(\d{1,2}):(\d{2})\s*(am|pm)`)
+	quotaTimezonePattern = regexp.MustCompile(`\(([A-Za-z][A-Za-z0-9_+\-/]+(?:/[A-Za-z0-9_+\-]+)+)\)`)
+	easternTimePattern   = regexp.MustCompile(`(?i)\bET\b`)
+)
+
+func classifyFailure(result *model.ReviewerResult, now time.Time) {
+	retryAt, quota := QuotaRetryAt(result.Error, now)
+	if !quota {
+		return
+	}
+	result.FailureKind = "quota"
+	result.Retryable = true
+	if !retryAt.IsZero() {
+		result.RetryAt = &retryAt
+	}
+}
+
+// QuotaRetryAt recognizes provider quota failures and extracts their reset
+// time when one is present. The timestamp is interpreted relative to the time
+// the failure occurred, including an IANA location emitted by the provider.
+func QuotaRetryAt(message string, observedAt time.Time) (time.Time, bool) {
+	normalized := strings.ToLower(message)
+	if !strings.Contains(normalized, "quota") && !strings.Contains(normalized, "usage limit") && !strings.Contains(normalized, "session limit") && !strings.Contains(normalized, "rate limit") && !strings.Contains(normalized, "hit your limit") {
+		return time.Time{}, false
+	}
+	match := quotaResetPattern.FindStringSubmatch(message)
+	if len(match) != 4 {
+		return time.Time{}, true
+	}
+	hour, _ := strconv.Atoi(match[1])
+	minute, _ := strconv.Atoi(match[2])
+	if strings.EqualFold(match[3], "pm") && hour != 12 {
+		hour += 12
+	}
+	if strings.EqualFold(match[3], "am") && hour == 12 {
+		hour = 0
+	}
+	location := observedAt.Location()
+	if timezoneMatch := quotaTimezonePattern.FindStringSubmatch(message); len(timezoneMatch) == 2 {
+		if parsedLocation, err := time.LoadLocation(timezoneMatch[1]); err == nil {
+			location = parsedLocation
+		}
+	} else if easternTimePattern.MatchString(message) {
+		if eastern, err := time.LoadLocation("America/New_York"); err == nil {
+			location = eastern
+		}
+	}
+	localObservedAt := observedAt.In(location)
+	retryAt := time.Date(localObservedAt.Year(), localObservedAt.Month(), localObservedAt.Day(), hour, minute, 0, 0, location)
+	if !retryAt.After(observedAt) {
+		retryAt = retryAt.Add(24 * time.Hour)
+	}
+	return retryAt, true
 }
 
 type reviewerTelemetry struct {
@@ -308,6 +373,13 @@ func applyTelemetry(result *model.ReviewerResult, telemetry reviewerTelemetry) {
 		result.ModelSource = telemetry.ModelSource
 	}
 	result.Usage = telemetry.Usage
+}
+
+func normalizedAttempt(attempt int) int {
+	if attempt < 1 {
+		return 1
+	}
+	return attempt
 }
 
 func codexFallbackPaths() []string {

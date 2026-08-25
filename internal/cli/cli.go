@@ -14,11 +14,14 @@ import (
 	"github.com/herikwebb/cora/internal/gitx"
 	"github.com/herikwebb/cora/internal/model"
 	"github.com/herikwebb/cora/internal/orchestrator"
+	"github.com/herikwebb/cora/internal/provider"
 	"github.com/herikwebb/cora/internal/record"
 	"github.com/spf13/cobra"
 )
 
 var Version = "0.1.0-dev"
+var SourceSHA = "unknown"
+var BuildTime = "unknown"
 
 type options struct {
 	repo string
@@ -55,10 +58,13 @@ func newRootCommand() *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
+	root.SetVersionTemplate("cora version {{.Version}} (source " + SourceSHA + ", built " + BuildTime + ")\n")
 	root.PersistentFlags().StringVarP(&opts.repo, "repo", "C", ".", "target repository directory")
 	root.PersistentFlags().BoolVar(&opts.json, "json", false, "emit machine-readable JSON")
 	root.AddCommand(newReviewCommand(opts))
+	root.AddCommand(newRetryCommand(opts))
 	root.AddCommand(newStatusCommand(opts))
+	root.AddCommand(newListCommand(opts))
 	root.AddCommand(newShowCommand(opts))
 	root.AddCommand(newVerifyCommand(opts))
 	root.AddCommand(newConfigCommand(opts))
@@ -99,6 +105,8 @@ func newReviewCommand(opts *options) *cobra.Command {
 	var allowAPIBilling bool
 	var allowUnsafeChecks bool
 	var securitySensitive bool
+	var noAdjudication bool
+	var profiles []string
 	command := &cobra.Command{
 		Use:   "review",
 		Short: "Review changes independently and evaluate consensus",
@@ -165,11 +173,22 @@ func newReviewCommand(opts *options) *cobra.Command {
 			if securitySensitive {
 				cfg.Escalation.ForceSecuritySensitive = true
 			}
+			if noAdjudication {
+				cfg.Escalation.AdjudicateDisagreements = false
+			}
 			target, err = resolve(candidateBase, cfg.RequireCleanTree)
 			if err != nil {
 				return err
 			}
-			decision, err := (orchestrator.Runner{Version: Version, Progress: command.ErrOrStderr()}).Run(ctx, repo, target, cfg)
+			profiles, err = expandAutoProfiles(ctx, repo, target, profiles)
+			if err != nil {
+				return err
+			}
+			cfg, err = config.ApplyProfiles(cfg, profiles)
+			if err != nil {
+				return err
+			}
+			decision, err := runner(command).Run(ctx, repo, target, cfg)
 			if err != nil {
 				return err
 			}
@@ -194,11 +213,191 @@ func newReviewCommand(opts *options) *cobra.Command {
 	command.Flags().BoolVar(&allowAPIBilling, "allow-api-billing", false, "allow API-key or other separately billed authentication")
 	command.Flags().BoolVar(&allowUnsafeChecks, "allow-unsafe-checks", false, "allow configured checks to execute unsandboxed on the host")
 	command.Flags().BoolVar(&securitySensitive, "security-sensitive", false, "escalate Claude to the configured security review model and effort")
+	command.Flags().BoolVar(&noAdjudication, "no-adjudication", false, "do not run a Fable adjudicator when reviewers disagree")
+	command.Flags().StringSliceVar(&profiles, "profile", nil, "validation profile to run (repeatable; auto detects a built-in profile)")
 	return command
 }
 
+func newRetryCommand(opts *options) *cobra.Command {
+	var reviewers []string
+	var noWait bool
+	var allowAPIBilling bool
+	var noAdjudication bool
+	command := &cobra.Command{
+		Use:   "retry [run-id]",
+		Short: "Retry selected reviewers while reusing completed work",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			ctx := command.Context()
+			repo, err := gitx.Discover(ctx, opts.repo)
+			if err != nil {
+				return err
+			}
+			runID := "latest"
+			if len(args) == 1 {
+				runID = args[0]
+			}
+			store := record.New(repo.CommonDir)
+			parentRun, err := store.Resolve(runID)
+			if err != nil {
+				return err
+			}
+			parentManifest, err := record.LoadManifest(parentRun)
+			if err != nil {
+				return err
+			}
+			if parentManifest.FinishedAt.IsZero() {
+				return fmt.Errorf("run %s is still active or did not finish", parentRun.ID)
+			}
+			valid, err := repo.VerifyTarget(ctx, parentManifest.Target)
+			if err != nil {
+				return err
+			}
+			if !valid {
+				return fmt.Errorf("run %s no longer matches its recorded Git target", parentRun.ID)
+			}
+			selected, err := selectRetryReviewers(parentManifest.Reviewers, reviewers)
+			if err != nil {
+				return err
+			}
+			notBefore := quotaNotBefore(parentManifest.Reviewers, selected, parentManifest.FinishedAt, time.Now())
+			if noWait {
+				for _, retryAt := range notBefore {
+					if retryAt.After(time.Now()) {
+						return fmt.Errorf("selected provider is quota-limited until %s", retryAt.Local().Format(time.RFC3339))
+					}
+				}
+			}
+
+			personal, err := config.LoadPersonal()
+			if err != nil {
+				return err
+			}
+			cfg, err := loadTrustedConfig(ctx, repo, personal, parentManifest.Target)
+			if err != nil {
+				return err
+			}
+			if allowAPIBilling {
+				cfg.AllowAPIBilling = true
+			}
+			if noAdjudication {
+				cfg.Escalation.AdjudicateDisagreements = false
+			}
+			if (selected["codex"] && !cfg.Reviewers.Codex.Enabled) || (selected["claude"] && !cfg.Reviewers.Claude.Enabled) {
+				return errors.New("selected reviewer is disabled by the trusted configuration")
+			}
+			previous := make([]model.ReviewerResult, len(parentManifest.Reviewers))
+			copy(previous, parentManifest.Reviewers)
+			for index := range previous {
+				if selected[previous[index].Reviewer] {
+					previous[index].Status = "incomplete"
+					previous[index].Report = nil
+					previous[index].ReusedFromRunID = ""
+				}
+			}
+			decision, err := runner(command).RunWithOptions(ctx, repo, parentManifest.Target, cfg, orchestrator.RunOptions{
+				ParentRunID: parentRun.ID, RetryReviewers: selected, ReuseReviewers: previous,
+				ReuseChecks: true, Checks: parentManifest.Checks, NotBefore: notBefore,
+			})
+			if err != nil {
+				return err
+			}
+			if opts.json {
+				if err := printJSON(decision); err != nil {
+					return err
+				}
+			} else {
+				printDecision(decision)
+			}
+			if decision.State != model.StateApproved {
+				return stateError{state: decision.State}
+			}
+			return nil
+		},
+	}
+	command.Flags().StringSliceVar(&reviewers, "reviewer", nil, "reviewer to retry: codex or claude (repeatable)")
+	command.Flags().BoolVar(&noWait, "no-wait", false, "return instead of waiting for a recorded provider quota reset")
+	command.Flags().BoolVar(&allowAPIBilling, "allow-api-billing", false, "allow API-key or other separately billed authentication")
+	command.Flags().BoolVar(&noAdjudication, "no-adjudication", false, "do not run a Fable adjudicator when reviewers disagree")
+	return command
+}
+
+func runner(command *cobra.Command) orchestrator.Runner {
+	return orchestrator.Runner{Version: Version, SourceSHA: SourceSHA, BuildTime: BuildTime, Progress: command.ErrOrStderr()}
+}
+
+func selectRetryReviewers(results []model.ReviewerResult, requested []string) (map[string]bool, error) {
+	available := make(map[string]model.ReviewerResult)
+	for _, result := range results {
+		if result.Reviewer == "codex" || result.Reviewer == "claude" {
+			available[result.Reviewer] = result
+		}
+	}
+	selected := make(map[string]bool)
+	if len(requested) == 0 {
+		for name, result := range available {
+			if result.Status != "completed" || result.Report == nil {
+				selected[name] = true
+			}
+		}
+		if len(selected) == 0 {
+			return nil, errors.New("all base reviewers completed; pass --reviewer to rerun one explicitly")
+		}
+		return selected, nil
+	}
+	for _, name := range requested {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if _, found := available[name]; !found {
+			return nil, fmt.Errorf("reviewer %q is not present in the saved run", name)
+		}
+		selected[name] = true
+	}
+	return selected, nil
+}
+
+func quotaNotBefore(results []model.ReviewerResult, selected map[string]bool, observedAt, now time.Time) map[string]time.Time {
+	notBefore := make(map[string]time.Time)
+	for _, result := range results {
+		if !selected[result.Reviewer] {
+			continue
+		}
+		retryAt := result.RetryAt
+		if retryAt == nil {
+			if parsed, quota := provider.QuotaRetryAt(result.Error, observedAt); quota && !parsed.IsZero() {
+				retryAt = &parsed
+			}
+		}
+		if retryAt != nil && retryAt.After(now) {
+			notBefore[result.Reviewer] = *retryAt
+		}
+	}
+	return notBefore
+}
+
+func expandAutoProfiles(ctx context.Context, repo gitx.Repo, target model.Target, names []string) ([]string, error) {
+	expanded := make([]string, 0, len(names))
+	seen := make(map[string]bool)
+	for _, name := range names {
+		if name != "auto" {
+			if !seen[name] {
+				expanded = append(expanded, name)
+				seen[name] = true
+			}
+			continue
+		}
+		if _, found, err := repo.ReadFileAt(ctx, target.HeadSHA, "go.mod"); err != nil {
+			return nil, err
+		} else if found && !seen["go"] {
+			expanded = append(expanded, "go")
+			seen["go"] = true
+		}
+	}
+	return expanded, nil
+}
+
 func newStatusCommand(opts *options) *cobra.Command {
-	return &cobra.Command{
+	var active bool
+	command := &cobra.Command{
 		Use:   "status",
 		Short: "Show the latest review run",
 		Args:  cobra.NoArgs,
@@ -208,13 +407,44 @@ func newStatusCommand(opts *options) *cobra.Command {
 				return err
 			}
 			store := record.New(repo.CommonDir)
+			if active {
+				summaries, err := loadRunSummaries(store, 0)
+				if err != nil {
+					return err
+				}
+				activeRuns := make([]model.RunSummary, 0)
+				for _, summary := range summaries {
+					if summary.State == "active" {
+						activeRuns = append(activeRuns, summary)
+					}
+				}
+				if opts.json {
+					return printJSON(activeRuns)
+				}
+				if len(activeRuns) == 0 {
+					fmt.Fprintln(command.OutOrStdout(), "No active CORA runs.")
+					return nil
+				}
+				for _, summary := range activeRuns {
+					printRunSummary(summary)
+				}
+				return nil
+			}
 			run, err := store.Resolve("latest")
 			if err != nil {
 				return err
 			}
-			decision, err := record.LoadDecision(run)
-			if err != nil {
-				return err
+			decision, decisionErr := record.LoadDecision(run)
+			if decisionErr != nil {
+				summary, summaryErr := loadRunSummary(run)
+				if summaryErr != nil {
+					return decisionErr
+				}
+				if opts.json {
+					return printJSON(summary)
+				}
+				printRunSummary(summary)
+				return nil
 			}
 			if opts.json {
 				return printJSON(decision)
@@ -223,10 +453,151 @@ func newStatusCommand(opts *options) *cobra.Command {
 			return nil
 		},
 	}
+	command.Flags().BoolVar(&active, "active", false, "show all currently active runs")
+	return command
+}
+
+func newListCommand(opts *options) *cobra.Command {
+	var state string
+	var head string
+	var limit int
+	command := &cobra.Command{
+		Use:   "list",
+		Short: "List saved review runs",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			repo, err := gitx.Discover(command.Context(), opts.repo)
+			if err != nil {
+				return err
+			}
+			summaries, err := loadRunSummaries(record.New(repo.CommonDir), 0)
+			if err != nil {
+				return err
+			}
+			filtered := make([]model.RunSummary, 0, len(summaries))
+			for _, summary := range summaries {
+				if state != "" && summary.State != state {
+					continue
+				}
+				if head != "" && !strings.HasPrefix(summary.HeadSHA, head) {
+					continue
+				}
+				filtered = append(filtered, summary)
+				if limit > 0 && len(filtered) >= limit {
+					break
+				}
+			}
+			if opts.json {
+				return printJSON(filtered)
+			}
+			if len(filtered) == 0 {
+				fmt.Fprintln(command.OutOrStdout(), "No CORA runs found.")
+				return nil
+			}
+			fmt.Fprintln(command.OutOrStdout(), "RUN                                      STATE               HEAD      ELAPSED   PARENT")
+			for _, summary := range filtered {
+				parent := summary.ParentRunID
+				if parent == "" {
+					parent = "-"
+				}
+				fmt.Fprintf(command.OutOrStdout(), "%-40s %-19s %-9s %-9s %s\n", summary.RunID, summary.State, shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), parent)
+			}
+			return nil
+		},
+	}
+	command.Flags().StringVar(&state, "state", "", "filter by run state")
+	command.Flags().StringVar(&head, "head", "", "filter by head SHA prefix")
+	command.Flags().IntVar(&limit, "limit", 20, "maximum runs to show (0 means all)")
+	return command
+}
+
+func loadRunSummaries(store record.Store, limit int) ([]model.RunSummary, error) {
+	runs, err := store.Runs()
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && len(runs) > limit {
+		runs = runs[:limit]
+	}
+	summaries := make([]model.RunSummary, 0, len(runs))
+	for _, run := range runs {
+		summary, err := loadRunSummary(run)
+		if err == nil {
+			summaries = append(summaries, summary)
+		}
+	}
+	return summaries, nil
+}
+
+func loadRunSummary(run record.Run) (model.RunSummary, error) {
+	manifest, err := record.LoadManifest(run)
+	if err != nil {
+		return model.RunSummary{}, err
+	}
+	now := time.Now()
+	finished := manifest.FinishedAt
+	end := now
+	if !finished.IsZero() {
+		end = finished
+	}
+	summary := model.RunSummary{
+		RunID: run.ID, State: "incomplete", StartedAt: manifest.StartedAt, FinishedAt: finished,
+		ElapsedMS: end.Sub(manifest.StartedAt).Milliseconds(), HeadSHA: manifest.Target.HeadSHA,
+		ParentRunID: manifest.ParentRunID, RepositoryIdentity: manifest.RepositoryIdentity, RecordPath: run.Path,
+	}
+	if decision, decisionErr := record.LoadDecision(run); decisionErr == nil {
+		summary.State = decision.State
+		summary.Reviewers = decision.Reviewers
+		summary.Checks = decision.Checks
+		return summary, nil
+	}
+	if heartbeat, heartbeatErr := record.LoadHeartbeat(run); heartbeatErr == nil {
+		summary.State = heartbeat.State
+		summary.Phase = heartbeat.Phase
+		summary.Reviewers = heartbeat.Reviewers
+		summary.Checks = heartbeat.Checks
+		if heartbeat.State == "active" && now.Sub(heartbeat.UpdatedAt) > 2*heartbeatFreshnessWindow() {
+			summary.State = "interrupted"
+		}
+		if heartbeat.State != "active" && manifest.FinishedAt.IsZero() {
+			summary.ElapsedMS = heartbeat.UpdatedAt.Sub(manifest.StartedAt).Milliseconds()
+		}
+	}
+	return summary, nil
+}
+
+func heartbeatFreshnessWindow() time.Duration { return 30 * time.Second }
+
+func printRunSummary(summary model.RunSummary) {
+	fmt.Printf("%s %s\n", strings.ToUpper(summary.State), summary.RunID)
+	if summary.Phase != "" {
+		fmt.Printf("Phase: %s\n", summary.Phase)
+	}
+	fmt.Printf("Head: %s\nElapsed: %s\nRecord: %s\n", shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), summary.RecordPath)
+	for _, name := range sortedStateNames(summary.Reviewers) {
+		fmt.Printf("%-18s %s\n", name+":", summary.Reviewers[name])
+	}
+	for _, name := range sortedStateNames(summary.Checks) {
+		fmt.Printf("%-18s %s\n", "check "+name+":", summary.Checks[name])
+	}
+}
+
+func sortedStateNames(states map[string]string) []string {
+	names := make([]string, 0, len(states))
+	for name := range states {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func formatMilliseconds(milliseconds int64) string {
+	return (time.Duration(milliseconds) * time.Millisecond).Round(100 * time.Millisecond).String()
 }
 
 func newShowCommand(opts *options) *cobra.Command {
-	return &cobra.Command{
+	var verbose bool
+	command := &cobra.Command{
 		Use:   "show [run-id]",
 		Short: "Show a saved review run",
 		Args:  cobra.MaximumNArgs(1),
@@ -262,6 +633,27 @@ func newShowCommand(opts *options) *cobra.Command {
 			printDecision(decision)
 			fmt.Printf("Started:    %s\n", manifest.StartedAt.Local().Format(time.RFC3339))
 			fmt.Printf("Finished:   %s\n", manifest.FinishedAt.Local().Format(time.RFC3339))
+			if len(decision.Findings) > 0 {
+				fmt.Println("\nConsolidated findings:")
+				for _, finding := range decision.Findings {
+					fmt.Printf("  [%s] %s:%d %s (%s)\n", finding.Severity, finding.File, finding.Line, finding.Claim, strings.Join(finding.Reviewers, ", "))
+					if verbose {
+						fmt.Printf("    Confidence: %.0f%%\n", finding.Confidence*100)
+						for _, evidence := range finding.Evidence {
+							fmt.Printf("    Evidence: %s\n", evidence)
+						}
+						for _, fix := range finding.SuggestedFixes {
+							fmt.Printf("    Suggested fix: %s\n", fix)
+						}
+					}
+				}
+			}
+			if verbose && len(decision.ResidualRisks) > 0 {
+				fmt.Println("\nResidual risks:")
+				for _, risk := range decision.ResidualRisks {
+					fmt.Printf("  - %s\n", risk)
+				}
+			}
 			for _, reviewer := range manifest.Reviewers {
 				modelName := reviewer.Model
 				if modelName == "" {
@@ -273,8 +665,22 @@ func newShowCommand(opts *options) *cobra.Command {
 				}
 				if reviewer.Report != nil {
 					fmt.Printf("\n%s: %s (model=%s effort=%s)\n%s\n", strings.ToUpper(reviewer.Reviewer), reviewer.Report.Verdict, modelName, effort, reviewer.Report.Summary)
-					for _, finding := range reviewer.Report.Findings {
-						fmt.Printf("  [%s] %s:%d %s\n", finding.Severity, finding.File, finding.Line, finding.Claim)
+					if verbose {
+						for _, finding := range reviewer.Report.Findings {
+							fmt.Printf("  [%s] %s:%d %s\n", finding.Severity, finding.File, finding.Line, finding.Claim)
+							fmt.Printf("    Confidence: %.0f%%\n", finding.Confidence*100)
+							fmt.Printf("    Evidence: %s\n", finding.Evidence)
+							fmt.Printf("    Suggested fix: %s\n", finding.SuggestedFix)
+						}
+						if len(reviewer.Report.OmittedPaths) > 0 {
+							fmt.Printf("Omitted paths: %s\n", strings.Join(reviewer.Report.OmittedPaths, ", "))
+						}
+						if len(reviewer.Report.ResidualRisks) > 0 {
+							fmt.Println("Residual risks:")
+							for _, risk := range reviewer.Report.ResidualRisks {
+								fmt.Printf("  - %s\n", risk)
+							}
+						}
 					}
 				} else {
 					fmt.Printf("\n%s: incomplete (model=%s effort=%s) — %s\n", strings.ToUpper(reviewer.Reviewer), modelName, effort, reviewer.Error)
@@ -297,6 +703,8 @@ func newShowCommand(opts *options) *cobra.Command {
 			return nil
 		},
 	}
+	command.Flags().BoolVarP(&verbose, "verbose", "v", false, "show evidence, suggested fixes, omitted paths, and residual risks")
+	return command
 }
 
 func newVerifyCommand(opts *options) *cobra.Command {
@@ -441,6 +849,9 @@ func printDecision(decision model.Decision) {
 	fmt.Printf("Findings: blocker=%d major=%d minor=%d note=%d\n",
 		decision.OpenFindings["blocker"], decision.OpenFindings["major"], decision.OpenFindings["minor"], decision.OpenFindings["note"])
 	fmt.Printf("Usage: %s\n", formatUsage(decision.Usage))
+	for _, disagreement := range decision.Disagreements {
+		fmt.Printf("Disagreement: %s\n", disagreement)
+	}
 	if decision.RecordPath != "" {
 		fmt.Println("Record:", decision.RecordPath)
 	}

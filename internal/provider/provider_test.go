@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/herikwebb/cora/internal/config"
 	"github.com/herikwebb/cora/internal/model"
@@ -35,6 +36,31 @@ func TestCodexReviewArgsUseGenericExecForAuditedPrompt(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Codex args = %v, want %v", got, want)
+	}
+}
+
+func TestClassifyQuotaFailureExtractsRetryTime(t *testing.T) {
+	now := time.Date(2026, 8, 25, 10, 30, 0, 0, time.FixedZone("ET", -4*60*60))
+	result := model.ReviewerResult{Error: "You've hit your usage limit; resets 11:50am"}
+	classifyFailure(&result, now)
+	if result.FailureKind != "quota" || !result.Retryable || result.RetryAt == nil {
+		t.Fatalf("quota classification = %#v", result)
+	}
+	want := time.Date(2026, 8, 25, 11, 50, 0, 0, now.Location())
+	if !result.RetryAt.Equal(want) {
+		t.Fatalf("retry time = %s, want %s", result.RetryAt, want)
+	}
+}
+
+func TestQuotaRetryAtUsesProviderTimezone(t *testing.T) {
+	now := time.Date(2026, 8, 25, 15, 22, 0, 0, time.UTC)
+	retryAt, quota := QuotaRetryAt("You've hit your session limit · resets 11:50am (America/New_York)", now)
+	if !quota {
+		t.Fatal("quota failure was not recognized")
+	}
+	want := time.Date(2026, 8, 25, 15, 50, 0, 0, time.UTC)
+	if !retryAt.Equal(want) {
+		t.Fatalf("retry at = %s, want %s", retryAt, want)
 	}
 }
 

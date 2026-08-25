@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/herikwebb/cora/internal/config"
 	"github.com/herikwebb/cora/internal/gitx"
@@ -28,6 +29,57 @@ func TestRootCommandUsesReviewInsteadOfRun(t *testing.T) {
 	}
 	if !slices.Contains(names, "config") {
 		t.Fatalf("root commands %v do not include config", names)
+	}
+	for _, name := range []string{"retry", "list", "status", "show"} {
+		if !slices.Contains(names, name) {
+			t.Fatalf("root commands %v do not include %s", names, name)
+		}
+	}
+}
+
+func TestSelectRetryReviewersDefaultsToIncompleteProviders(t *testing.T) {
+	results := []model.ReviewerResult{
+		{Reviewer: "codex", Status: "completed", Report: &model.ReviewReport{Verdict: "approve"}},
+		{Reviewer: "claude", Status: "incomplete", FailureKind: "quota"},
+	}
+	selected, err := selectRetryReviewers(results, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 || !selected["claude"] || selected["codex"] {
+		t.Fatalf("selected reviewers = %#v", selected)
+	}
+}
+
+func TestQuotaNotBeforeSelectsOnlyRequestedReviewer(t *testing.T) {
+	now := time.Date(2026, 8, 25, 9, 30, 0, 0, time.FixedZone("EDT", -4*60*60))
+	retryAt := now.Add(time.Hour)
+	results := []model.ReviewerResult{
+		{Reviewer: "claude", Retryable: true, RetryAt: &retryAt},
+		{Reviewer: "codex", Retryable: true, RetryAt: &retryAt},
+	}
+	notBefore := quotaNotBefore(results, map[string]bool{"claude": true}, now, now)
+	if len(notBefore) != 1 || !notBefore["claude"].Equal(retryAt) {
+		t.Fatalf("quota queue = %#v", notBefore)
+	}
+}
+
+func TestQuotaNotBeforeRecoversResetFromLegacyReviewerError(t *testing.T) {
+	eastern, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedAt := time.Date(2026, 8, 25, 11, 22, 0, 0, eastern)
+	now := time.Date(2026, 8, 25, 11, 30, 0, 0, eastern)
+	results := []model.ReviewerResult{{
+		Reviewer: "claude", Status: "incomplete",
+		Error: "Claude review failed: You've hit your session limit · resets 11:50am (America/New_York)",
+	}}
+
+	notBefore := quotaNotBefore(results, map[string]bool{"claude": true}, observedAt, now)
+	want := time.Date(2026, 8, 25, 11, 50, 0, 0, eastern)
+	if got := notBefore["claude"]; !got.Equal(want) {
+		t.Fatalf("recovered retry time = %s, want %s", got, want)
 	}
 }
 
