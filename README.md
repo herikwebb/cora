@@ -15,7 +15,9 @@ surface is:
 
 ```text
 cora review    review a branch, range, commit, or working tree
+cora retry     retry selected reviewers while reusing completed results
 cora status    show the latest local run
+cora list      list and filter saved runs
 cora show      show a saved run
 cora verify    verify that an approval still matches a Git commit
 cora completion
@@ -62,7 +64,17 @@ cora review --uncommitted
 # risk obvious.
 cora review --base upstream/main --security-sensitive
 
-cora status
+# Run built-in Go validation in a disposable worktree. Host execution still
+# requires an explicit trust decision.
+cora review --base upstream/main --profile auto --allow-unsafe-checks
+
+# Retain the completed Codex result and queue only Claude until a recorded
+# quota reset time.
+cora retry latest --reviewer claude
+
+cora status --active
+cora list --state incomplete
+cora show latest --verbose
 cora show latest --json
 cora verify --head HEAD
 ```
@@ -132,6 +144,7 @@ enabled = true
 command = "codex"
 model = "gpt-5.6"
 effort = "high"
+max_concurrency = 2
 
 [reviewers.claude]
 enabled = true
@@ -139,11 +152,13 @@ command = "claude"
 model = "opus"
 effort = "high"
 max_turns = 50
+max_concurrency = 1
 
 [escalation]
 enabled = true
 model = "fable"
 effort = "high"
+adjudicate_disagreements = true
 security_path_markers = [
   "/.github/workflows/", "/auth/", "/security/", "/crypto/",
   "/iam/", "/permissions/", "/secrets/", "/credentials/", "oauth", "jwt",
@@ -154,6 +169,15 @@ name = "unit"
 command = ["go", "test", "./..."]
 timeout = "10m"
 env_allowlist = []
+
+[[validation_profiles]]
+name = "go-fast"
+
+[[validation_profiles.checks]]
+name = "go-test"
+command = ["go", "test", "./..."]
+timeout = "15m"
+env_allowlist = []
 ```
 
 By default, CORA refuses API-key authentication. Pass `--allow-api-billing`
@@ -163,9 +187,17 @@ Configured checks execute code from the reviewed tree. Until sandboxed check
 execution is available, CORA refuses to run them unless
 `--allow-unsafe-checks` is passed or `allow_unsafe_host_checks = true` is set.
 Allowed host checks receive a minimal environment with an ephemeral home and
-temporary directory. Add only explicitly required variable names to a check's
-`env_allowlist`; this reduces credential exposure but is not a filesystem or
-network sandbox.
+temporary directory and execute in a disposable detached worktree that is
+removed afterward. Add only explicitly required variable names to a check's
+`env_allowlist`; this protects the user's checkout and reduces credential
+exposure, but it is not a filesystem or network sandbox.
+
+Named validation profiles group checks without forcing every repository to use
+one global check list. `--profile auto` currently selects Cora's built-in `go`
+profile when the reviewed commit contains `go.mod`; `--profile go` selects it
+directly. Trusted base configuration can define additional
+`[[validation_profiles]]`. Profile checks retain the same
+`--allow-unsafe-checks` requirement.
 
 `minimum_approvals = 2` makes the default policy true two-agent consensus. All
 enabled reviewers must complete with full context; a blocking finding or a
@@ -177,10 +209,13 @@ instead. `--security-sensitive` forces the same behavior when path matching is
 not sufficient. When ordinary completed reviews disagree, CORA runs a separate
 Fable/high adjudication and retains all three reports; escalation is fail-closed
 and never removes a finding from an earlier report.
+Set `adjudicate_disagreements = false` or pass `--no-adjudication` to retain the
+disagreement without launching the extra provider request.
 
 `effort` accepts `low`, `medium`, `high`, `xhigh`, or `max`; Codex also accepts
-`none` and `minimal`. Codex defaults to GPT-5.6 at high effort so its effective selection
-and API-equivalent pricing are reproducible even when user CLI defaults change.
+`none` and `minimal`. Codex defaults to GPT-5.6 at high effort so its effective
+selection and API-equivalent pricing are reproducible even when user CLI
+defaults change.
 
 The policy fails closed. A timeout, malformed response, missing reviewer,
 incomplete context, or interrupted check produces `incomplete`, never an
@@ -196,6 +231,15 @@ The Claude adapter requires first-party Claude.ai subscription authentication
 and runs in safe plan mode with read-only tools. Common API-key environment
 variables are removed unless `--allow-api-billing` is explicitly passed.
 
+Provider concurrency is queued across Cora processes and repositories for the
+same user. Claude defaults to one concurrent request and Codex to two; adjust
+`max_concurrency` per reviewer when the subscription permits it. Quota failures
+are marked retryable and their reset time is saved when the CLI reports one.
+`cora retry` creates a child run, reuses completed base reviewers and checks,
+and queues only the selected provider. It also recovers reset timestamps from
+older saved Claude errors that predate the structured retry field. `--no-wait`
+returns immediately when a saved reset time is still in the future.
+
 After every reviewer and at the end of a run, CORA prints the effective model,
 effort, turns, thinking tokens, and API-equivalent cost. The normalized values
 are also saved per reviewer and in aggregate in `manifest.json` and
@@ -204,6 +248,13 @@ calculated from its reported tokens and the pricing table named by
 `cost_source`. A metric is shown as `n/a` when the installed provider CLI does
 not expose enough telemetry, and mixed-availability totals are labeled
 `partial` rather than silently treated as complete.
+Durations in JSON use integer `duration_ms` and `elapsed_ms` fields instead of
+Go's nanosecond representation.
+
+Equivalent findings are consolidated by location and claim similarity for the
+decision and human summary while each original reviewer report remains intact.
+`cora show --verbose` adds confidence, evidence, suggested fixes, omitted paths,
+and residual risks.
 
 ## Records
 
@@ -218,6 +269,16 @@ to the source tree. Each record includes the canonical patch, exact prompt and
 schema, raw tool logs, normalized reviewer reports, check logs, manifest, event
 stream, and deterministic decision. Publishing signed records to a dedicated
 Git ref is planned as a separate command.
+
+Each active run updates `heartbeat.json` every 30 seconds and prints elapsed
+time to stderr. `cora status --active` lists live runs, and `cora list` supports
+state and head-SHA filters. `latest` is resolved by run start time instead of
+completion order, so concurrent reviews cannot overwrite its meaning.
+
+Builds embed the Cora source SHA and UTC build time. Manifests record those
+values plus a credential-free repository identity such as
+`github.com/herikwebb/cora`; repositories without a remote fall back to their
+root commit identity.
 
 The current record is local and is not cryptographically signed. Treat Git-ref
 publication, signatures, and a GitHub status-check bridge as follow-on work
