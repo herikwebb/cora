@@ -1,5 +1,10 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || printf dev)
-LDFLAGS := -s -w -X github.com/herikwebb/cora/internal/cli.Version=$(VERSION)
+SOURCE_SHA ?= $(shell git rev-parse HEAD 2>/dev/null || printf unknown)
+BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -s -w \
+	-X github.com/herikwebb/cora/internal/cli.Version=$(VERSION) \
+	-X github.com/herikwebb/cora/internal/cli.SourceSHA=$(SOURCE_SHA) \
+	-X github.com/herikwebb/cora/internal/cli.BuildTime=$(BUILD_TIME)
 INSTALL_DIR ?= $(HOME)/.local/bin
 
 .PHONY: build install test clean
