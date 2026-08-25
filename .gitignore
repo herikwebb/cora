@@ -1,0 +1,5 @@
+/bin/
+/dist/
+/.cora/
+*.test
+coverage.out

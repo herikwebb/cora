@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CORA reviewer report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "verdict",
+    "context_complete",
+    "summary",
+    "findings",
+    "reviewed_paths",
+    "omitted_paths",
+    "residual_risks"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1" },
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "request_changes", "abstain"]
+    },
+    "context_complete": { "type": "boolean" },
+    "summary": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "confidence",
+          "file",
+          "line",
+          "claim",
+          "evidence",
+          "suggested_fix"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": {
+            "type": "string",
+            "enum": ["blocker", "major", "minor", "note"]
+          },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 0 },
+          "claim": { "type": "string" },
+          "evidence": { "type": "string" },
+          "suggested_fix": { "type": "string" }
+        }
+      }
+    },
+    "reviewed_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "omitted_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "residual_risks": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
