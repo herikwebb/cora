@@ -14,12 +14,13 @@ import (
 
 func Evaluate(runID string, target model.Target, reviewers []model.ReviewerResult, checks []model.CheckResult, blocking []string, minimumApprovals int, now time.Time) model.Decision {
 	decision := model.Decision{
-		SchemaVersion: model.SchemaVersion,
-		RunID:         runID,
-		BaseSHA:       target.BaseSHA,
-		HeadSHA:       target.HeadSHA,
-		DiffHash:      target.DiffHash,
-		Reviewers:     make(map[string]string, len(reviewers)),
+		SchemaVersion:  model.SchemaVersion,
+		RunID:          runID,
+		BaseSHA:        target.BaseSHA,
+		HeadSHA:        target.HeadSHA,
+		DiffHash:       target.DiffHash,
+		Reviewers:      make(map[string]string, len(reviewers)),
+		ReviewerErrors: make(map[string]string),
 		OpenFindings: map[string]int{
 			"blocker": 0,
 			"major":   0,
@@ -49,13 +50,24 @@ func Evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 	var residualRisks []string
 	verdictNames := make(map[string][]string)
 	for _, reviewer := range reviewers {
-		if reviewer.Status != "completed" || reviewer.Report == nil {
+		if reviewer.Report == nil {
 			decision.Reviewers[reviewer.Reviewer] = "incomplete"
+			if reviewer.Error != "" {
+				decision.ReviewerErrors[reviewer.Reviewer] = reviewer.Error
+			}
 			incomplete = true
 			continue
 		}
 		report := reviewer.Report
-		decision.Reviewers[reviewer.Reviewer] = report.Verdict
+		if reviewer.Status == "completed" {
+			decision.Reviewers[reviewer.Reviewer] = report.Verdict
+		} else {
+			decision.Reviewers[reviewer.Reviewer] = "partial"
+			incomplete = true
+			if reviewer.Error != "" {
+				decision.ReviewerErrors[reviewer.Reviewer] = reviewer.Error
+			}
+		}
 		verdictNames[report.Verdict] = append(verdictNames[report.Verdict], reviewer.Reviewer)
 		if !report.ContextComplete {
 			incomplete = true
@@ -122,7 +134,13 @@ func Evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 		decision.Reason = "working-tree reviews are advisory and cannot create an approval"
 	default:
 		decision.State = model.StateApproved
-		decision.Reason = fmt.Sprintf("all %d reviewers approved the exact change", len(reviewers))
+		nonBlocking := decision.OpenFindings["minor"] + decision.OpenFindings["note"]
+		if nonBlocking > 0 {
+			decision.OutcomeQualifier = "non_blocking_findings"
+			decision.Reason = fmt.Sprintf("all %d reviewers approved the exact change with %d non-blocking findings", len(reviewers), nonBlocking)
+		} else {
+			decision.Reason = fmt.Sprintf("all %d reviewers approved the exact change", len(reviewers))
+		}
 	}
 	return decision
 }
@@ -190,11 +208,23 @@ func equivalentFinding(existing model.ConsolidatedFinding, candidate model.Findi
 	}
 	left := findingTokens(existing.Claim)
 	right := findingTokens(candidate.Claim)
-	if jaccard(left, right) >= 0.45 {
+	claimSimilarity, shared := tokenSimilarity(left, right)
+	lineDistance := abs(existing.Line - candidate.Line)
+	if claimSimilarity >= 0.45 || (lineDistance == 0 && shared >= 4 && claimSimilarity >= 0.25) || (lineDistance <= 3 && shared >= 4 && claimSimilarity >= 0.33) {
 		return true
 	}
 	for _, evidence := range existing.Evidence {
 		if normalizedText(evidence) != "" && normalizedText(evidence) == normalizedText(candidate.Evidence) {
+			return true
+		}
+		evidenceSimilarity, evidenceShared := tokenSimilarity(findingTokens(evidence), findingTokens(candidate.Evidence))
+		if evidenceShared >= 4 && evidenceSimilarity >= 0.5 {
+			return true
+		}
+	}
+	for _, fix := range existing.SuggestedFixes {
+		fixSimilarity, fixShared := tokenSimilarity(findingTokens(fix), findingTokens(candidate.SuggestedFix))
+		if lineDistance == 0 && fixShared >= 3 && fixSimilarity >= 0.5 {
 			return true
 		}
 	}
@@ -202,17 +232,70 @@ func equivalentFinding(existing model.ConsolidatedFinding, candidate model.Findi
 }
 
 func findingTokens(value string) map[string]bool {
-	stop := map[string]bool{"a": true, "an": true, "and": true, "the": true, "to": true, "of": true, "in": true, "is": true, "can": true, "could": true, "may": true}
+	stop := map[string]bool{
+		"a": true, "an": true, "and": true, "are": true, "as": true, "at": true, "be": true,
+		"by": true, "can": true, "could": true, "does": true, "for": true, "from": true,
+		"in": true, "is": true, "it": true, "may": true, "new": true, "not": true, "of": true,
+		"on": true, "only": true, "or": true, "that": true, "the": true, "this": true, "to": true,
+		"when": true, "where": true, "which": true, "with": true, "without": true,
+	}
 	words := strings.FieldsFunc(strings.ToLower(value), func(character rune) bool {
 		return !unicode.IsLetter(character) && !unicode.IsDigit(character)
 	})
 	tokens := make(map[string]bool)
 	for _, word := range words {
+		word = normalizeToken(stemToken(word))
 		if len(word) > 1 && !stop[word] {
 			tokens[word] = true
 		}
 	}
 	return tokens
+}
+
+func normalizeToken(word string) string {
+	switch word {
+	case "assert", "assertion", "check", "postcondition", "verify", "verification":
+		return "assert"
+	case "delet", "deleted", "undelet":
+		return "delete"
+	case "exist", "left", "present", "retain", "remain":
+		return "remain"
+	case "namespace", "namespac":
+		return "namespace"
+	default:
+		return word
+	}
+}
+
+func stemToken(word string) string {
+	for _, suffix := range []string{"ization", "ations", "ation", "ments", "ment", "ingly", "edly", "ing", "ied", "ed", "es", "s"} {
+		if strings.HasSuffix(word, suffix) && len(word)-len(suffix) >= 4 {
+			stem := strings.TrimSuffix(word, suffix)
+			if suffix == "ied" {
+				stem += "y"
+			}
+			return stem
+		}
+	}
+	return word
+}
+
+func tokenSimilarity(left, right map[string]bool) (float64, int) {
+	if len(left) == 0 || len(right) == 0 {
+		return 0, 0
+	}
+	intersection := 0
+	for token := range left {
+		if right[token] {
+			intersection++
+		}
+	}
+	smaller := len(left)
+	if len(right) < smaller {
+		smaller = len(right)
+	}
+	containment := float64(intersection) / float64(smaller)
+	return max(jaccard(left, right), containment), intersection
 }
 
 func jaccard(left, right map[string]bool) float64 {

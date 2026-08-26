@@ -65,25 +65,27 @@ type ReviewReport struct {
 }
 
 type ReviewerResult struct {
-	Reviewer        string        `json:"reviewer"`
-	Status          string        `json:"status"`
-	Duration        Duration      `json:"duration_ms"`
-	Report          *ReviewReport `json:"report,omitempty"`
-	Error           string        `json:"error,omitempty"`
-	ExitCode        int           `json:"exit_code,omitempty"`
-	Auth            string        `json:"auth,omitempty"`
-	Tool            string        `json:"tool,omitempty"`
-	ToolVersion     string        `json:"tool_version,omitempty"`
-	Model           string        `json:"model,omitempty"`
-	ModelSource     string        `json:"model_source,omitempty"`
-	Effort          string        `json:"effort,omitempty"`
-	EscalationCause string        `json:"escalation_cause,omitempty"`
-	Attempt         int           `json:"attempt"`
-	ReusedFromRunID string        `json:"reused_from_run_id,omitempty"`
-	FailureKind     string        `json:"failure_kind,omitempty"`
-	Retryable       bool          `json:"retryable,omitempty"`
-	RetryAt         *time.Time    `json:"retry_at,omitempty"`
-	Usage           Usage         `json:"usage"`
+	Reviewer          string        `json:"reviewer"`
+	Status            string        `json:"status"`
+	Duration          Duration      `json:"duration_ms"`
+	QueueDuration     Duration      `json:"queue_duration_ms"`
+	ExecutionDuration Duration      `json:"execution_duration_ms"`
+	Report            *ReviewReport `json:"report,omitempty"`
+	Error             string        `json:"error,omitempty"`
+	ExitCode          int           `json:"exit_code,omitempty"`
+	Auth              string        `json:"auth,omitempty"`
+	Tool              string        `json:"tool,omitempty"`
+	ToolVersion       string        `json:"tool_version,omitempty"`
+	Model             string        `json:"model,omitempty"`
+	ModelSource       string        `json:"model_source,omitempty"`
+	Effort            string        `json:"effort,omitempty"`
+	EscalationCause   string        `json:"escalation_cause,omitempty"`
+	Attempt           int           `json:"attempt"`
+	ReusedFromRunID   string        `json:"reused_from_run_id,omitempty"`
+	FailureKind       string        `json:"failure_kind,omitempty"`
+	Retryable         bool          `json:"retryable,omitempty"`
+	RetryAt           *time.Time    `json:"retry_at,omitempty"`
+	Usage             Usage         `json:"usage"`
 }
 
 // Duration is encoded as milliseconds so JSON never exposes Go's nanosecond
@@ -125,6 +127,16 @@ type Usage struct {
 	CostSource               string  `json:"cost_source,omitempty"`
 }
 
+type ProviderQueueStatus struct {
+	Provider string     `json:"provider"`
+	Position int        `json:"position"`
+	Ahead    int        `json:"ahead"`
+	Active   int        `json:"active"`
+	Limit    int        `json:"limit"`
+	WaitMS   int64      `json:"wait_ms"`
+	ETAAt    *time.Time `json:"eta_at,omitempty"`
+}
+
 type CheckResult struct {
 	Name            string   `json:"name"`
 	Profile         string   `json:"profile,omitempty"`
@@ -150,22 +162,26 @@ type EscalationMetadata struct {
 }
 
 type Decision struct {
-	SchemaVersion string                `json:"schema_version"`
-	RunID         string                `json:"run_id"`
-	State         string                `json:"state"`
-	Reason        string                `json:"reason"`
-	BaseSHA       string                `json:"base_sha"`
-	HeadSHA       string                `json:"head_sha"`
-	DiffHash      string                `json:"diff_hash"`
-	Reviewers     map[string]string     `json:"reviewers"`
-	OpenFindings  map[string]int        `json:"open_findings"`
-	Findings      []ConsolidatedFinding `json:"findings,omitempty"`
-	ResidualRisks []string              `json:"residual_risks,omitempty"`
-	Disagreements []string              `json:"disagreements,omitempty"`
-	Checks        map[string]string     `json:"checks,omitempty"`
-	Usage         Usage                 `json:"usage"`
-	CreatedAt     time.Time             `json:"created_at"`
-	RecordPath    string                `json:"record_path,omitempty"`
+	SchemaVersion    string                `json:"schema_version"`
+	RunID            string                `json:"run_id"`
+	State            string                `json:"state"`
+	OutcomeQualifier string                `json:"outcome_qualifier,omitempty"`
+	Reason           string                `json:"reason"`
+	BaseSHA          string                `json:"base_sha"`
+	HeadSHA          string                `json:"head_sha"`
+	DiffHash         string                `json:"diff_hash"`
+	Reviewers        map[string]string     `json:"reviewers"`
+	ReviewerErrors   map[string]string     `json:"reviewer_errors,omitempty"`
+	OpenFindings     map[string]int        `json:"open_findings"`
+	Findings         []ConsolidatedFinding `json:"findings,omitempty"`
+	ResidualRisks    []string              `json:"residual_risks,omitempty"`
+	Disagreements    []string              `json:"disagreements,omitempty"`
+	Checks           map[string]string     `json:"checks,omitempty"`
+	Usage            Usage                 `json:"usage"`
+	IncrementalUsage Usage                 `json:"incremental_usage"`
+	CumulativeUsage  Usage                 `json:"cumulative_usage"`
+	CreatedAt        time.Time             `json:"created_at"`
+	RecordPath       string                `json:"record_path,omitempty"`
 }
 
 type Manifest struct {
@@ -188,30 +204,34 @@ type Manifest struct {
 	Security           SecurityMetadata   `json:"security"`
 	Escalation         EscalationMetadata `json:"escalation"`
 	Usage              Usage              `json:"usage"`
+	IncrementalUsage   Usage              `json:"incremental_usage"`
+	CumulativeUsage    Usage              `json:"cumulative_usage"`
 }
 
 type Heartbeat struct {
-	RunID     string            `json:"run_id"`
-	State     string            `json:"state"`
-	Phase     string            `json:"phase"`
-	StartedAt time.Time         `json:"started_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
-	PID       int               `json:"pid"`
-	Reviewers map[string]string `json:"reviewers,omitempty"`
-	Checks    map[string]string `json:"checks,omitempty"`
+	RunID     string                         `json:"run_id"`
+	State     string                         `json:"state"`
+	Phase     string                         `json:"phase"`
+	StartedAt time.Time                      `json:"started_at"`
+	UpdatedAt time.Time                      `json:"updated_at"`
+	PID       int                            `json:"pid"`
+	Reviewers map[string]string              `json:"reviewers,omitempty"`
+	Checks    map[string]string              `json:"checks,omitempty"`
+	Queues    map[string]ProviderQueueStatus `json:"queues,omitempty"`
 }
 
 type RunSummary struct {
-	RunID              string            `json:"run_id"`
-	State              string            `json:"state"`
-	Phase              string            `json:"phase,omitempty"`
-	StartedAt          time.Time         `json:"started_at"`
-	FinishedAt         time.Time         `json:"finished_at,omitempty"`
-	ElapsedMS          int64             `json:"elapsed_ms"`
-	HeadSHA            string            `json:"head_sha"`
-	ParentRunID        string            `json:"parent_run_id,omitempty"`
-	RepositoryIdentity string            `json:"repository_identity,omitempty"`
-	Reviewers          map[string]string `json:"reviewers,omitempty"`
-	Checks             map[string]string `json:"checks,omitempty"`
-	RecordPath         string            `json:"record_path"`
+	RunID              string                         `json:"run_id"`
+	State              string                         `json:"state"`
+	Phase              string                         `json:"phase,omitempty"`
+	StartedAt          time.Time                      `json:"started_at"`
+	FinishedAt         time.Time                      `json:"finished_at,omitempty"`
+	ElapsedMS          int64                          `json:"elapsed_ms"`
+	HeadSHA            string                         `json:"head_sha"`
+	ParentRunID        string                         `json:"parent_run_id,omitempty"`
+	RepositoryIdentity string                         `json:"repository_identity,omitempty"`
+	Reviewers          map[string]string              `json:"reviewers,omitempty"`
+	Checks             map[string]string              `json:"checks,omitempty"`
+	Queues             map[string]ProviderQueueStatus `json:"queues,omitempty"`
+	RecordPath         string                         `json:"record_path"`
 }
