@@ -185,29 +185,40 @@ func (r Runner) RunWithOptions(parent context.Context, repo gitx.Repo, target mo
 		r.progressf("cora: security-sensitive review; Claude escalated to %s/%s\n", cfg.Escalation.Model, cfg.Escalation.Effort)
 	}
 
-	overallTimeout := cfg.OverallTimeout.Duration + maximumQueueDelay(options.NotBefore, time.Now())
-	overallCtx, cancelOverall := context.WithTimeout(parent, overallTimeout)
-	defer cancelOverall()
+	execution := newExecutionBudget(parent, cfg.OverallTimeout.Duration)
+	defer execution.Close()
+	queueCtx, cancelQueue := context.WithTimeout(parent, cfg.QueueTimeout.Duration)
+	defer cancelQueue()
+	stopQueueOnExecutionTimeout := context.AfterFunc(execution.Context(), cancelQueue)
+	defer stopQueueOnExecutionTimeout()
 
-	onReviewerQueue := func(name, providerName string) error {
+	onReviewerQueue := func(name string, status model.ProviderQueueStatus) error {
 		heartbeat.Reviewer(name, "queued")
-		r.progressf("cora: reviewer %s queued for %s capacity\n", name, providerName)
-		return record.AppendEvent(run, map[string]any{"type": "reviewer.queued", "at": time.Now().UTC(), "reviewer": name, "provider": providerName})
+		heartbeat.Queue(name, status)
+		eta := "unknown"
+		if status.ETAAt != nil {
+			eta = status.ETAAt.Local().Format(time.RFC3339)
+		}
+		r.progressf("cora: reviewer %s queued for %s capacity (position=%d ahead=%d eta=%s)\n", name, status.Provider, status.Position, status.Ahead, eta)
+		return record.AppendEvent(run, map[string]any{"type": "reviewer.queued", "at": time.Now().UTC(), "reviewer": name, "queue": status})
 	}
 	onReviewerStart := func(name string) error {
+		heartbeat.ClearQueue(name)
 		heartbeat.Reviewer(name, "running")
 		r.progressf("cora: reviewer %s started\n", name)
 		return record.AppendEvent(run, map[string]any{"type": "reviewer.started", "at": time.Now().UTC(), "reviewer": name})
 	}
 	onReviewerFinish := func(result model.ReviewerResult) error {
+		heartbeat.ClearQueue(result.Reviewer)
 		heartbeat.Reviewer(result.Reviewer, result.Status)
 		if err := record.WriteJSON(filepath.Join(run.Path, safeName(result.Reviewer)+".json"), result); err != nil {
 			return err
 		}
-		r.progressf("cora: reviewer %s %s in %s (%s)\n", result.Reviewer, result.Status, formatDuration(result.Duration.Duration), formatReviewerUsage(result))
+		r.progressf("cora: reviewer %s %s in %s execution + %s queue (%s)\n", result.Reviewer, result.Status, formatDuration(result.ExecutionDuration.Duration), formatDuration(result.QueueDuration.Duration), formatReviewerUsage(result))
 		return record.AppendEvent(run, map[string]any{
 			"type": "reviewer.finished", "at": time.Now().UTC(), "reviewer": result.Reviewer,
 			"status": result.Status, "duration_ms": result.Duration.Milliseconds(), "model": result.Model,
+			"queue_duration_ms": result.QueueDuration.Milliseconds(), "execution_duration_ms": result.ExecutionDuration.Milliseconds(),
 			"effort": result.Effort, "escalation_cause": result.EscalationCause, "failure_kind": result.FailureKind,
 			"retryable": result.Retryable, "retry_at": result.RetryAt, "usage": result.Usage,
 		})
@@ -227,11 +238,13 @@ func (r Runner) RunWithOptions(parent context.Context, repo gitx.Repo, target mo
 	for reviewer, notBefore := range options.NotBefore {
 		if notBefore.After(time.Now()) {
 			heartbeat.Reviewer(reviewer, "quota-queued")
+			resetAt := notBefore
+			heartbeat.Queue(reviewer, model.ProviderQueueStatus{Provider: reviewer, Position: 0, ETAAt: &resetAt})
 			_ = record.AppendEvent(run, map[string]any{"type": "reviewer.quota_queued", "at": time.Now().UTC(), "reviewer": reviewer, "not_before": notBefore})
 			r.progressf("cora: reviewer %s queued until provider quota resets at %s\n", reviewer, notBefore.Local().Format(time.RFC3339))
 		}
 	}
-	newReviewers, err := runReviewerAdapters(overallCtx, initialAdapters, executionRepo, reviewerWorkDir, run, target, cfg, prompt, reviewerSecurityPolicy, schemaPath,
+	newReviewers, err := runReviewerAdapters(queueCtx, execution, initialAdapters, executionRepo, reviewerWorkDir, run, target, cfg, prompt, reviewerSecurityPolicy, schemaPath,
 		reviewerCallbacks{Queued: onReviewerQueue, Started: onReviewerStart, Finished: onReviewerFinish}, attempts, options.NotBefore)
 	if err != nil {
 		return model.Decision{}, err
@@ -250,7 +263,7 @@ func (r Runner) RunWithOptions(parent context.Context, repo gitx.Repo, target mo
 		_ = record.AppendEvent(run, map[string]any{"type": "review.escalated", "at": time.Now().UTC(), "cause": "disputed", "model": escalatedConfig.Model, "effort": escalatedConfig.Effort})
 		r.progressf("cora: reviewers disagree; escalating to %s/%s\n", escalatedConfig.Model, escalatedConfig.Effort)
 		escalationPrompt := disputeEscalationPrompt(prompt, reviewers)
-		escalated, escalationErr := runReviewerAdapters(overallCtx, []provider.Adapter{provider.Claude{
+		escalated, escalationErr := runReviewerAdapters(queueCtx, execution, []provider.Adapter{provider.Claude{
 			Config: escalatedConfig, ReviewerName: "claude-escalation", EscalationCause: "disputed",
 		}}, executionRepo, reviewerWorkDir, run, target, cfg, escalationPrompt, reviewerSecurityPolicy, schemaPath,
 			reviewerCallbacks{Queued: onReviewerQueue, Started: onReviewerStart, Finished: onReviewerFinish}, attempts, nil)
@@ -272,14 +285,18 @@ func (r Runner) RunWithOptions(parent context.Context, repo gitx.Repo, target mo
 	}
 	var newChecks []model.CheckResult
 	if !options.ReuseChecks && len(cfg.Checks) > 0 {
-		checkWorkspace, workspaceErr := repo.PrepareDisposableWorkspace(overallCtx, target)
+		if !execution.Start() {
+			return model.Decision{}, errors.New("overall execution timeout exceeded before checks started")
+		}
+		checkWorkspace, workspaceErr := repo.PrepareDisposableWorkspace(execution.Context(), target)
 		if workspaceErr != nil {
+			execution.Stop()
 			return model.Decision{}, workspaceErr
 		}
 		defer checkWorkspace.Close(context.Background())
 		checkRepo := executionRepo
 		checkRepo.Root = checkWorkspace.Root
-		newChecks, err = runChecks(overallCtx, checkRepo, run, cfg,
+		newChecks, err = runChecks(execution.Context(), checkRepo, run, cfg,
 			func(name string) error {
 				heartbeat.Check(name, "running")
 				r.progressf("cora: check %s started\n", name)
@@ -290,6 +307,7 @@ func (r Runner) RunWithOptions(parent context.Context, repo gitx.Repo, target mo
 				r.progressf("cora: check %s %s in %s\n", result.Name, result.Status, formatDuration(result.Duration.Duration))
 				return record.AppendEvent(run, map[string]any{"type": "check.finished", "at": time.Now().UTC(), "check": result.Name, "status": result.Status, "duration_ms": result.Duration.Milliseconds()})
 			})
+		execution.Stop()
 		if err != nil {
 			return model.Decision{}, err
 		}
@@ -298,10 +316,31 @@ func (r Runner) RunWithOptions(parent context.Context, repo gitx.Repo, target mo
 
 	decision := verdict.Evaluate(run.ID, target, reviewers, checks, cfg.BlockingSeverities, cfg.MinimumApprovals, time.Now())
 	decision.RecordPath = run.Path
-	decision.Usage = summarizeNewUsage(reviewers)
+	incrementalUsage := summarizeNewUsage(reviewers)
+	cumulativeUsage := incrementalUsage
+	if options.ParentRunID != "" {
+		parentRun, resolveErr := store.Resolve(options.ParentRunID)
+		if resolveErr != nil {
+			return model.Decision{}, fmt.Errorf("load parent usage: %w", resolveErr)
+		}
+		parentManifest, loadErr := record.LoadManifest(parentRun)
+		if loadErr != nil {
+			return model.Decision{}, fmt.Errorf("load parent usage: %w", loadErr)
+		}
+		parentUsage := parentManifest.CumulativeUsage
+		if usageEmpty(parentUsage) {
+			parentUsage = parentManifest.Usage
+		}
+		cumulativeUsage = addUsage(parentUsage, incrementalUsage)
+	}
+	decision.Usage = cumulativeUsage
+	decision.IncrementalUsage = incrementalUsage
+	decision.CumulativeUsage = cumulativeUsage
 	manifest.Reviewers = reviewers
 	manifest.Checks = checks
-	manifest.Usage = decision.Usage
+	manifest.Usage = cumulativeUsage
+	manifest.IncrementalUsage = incrementalUsage
+	manifest.CumulativeUsage = cumulativeUsage
 	manifest.FinishedAt = time.Now().UTC()
 	if err := record.WriteJSON(filepath.Join(run.Path, "manifest.json"), manifest); err != nil {
 		return model.Decision{}, err
@@ -320,12 +359,12 @@ func (r Runner) RunWithOptions(parent context.Context, repo gitx.Repo, target mo
 }
 
 type reviewerCallbacks struct {
-	Queued   func(string, string) error
+	Queued   func(string, model.ProviderQueueStatus) error
 	Started  func(string) error
 	Finished func(model.ReviewerResult) error
 }
 
-func runReviewerAdapters(ctx context.Context, adapters []provider.Adapter, repo gitx.Repo, workDir string, run record.Run, target model.Target, cfg config.Config, prompt, policy, schemaPath string, callbacks reviewerCallbacks, attempts map[string]int, notBefore map[string]time.Time) ([]model.ReviewerResult, error) {
+func runReviewerAdapters(queueCtx context.Context, execution *executionBudget, adapters []provider.Adapter, repo gitx.Repo, workDir string, run record.Run, target model.Target, cfg config.Config, prompt, policy, schemaPath string, callbacks reviewerCallbacks, attempts map[string]int, notBefore map[string]time.Time) ([]model.ReviewerResult, error) {
 	results := make(chan model.ReviewerResult, len(adapters))
 	var group sync.WaitGroup
 	for _, adapter := range adapters {
@@ -333,35 +372,57 @@ func runReviewerAdapters(ctx context.Context, adapters []provider.Adapter, repo 
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			if err := waitUntil(ctx, notBefore[adapter.Name()]); err != nil {
+			queueStarted := time.Now()
+			if err := waitUntil(queueCtx, notBefore[adapter.Name()]); err != nil {
+				queueDuration := time.Since(queueStarted)
 				results <- model.ReviewerResult{
 					Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()),
 					FailureKind: "quota_queue", Retryable: true, Error: "wait for provider quota reset: " + err.Error(),
+					Duration: model.NewDuration(queueDuration), QueueDuration: model.NewDuration(queueDuration),
 				}
 				return
 			}
-			if callbacks.Queued != nil {
-				if err := callbacks.Queued(adapter.Name(), adapter.Provider()); err != nil {
-					results <- model.ReviewerResult{Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()), Error: err.Error()}
-					return
+			var queueCallbackErr error
+			lease, err := record.AcquireProviderQueued(queueCtx, adapter.Provider(), providerConcurrency(cfg, adapter.Provider()), record.ProviderQueueRequest{
+				RunID: run.ID, Reviewer: adapter.Name(),
+			}, func(status model.ProviderQueueStatus) {
+				if queueCallbackErr == nil && callbacks.Queued != nil {
+					queueCallbackErr = callbacks.Queued(adapter.Name(), status)
 				}
+			})
+			if queueCallbackErr != nil {
+				if err == nil {
+					_ = lease.Release()
+				}
+				queueDuration := time.Since(queueStarted)
+				results <- model.ReviewerResult{Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()), Error: queueCallbackErr.Error(), Duration: model.NewDuration(queueDuration), QueueDuration: model.NewDuration(queueDuration)}
+				return
 			}
-			lease, err := record.AcquireProvider(ctx, adapter.Provider(), providerConcurrency(cfg, adapter.Provider()), nil)
 			if err != nil {
+				queueDuration := time.Since(queueStarted)
 				results <- model.ReviewerResult{
 					Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()),
 					FailureKind: "provider_queue", Retryable: true, Error: "wait for provider capacity: " + err.Error(),
+					Duration: model.NewDuration(queueDuration), QueueDuration: model.NewDuration(queueDuration),
 				}
 				return
 			}
-			defer lease.Release()
+			queueDuration := time.Since(queueStarted)
+			if !execution.Start() {
+				_ = lease.Release()
+				results <- model.ReviewerResult{Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()), Error: "overall execution timeout exceeded", FailureKind: "overall_timeout", Duration: model.NewDuration(queueDuration), QueueDuration: model.NewDuration(queueDuration)}
+				return
+			}
 			if callbacks.Started != nil {
 				if err := callbacks.Started(adapter.Name()); err != nil {
-					results <- model.ReviewerResult{Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()), Error: err.Error()}
+					execution.Stop()
+					_ = lease.Release()
+					executionDuration := time.Since(queueStarted) - queueDuration
+					results <- model.ReviewerResult{Reviewer: adapter.Name(), Status: "incomplete", Attempt: attemptFor(attempts, adapter.Name()), Error: err.Error(), Duration: model.NewDuration(queueDuration + executionDuration), QueueDuration: model.NewDuration(queueDuration), ExecutionDuration: model.NewDuration(executionDuration)}
 					return
 				}
 			}
-			results <- adapter.Review(ctx, provider.Request{
+			result := adapter.Review(execution.Context(), provider.Request{
 				RepoRoot:        repo.Root,
 				WorkDir:         workDir,
 				Target:          target,
@@ -373,7 +434,14 @@ func runReviewerAdapters(ctx context.Context, adapters []provider.Adapter, repo 
 				Timeout:         cfg.ReviewerTimeout.Duration,
 				AllowAPIBilling: cfg.AllowAPIBilling,
 				Attempt:         attemptFor(attempts, adapter.Name()),
+				ChangedPaths:    changedPathsForTarget(repo, execution.Context(), target),
 			})
+			execution.Stop()
+			_ = lease.Release()
+			result.QueueDuration = model.NewDuration(queueDuration)
+			result.ExecutionDuration = result.Duration
+			result.Duration = model.NewDuration(queueDuration + result.ExecutionDuration.Duration)
+			results <- result
 		}()
 	}
 	go func() {
@@ -390,6 +458,14 @@ func runReviewerAdapters(ctx context.Context, adapters []provider.Adapter, repo 
 	}
 	sort.Slice(collected, func(i, j int) bool { return collected[i].Reviewer < collected[j].Reviewer })
 	return collected, callbackErr
+}
+
+func changedPathsForTarget(repo gitx.Repo, ctx context.Context, target model.Target) []string {
+	paths, err := repo.ChangedPaths(ctx, target)
+	if err != nil {
+		return nil
+	}
+	return paths
 }
 
 func waitUntil(ctx context.Context, notBefore time.Time) error {
@@ -706,6 +782,43 @@ func summarizeNewUsage(results []model.ReviewerResult) model.Usage {
 		total.CostSource = "aggregate of reviewer usage"
 	}
 	return total
+}
+
+func addUsage(left, right model.Usage) model.Usage {
+	total := model.Usage{
+		Turns:                  left.Turns + right.Turns,
+		InputTokens:            left.InputTokens + right.InputTokens,
+		CachedInputTokens:      left.CachedInputTokens + right.CachedInputTokens,
+		OutputTokens:           left.OutputTokens + right.OutputTokens,
+		ThinkingTokens:         left.ThinkingTokens + right.ThinkingTokens,
+		APIEquivalentCostUSD:   left.APIEquivalentCostUSD + right.APIEquivalentCostUSD,
+		TurnsKnown:             left.TurnsKnown && right.TurnsKnown,
+		ThinkingTokensKnown:    left.ThinkingTokensKnown && right.ThinkingTokensKnown,
+		APIEquivalentCostKnown: left.APIEquivalentCostKnown && right.APIEquivalentCostKnown,
+	}
+	total.TurnsPartial = left.TurnsPartial || right.TurnsPartial || (left.TurnsKnown != right.TurnsKnown)
+	total.ThinkingTokensPartial = left.ThinkingTokensPartial || right.ThinkingTokensPartial || (left.ThinkingTokensKnown != right.ThinkingTokensKnown)
+	total.APIEquivalentCostPartial = left.APIEquivalentCostPartial || right.APIEquivalentCostPartial || (left.APIEquivalentCostKnown != right.APIEquivalentCostKnown)
+	if left.TurnsKnown && right.TurnsKnown {
+		total.TurnsPartial = false
+	}
+	if left.ThinkingTokensKnown && right.ThinkingTokensKnown {
+		total.ThinkingTokensPartial = false
+	}
+	if left.APIEquivalentCostKnown && right.APIEquivalentCostKnown {
+		total.APIEquivalentCostPartial = false
+	}
+	if left.APIEquivalentCostKnown || right.APIEquivalentCostKnown || total.APIEquivalentCostPartial {
+		total.CostSource = "aggregate across run lineage"
+	}
+	return total
+}
+
+func usageEmpty(usage model.Usage) bool {
+	return usage.Turns == 0 && usage.InputTokens == 0 && usage.CachedInputTokens == 0 &&
+		usage.OutputTokens == 0 && usage.ThinkingTokens == 0 && usage.APIEquivalentCostUSD == 0 &&
+		!usage.TurnsKnown && !usage.TurnsPartial && !usage.ThinkingTokensKnown &&
+		!usage.ThinkingTokensPartial && !usage.APIEquivalentCostKnown && !usage.APIEquivalentCostPartial
 }
 
 func formatReviewerUsage(result model.ReviewerResult) string {

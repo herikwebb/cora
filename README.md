@@ -64,6 +64,10 @@ cora review --uncommitted
 # risk obvious.
 cora review --base upstream/main --security-sensitive
 
+# Opt into an additional Fable adjudication when the ordinary reviewers
+# disagree. This can add substantial provider usage.
+cora review --base upstream/main --adjudicate
+
 # Run built-in Go validation in a disposable worktree. Host execution still
 # requires an explicit trust decision.
 cora review --base upstream/main --profile auto --allow-unsafe-checks
@@ -133,6 +137,7 @@ embedded in the binary. A complete starting file is available at
 base = "upstream/main"
 reviewer_timeout = "15m"
 overall_timeout = "45m"
+queue_timeout = "24h"
 require_clean_tree = true
 allow_api_billing = false
 allow_unsafe_host_checks = false
@@ -142,7 +147,7 @@ blocking_severities = ["blocker", "major"]
 [reviewers.codex]
 enabled = true
 command = "codex"
-model = "gpt-5.6"
+model = "gpt-5.6-sol"
 effort = "high"
 max_concurrency = 2
 
@@ -152,13 +157,16 @@ command = "claude"
 model = "opus"
 effort = "high"
 max_turns = 50
+finalization_turns = 2
+# Optional hard ceiling passed to Claude Code; 0 disables it.
+max_budget_usd = 0
 max_concurrency = 1
 
 [escalation]
 enabled = true
 model = "fable"
 effort = "high"
-adjudicate_disagreements = true
+adjudicate_disagreements = false
 security_path_markers = [
   "/.github/workflows/", "/auth/", "/security/", "/crypto/",
   "/iam/", "/permissions/", "/secrets/", "/credentials/", "oauth", "jwt",
@@ -203,17 +211,23 @@ directly. Trusted base configuration can define additional
 enabled reviewers must complete with full context; a blocking finding or a
 failed check requests changes, and an abstention sends the decision to a human.
 
-Claude defaults to Opus at high effort. Changes to reviewer/control files or
-paths matching `escalation.security_path_markers` use Fable at high effort
-instead. `--security-sensitive` forces the same behavior when path matching is
-not sufficient. When ordinary completed reviews disagree, CORA runs a separate
-Fable/high adjudication and retains all three reports; escalation is fail-closed
-and never removes a finding from an earlier report.
-Set `adjudicate_disagreements = false` or pass `--no-adjudication` to retain the
-disagreement without launching the extra provider request.
+Claude defaults to Opus at high effort. It reserves its final two turns for a
+structured response; if it nevertheless reaches the turn ceiling, CORA saves
+a partial abstaining report with incomplete context and omitted paths rather
+than discarding all work. `max_budget_usd` can impose an additional Claude Code
+cost ceiling.
+
+Changes to reviewer/control files or paths matching
+`escalation.security_path_markers` use Fable at high effort instead.
+`--security-sensitive` forces the same behavior when path matching is not
+sufficient. Disagreement adjudication is disabled by default because it adds
+cost and cannot overturn an earlier fail-closed blocking result. Pass
+`--adjudicate` or set `adjudicate_disagreements = true` to run a separate
+Fable/high adjudication and retain all three reports; adjudication never removes
+a finding from an earlier report.
 
 `effort` accepts `low`, `medium`, `high`, `xhigh`, or `max`; Codex also accepts
-`none` and `minimal`. Codex defaults to GPT-5.6 at high effort so its effective
+`none` and `minimal`. Codex defaults to `gpt-5.6-sol` at high effort so its effective
 selection and API-equivalent pricing are reproducible even when user CLI
 defaults change.
 
@@ -231,8 +245,12 @@ The Claude adapter requires first-party Claude.ai subscription authentication
 and runs in safe plan mode with read-only tools. Common API-key environment
 variables are removed unless `--allow-api-billing` is explicitly passed.
 
-Provider concurrency is queued across Cora processes and repositories for the
-same user. Claude defaults to one concurrent request and Codex to two; adjust
+Provider concurrency uses a user-global FIFO queue across Cora processes and
+repositories. `cora status --active` reports each reviewer's position, number
+ahead, and a best-effort ETA derived from recent executions. Queue wait is
+recorded separately from execution time and does not consume reviewer or
+overall execution timeouts; `queue_timeout` bounds the wait itself. Claude
+defaults to one concurrent request and Codex to two; adjust
 `max_concurrency` per reviewer when the subscription permits it. Quota failures
 are marked retryable and their reset time is saved when the CLI reports one.
 `cora retry` creates a child run, reuses completed base reviewers and checks,
@@ -243,11 +261,19 @@ returns immediately when a saved reset time is still in the future.
 After every reviewer and at the end of a run, CORA prints the effective model,
 effort, turns, thinking tokens, and API-equivalent cost. The normalized values
 are also saved per reviewer and in aggregate in `manifest.json` and
-`decision.json`. Claude cost comes from the CLI result envelope; Codex cost is
+`decision.json`. Retry records distinguish incremental usage for that attempt
+from cumulative usage across their parent lineage; the compatibility `usage`
+field is cumulative. Claude cost comes from the CLI result envelope; Codex cost is
 calculated from its reported tokens and the pricing table named by
 `cost_source`. A metric is shown as `n/a` when the installed provider CLI does
 not expose enough telemetry, and mixed-availability totals are labeled
 `partial` rather than silently treated as complete.
+
+An approved run with minor or note findings is displayed as `APPROVED WITH
+NON-BLOCKING FINDINGS` while retaining the machine state `approved` and exit
+code 0. Provider process failures retain the provider's actual error in the
+top-level decision, so JSON automation need not open raw logs to diagnose an
+unsupported model or similar failure.
 Durations in JSON use integer `duration_ms` and `elapsed_ms` fields instead of
 Go's nanosecond representation.
 

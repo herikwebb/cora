@@ -105,7 +105,7 @@ func newReviewCommand(opts *options) *cobra.Command {
 	var allowAPIBilling bool
 	var allowUnsafeChecks bool
 	var securitySensitive bool
-	var noAdjudication bool
+	var adjudicate bool
 	var profiles []string
 	command := &cobra.Command{
 		Use:   "review",
@@ -173,8 +173,8 @@ func newReviewCommand(opts *options) *cobra.Command {
 			if securitySensitive {
 				cfg.Escalation.ForceSecuritySensitive = true
 			}
-			if noAdjudication {
-				cfg.Escalation.AdjudicateDisagreements = false
+			if adjudicate {
+				cfg.Escalation.AdjudicateDisagreements = true
 			}
 			target, err = resolve(candidateBase, cfg.RequireCleanTree)
 			if err != nil {
@@ -213,7 +213,7 @@ func newReviewCommand(opts *options) *cobra.Command {
 	command.Flags().BoolVar(&allowAPIBilling, "allow-api-billing", false, "allow API-key or other separately billed authentication")
 	command.Flags().BoolVar(&allowUnsafeChecks, "allow-unsafe-checks", false, "allow configured checks to execute unsandboxed on the host")
 	command.Flags().BoolVar(&securitySensitive, "security-sensitive", false, "escalate Claude to the configured security review model and effort")
-	command.Flags().BoolVar(&noAdjudication, "no-adjudication", false, "do not run a Fable adjudicator when reviewers disagree")
+	command.Flags().BoolVar(&adjudicate, "adjudicate", false, "run a Fable adjudicator when reviewers disagree")
 	command.Flags().StringSliceVar(&profiles, "profile", nil, "validation profile to run (repeatable; auto detects a built-in profile)")
 	return command
 }
@@ -222,7 +222,7 @@ func newRetryCommand(opts *options) *cobra.Command {
 	var reviewers []string
 	var noWait bool
 	var allowAPIBilling bool
-	var noAdjudication bool
+	var adjudicate bool
 	command := &cobra.Command{
 		Use:   "retry [run-id]",
 		Short: "Retry selected reviewers while reusing completed work",
@@ -280,8 +280,8 @@ func newRetryCommand(opts *options) *cobra.Command {
 			if allowAPIBilling {
 				cfg.AllowAPIBilling = true
 			}
-			if noAdjudication {
-				cfg.Escalation.AdjudicateDisagreements = false
+			if adjudicate {
+				cfg.Escalation.AdjudicateDisagreements = true
 			}
 			if (selected["codex"] && !cfg.Reviewers.Codex.Enabled) || (selected["claude"] && !cfg.Reviewers.Claude.Enabled) {
 				return errors.New("selected reviewer is disabled by the trusted configuration")
@@ -318,7 +318,7 @@ func newRetryCommand(opts *options) *cobra.Command {
 	command.Flags().StringSliceVar(&reviewers, "reviewer", nil, "reviewer to retry: codex or claude (repeatable)")
 	command.Flags().BoolVar(&noWait, "no-wait", false, "return instead of waiting for a recorded provider quota reset")
 	command.Flags().BoolVar(&allowAPIBilling, "allow-api-billing", false, "allow API-key or other separately billed authentication")
-	command.Flags().BoolVar(&noAdjudication, "no-adjudication", false, "do not run a Fable adjudicator when reviewers disagree")
+	command.Flags().BoolVar(&adjudicate, "adjudicate", false, "run a Fable adjudicator when reviewers disagree")
 	return command
 }
 
@@ -556,6 +556,7 @@ func loadRunSummary(run record.Run) (model.RunSummary, error) {
 		summary.Phase = heartbeat.Phase
 		summary.Reviewers = heartbeat.Reviewers
 		summary.Checks = heartbeat.Checks
+		summary.Queues = heartbeat.Queues
 		if heartbeat.State == "active" && now.Sub(heartbeat.UpdatedAt) > 2*heartbeatFreshnessWindow() {
 			summary.State = "interrupted"
 		}
@@ -579,6 +580,19 @@ func printRunSummary(summary model.RunSummary) {
 	}
 	for _, name := range sortedStateNames(summary.Checks) {
 		fmt.Printf("%-18s %s\n", "check "+name+":", summary.Checks[name])
+	}
+	queueNames := make([]string, 0, len(summary.Queues))
+	for name := range summary.Queues {
+		queueNames = append(queueNames, name)
+	}
+	sort.Strings(queueNames)
+	for _, name := range queueNames {
+		queue := summary.Queues[name]
+		eta := "unknown"
+		if queue.ETAAt != nil {
+			eta = queue.ETAAt.Local().Format(time.RFC3339)
+		}
+		fmt.Printf("%-18s position=%d ahead=%d active=%d/%d eta=%s\n", "queue "+name+":", queue.Position, queue.Ahead, queue.Active, queue.Limit, eta)
 	}
 }
 
@@ -688,6 +702,7 @@ func newShowCommand(opts *options) *cobra.Command {
 				if reviewer.EscalationCause != "" {
 					fmt.Printf("Escalation: %s\n", reviewer.EscalationCause)
 				}
+				fmt.Printf("Duration: execution=%s queue=%s total=%s\n", formatMilliseconds(reviewer.ExecutionDuration.Milliseconds()), formatMilliseconds(reviewer.QueueDuration.Milliseconds()), formatMilliseconds(reviewer.Duration.Milliseconds()))
 				fmt.Printf("Usage: %s\n", formatUsage(reviewer.Usage))
 			}
 			if len(manifest.Checks) > 0 {
@@ -824,7 +839,11 @@ func findApproval(store record.Store, runID, headSHA string) (record.Run, model.
 }
 
 func printDecision(decision model.Decision) {
-	fmt.Printf("%s %s\n", strings.ToUpper(decision.State), shortSHA(decision.HeadSHA))
+	stateLabel := strings.ToUpper(decision.State)
+	if decision.State == model.StateApproved && decision.OutcomeQualifier == "non_blocking_findings" {
+		stateLabel = "APPROVED WITH NON-BLOCKING FINDINGS"
+	}
+	fmt.Printf("%s %s\n", stateLabel, shortSHA(decision.HeadSHA))
 	fmt.Printf("Reason: %s\n", decision.Reason)
 	reviewerErrors := loadReviewerErrors(decision)
 	names := make([]string, 0, len(decision.Reviewers))
@@ -848,13 +867,24 @@ func printDecision(decision model.Decision) {
 	}
 	fmt.Printf("Findings: blocker=%d major=%d minor=%d note=%d\n",
 		decision.OpenFindings["blocker"], decision.OpenFindings["major"], decision.OpenFindings["minor"], decision.OpenFindings["note"])
-	fmt.Printf("Usage: %s\n", formatUsage(decision.Usage))
+	if !usageEmpty(decision.IncrementalUsage) || !usageEmpty(decision.CumulativeUsage) {
+		fmt.Printf("Usage this run: %s\n", formatUsage(decision.IncrementalUsage))
+		fmt.Printf("Usage cumulative: %s\n", formatUsage(decision.CumulativeUsage))
+	} else {
+		fmt.Printf("Usage: %s\n", formatUsage(decision.Usage))
+	}
 	for _, disagreement := range decision.Disagreements {
 		fmt.Printf("Disagreement: %s\n", disagreement)
 	}
 	if decision.RecordPath != "" {
 		fmt.Println("Record:", decision.RecordPath)
 	}
+}
+
+func usageEmpty(usage model.Usage) bool {
+	return usage.Turns == 0 && usage.InputTokens == 0 && usage.CachedInputTokens == 0 && usage.OutputTokens == 0 &&
+		usage.ThinkingTokens == 0 && usage.APIEquivalentCostUSD == 0 && !usage.TurnsKnown && !usage.TurnsPartial &&
+		!usage.ThinkingTokensKnown && !usage.ThinkingTokensPartial && !usage.APIEquivalentCostKnown && !usage.APIEquivalentCostPartial
 }
 
 func formatUsage(usage model.Usage) string {
@@ -892,6 +922,9 @@ func formatCost(usage model.Usage) string {
 }
 
 func loadReviewerErrors(decision model.Decision) map[string]string {
+	if len(decision.ReviewerErrors) > 0 {
+		return decision.ReviewerErrors
+	}
 	errorsByReviewer := make(map[string]string)
 	if decision.RecordPath == "" {
 		return errorsByReviewer

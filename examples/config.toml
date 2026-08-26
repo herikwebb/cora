@@ -2,6 +2,7 @@
 base = "upstream/main"
 reviewer_timeout = "15m"
 overall_timeout = "45m"
+queue_timeout = "24h"
 require_clean_tree = true
 allow_api_billing = false
 # Host checks can read the local filesystem and use the network. Leave this
@@ -13,7 +14,7 @@ blocking_severities = ["blocker", "major"]
 [reviewers.codex]
 enabled = true
 command = "codex"
-model = "gpt-5.6"
+model = "gpt-5.6-sol"
 effort = "high"
 max_concurrency = 2
 
@@ -23,15 +24,18 @@ command = "claude"
 model = "opus"
 effort = "high"
 max_turns = 50
+finalization_turns = 2
+# Optional hard ceiling passed to Claude Code; 0 disables it.
+max_budget_usd = 0
 max_concurrency = 1
 
-# Security-sensitive changes use this Claude model. A completed disagreement
-# between the ordinary reviewers also starts a separate adjudication with it.
+# Security-sensitive changes use this Claude model. Set adjudication to true
+# only when the additional provider usage for disputes is intentional.
 [escalation]
 enabled = true
 model = "fable"
 effort = "high"
-adjudicate_disagreements = true
+adjudicate_disagreements = false
 security_path_markers = [
   "/.cora/", "/.codex/", "/.claude/", "/.github/workflows/",
   "/auth/", "/authentication/", "/authorization/", "/security/",

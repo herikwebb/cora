@@ -48,6 +48,103 @@ func TestStoreLifecycleAndLock(t *testing.T) {
 	}
 }
 
+func TestProviderLeaseQueueIsFIFOAndReportsETA(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	first, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "first"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := first.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	held, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "held"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type acquired struct {
+		name  string
+		lease ProviderLease
+		err   error
+	}
+	results := make(chan acquired, 2)
+	start := func(name string) {
+		go func() {
+			lease, acquireErr := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: name}, nil)
+			results <- acquired{name: name, lease: lease, err: acquireErr}
+		}()
+	}
+	start("second")
+	waitForTicketCount(t, filepath.Join(root, safeComponent(provider)), 1)
+	start("third")
+	waitForTicketCount(t, filepath.Join(root, safeComponent(provider)), 2)
+	if err := held.Release(); err != nil {
+		t.Fatal(err)
+	}
+	second := <-results
+	if second.err != nil || second.name != "second" {
+		t.Fatalf("first queued acquisition = %#v", second)
+	}
+	select {
+	case unexpected := <-results:
+		t.Fatalf("third acquired before second released: %#v", unexpected)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := second.lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	third := <-results
+	if third.err != nil || third.name != "third" {
+		t.Fatalf("second queued acquisition = %#v", third)
+	}
+	if err := third.lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "active"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	statusChannel := make(chan model.ProviderQueueStatus, 1)
+	go func() {
+		_, _ = AcquireProviderQueued(ctx, provider, 1, ProviderQueueRequest{Reviewer: "eta"}, func(status model.ProviderQueueStatus) {
+			select {
+			case statusChannel <- status:
+			default:
+			}
+		})
+	}()
+	status := <-statusChannel
+	cancel()
+	_ = active.Release()
+	if status.Position != 1 || status.Active != 1 || status.ETAAt == nil {
+		t.Fatalf("queue status = %#v", status)
+	}
+}
+
+func waitForTicketCount(t *testing.T, directory string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		entries, _ := os.ReadDir(directory)
+		count := 0
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), "ticket-") {
+				count++
+			}
+		}
+		if count >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("provider ticket count did not reach %d", want)
+}
+
 func TestLatestUsesRunStartOrderInsteadOfCompletionOrder(t *testing.T) {
 	store := New(t.TempDir())
 	first, err := store.Create(time.Date(2026, 8, 25, 12, 0, 0, 1, time.UTC), strings.Repeat("a", 40))
@@ -74,7 +171,7 @@ func TestLatestUsesRunStartOrderInsteadOfCompletionOrder(t *testing.T) {
 }
 
 func TestProviderLeaseQueuesAtConcurrencyLimit(t *testing.T) {
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
 	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
 	first, err := AcquireProvider(context.Background(), provider, 1, nil)
 	if err != nil {

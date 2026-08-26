@@ -20,6 +20,7 @@ import (
 )
 
 func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
 	repoRoot := orchestratorTestRepo(t)
 	gitRun(t, repoRoot, "switch", "-c", "feature")
 	if err := os.WriteFile(filepath.Join(repoRoot, "app.txt"), []byte("base\nfeature\n"), 0o644); err != nil {
@@ -134,7 +135,7 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	for _, reviewer := range manifest.Reviewers {
 		reviewers[reviewer.Reviewer] = reviewer
 	}
-	if reviewers["codex"].Model != "gpt-5.6" || reviewers["codex"].Effort != "high" {
+	if reviewers["codex"].Model != "gpt-5.6-sol" || reviewers["codex"].Effort != "high" {
 		t.Fatalf("Codex effective settings = %#v", reviewers["codex"])
 	}
 	if reviewers["claude"].Model != "claude-fable-5" || reviewers["claude"].Effort != "high" || reviewers["claude"].EscalationCause != "security_sensitive" {
@@ -193,6 +194,13 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	if retryManifest.ParentRunID != latest.ID || len(retryManifest.Reviewers) != 2 {
 		t.Fatalf("retry manifest = %#v", retryManifest)
 	}
+	if retryManifest.CumulativeUsage.APIEquivalentCostUSD <= retryManifest.IncrementalUsage.APIEquivalentCostUSD {
+		t.Fatalf("retry cumulative usage does not include parent: incremental=%#v cumulative=%#v", retryManifest.IncrementalUsage, retryManifest.CumulativeUsage)
+	}
+	wantCost := manifest.Usage.APIEquivalentCostUSD + retryManifest.IncrementalUsage.APIEquivalentCostUSD
+	if difference := retryManifest.CumulativeUsage.APIEquivalentCostUSD - wantCost; difference < -0.0000001 || difference > 0.0000001 {
+		t.Fatalf("retry cumulative cost = %.8f, want %.8f", retryManifest.CumulativeUsage.APIEquivalentCostUSD, wantCost)
+	}
 	for _, reviewer := range retryManifest.Reviewers {
 		switch reviewer.Reviewer {
 		case "codex":
@@ -224,6 +232,7 @@ func TestReuseReviewerResultsPreservesUnselectedIncompleteReviewer(t *testing.T)
 }
 
 func TestRunnerEscalatesDisputedReviewToFable(t *testing.T) {
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
 	repoRoot := orchestratorTestRepo(t)
 	gitRun(t, repoRoot, "switch", "-c", "feature")
 	if err := os.WriteFile(filepath.Join(repoRoot, "app.txt"), []byte("base\nfeature\n"), 0o644); err != nil {
@@ -247,6 +256,7 @@ func TestRunnerEscalatesDisputedReviewToFable(t *testing.T) {
 	writeExecutable(t, claudePath, fakeDisputeClaudeScript)
 
 	cfg := config.Defaults()
+	cfg.Escalation.AdjudicateDisagreements = true
 	cfg.Reviewers.Codex.Command = codexPath
 	cfg.Reviewers.Claude.Command = claudePath
 	cfg.ReviewerTimeout.Duration = 5 * time.Second
@@ -434,7 +444,7 @@ while [ "$#" -gt 0 ]; do
     fi
   elif [ "$1" = "--model" ]; then
     shift
-    if [ "$1" = "gpt-5.6" ]; then
+    if [ "$1" = "gpt-5.6-sol" ]; then
       seen_model="true"
     fi
   elif [ "$1" = "--config" ]; then
@@ -450,7 +460,7 @@ if [ "$seen_sandbox" != "true" ] || [ "$seen_model" != "true" ] || [ "$seen_effo
   exit 21
 fi
 printf '%s\n' '` + validReport + `' > "$output"
-echo '{"type":"thread.started","model_name":"gpt-5.6"}'
+echo '{"type":"thread.started","model_name":"gpt-5.6-sol"}'
 echo '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":300,"reasoning_tokens":120}}'
 `
 
@@ -503,7 +513,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 printf '%s\n' '` + disputingReport + `' > "$output"
-echo '{"type":"thread.started","model_name":"gpt-5.6"}'
+echo '{"type":"thread.started","model_name":"gpt-5.6-sol"}'
 echo '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":20,"reasoning_tokens":10}}'
 `
 

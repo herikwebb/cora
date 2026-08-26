@@ -31,9 +31,25 @@ func newRunHeartbeat(run record.Run, started time.Time, progress io.Writer) *run
 		run: run, progress: progress, stop: make(chan struct{}), done: make(chan struct{}),
 		value: model.Heartbeat{
 			RunID: run.ID, State: "active", Phase: "reviewers", StartedAt: started,
-			UpdatedAt: time.Now().UTC(), PID: os.Getpid(), Reviewers: map[string]string{}, Checks: map[string]string{},
+			UpdatedAt: time.Now().UTC(), PID: os.Getpid(), Reviewers: map[string]string{}, Checks: map[string]string{}, Queues: map[string]model.ProviderQueueStatus{},
 		},
 	}
+}
+
+func (h *runHeartbeat) Queue(name string, status model.ProviderQueueStatus) {
+	h.mu.Lock()
+	h.value.Queues[name] = status
+	h.value.UpdatedAt = time.Now().UTC()
+	h.mu.Unlock()
+	h.write()
+}
+
+func (h *runHeartbeat) ClearQueue(name string) {
+	h.mu.Lock()
+	delete(h.value.Queues, name)
+	h.value.UpdatedAt = time.Now().UTC()
+	h.mu.Unlock()
+	h.write()
 }
 
 func (h *runHeartbeat) Start() {
@@ -106,7 +122,16 @@ func (h *runHeartbeat) snapshot() model.Heartbeat {
 	value := h.value
 	value.Reviewers = cloneStates(h.value.Reviewers)
 	value.Checks = cloneStates(h.value.Checks)
+	value.Queues = cloneQueues(h.value.Queues)
 	return value
+}
+
+func cloneQueues(source map[string]model.ProviderQueueStatus) map[string]model.ProviderQueueStatus {
+	clone := make(map[string]model.ProviderQueueStatus, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }
 
 func cloneStates(source map[string]string) map[string]string {
@@ -128,6 +153,19 @@ func heartbeatDetail(heartbeat model.Heartbeat) string {
 		for _, name := range names {
 			parts = append(parts, name+"="+states[name])
 		}
+	}
+	queueNames := make([]string, 0, len(heartbeat.Queues))
+	for name := range heartbeat.Queues {
+		queueNames = append(queueNames, name)
+	}
+	sort.Strings(queueNames)
+	for _, name := range queueNames {
+		queue := heartbeat.Queues[name]
+		detail := fmt.Sprintf("%s=queue:%d", name, queue.Position)
+		if queue.ETAAt != nil {
+			detail += "~" + formatDuration(time.Until(*queue.ETAAt))
+		}
+		parts = append(parts, detail)
 	}
 	return strings.Join(parts, " ")
 }

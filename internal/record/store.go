@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/herikwebb/cora/internal/model"
@@ -30,8 +31,34 @@ type Lock struct {
 }
 
 type ProviderLease struct {
-	path string
+	path        string
+	historyPath string
+	started     time.Time
+	provider    string
+	runID       string
+	reviewer    string
 }
+
+type ProviderQueueRequest struct {
+	RunID    string
+	Reviewer string
+}
+
+type providerTicket struct {
+	PID        int       `json:"pid"`
+	EnqueuedAt time.Time `json:"enqueued_at"`
+	RunID      string    `json:"run_id,omitempty"`
+	Reviewer   string    `json:"reviewer,omitempty"`
+}
+
+type providerHistoryEntry struct {
+	FinishedAt time.Time `json:"finished_at"`
+	DurationMS int64     `json:"duration_ms"`
+	RunID      string    `json:"run_id,omitempty"`
+	Reviewer   string    `json:"reviewer,omitempty"`
+}
+
+var providerTicketSequence atomic.Uint64
 
 const (
 	privateDirMode  os.FileMode = 0o700
@@ -155,32 +182,77 @@ func LoadHeartbeat(run Run) (model.Heartbeat, error) {
 // AcquireProvider obtains one cross-process slot for a provider. The queue is
 // user-global because provider quotas are shared across repositories.
 func AcquireProvider(ctx context.Context, provider string, limit int, onWait func(time.Duration)) (ProviderLease, error) {
+	started := time.Now()
+	return AcquireProviderQueued(ctx, provider, limit, ProviderQueueRequest{}, func(status model.ProviderQueueStatus) {
+		if onWait != nil {
+			onWait(time.Since(started))
+		}
+	})
+}
+
+// AcquireProviderQueued obtains a provider slot in FIFO order and reports a
+// best-effort position and ETA based on recent execution durations.
+func AcquireProviderQueued(ctx context.Context, provider string, limit int, request ProviderQueueRequest, onWait func(model.ProviderQueueStatus)) (ProviderLease, error) {
 	if limit < 1 {
 		return ProviderLease{}, errors.New("provider concurrency limit must be positive")
 	}
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return ProviderLease{}, fmt.Errorf("resolve provider queue directory: %w", err)
+	queueRoot := strings.TrimSpace(os.Getenv("CORA_PROVIDER_QUEUE_DIR"))
+	if queueRoot == "" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return ProviderLease{}, fmt.Errorf("resolve provider queue directory: %w", err)
+		}
+		queueRoot = filepath.Join(cacheDir, "cora", "provider-queue")
 	}
-	queueDir := filepath.Join(cacheDir, "cora", "provider-queue", safeComponent(provider))
+	queueDir := filepath.Join(queueRoot, safeComponent(provider))
 	if err := ensurePrivateDir(queueDir); err != nil {
 		return ProviderLease{}, err
 	}
-	started := time.Now()
+	started := time.Now().UTC()
+	ticket := providerTicket{PID: os.Getpid(), EnqueuedAt: started, RunID: request.RunID, Reviewer: request.Reviewer}
+	ticketName := fmt.Sprintf("ticket-%020d-%d-%06d.json", started.UnixNano(), os.Getpid(), providerTicketSequence.Add(1))
+	ticketPath := filepath.Join(queueDir, ticketName)
+	if err := WriteJSON(ticketPath, ticket); err != nil {
+		return ProviderLease{}, fmt.Errorf("create provider queue ticket: %w", err)
+	}
+	defer os.Remove(ticketPath)
+	historyPath := filepath.Join(queueDir, "history.jsonl")
 	lastNotice := time.Time{}
 	for {
-		for slot := 0; slot < limit; slot++ {
-			path := filepath.Join(queueDir, fmt.Sprintf("slot-%d.lock", slot))
-			lease, acquired, err := tryProviderSlot(path)
-			if err != nil {
-				return ProviderLease{}, err
-			}
-			if acquired {
-				return lease, nil
+		tickets, err := liveProviderTickets(queueDir)
+		if err != nil {
+			return ProviderLease{}, err
+		}
+		position := ticketPosition(tickets, ticketName)
+		active, err := activeProviderSlots(queueDir, limit)
+		if err != nil {
+			return ProviderLease{}, err
+		}
+		available := limit - active
+		if position > 0 && position <= available {
+			for slot := 0; slot < limit; slot++ {
+				path := filepath.Join(queueDir, fmt.Sprintf("slot-%d.lock", slot))
+				lease, acquired, err := tryProviderSlot(path, provider, request)
+				if err != nil {
+					return ProviderLease{}, err
+				}
+				if acquired {
+					_ = os.Remove(ticketPath)
+					lease.historyPath = historyPath
+					return lease, nil
+				}
 			}
 		}
 		if onWait != nil && (lastNotice.IsZero() || time.Since(lastNotice) >= 30*time.Second) {
-			onWait(time.Since(started))
+			status := model.ProviderQueueStatus{
+				Provider: provider, Position: max(position, 1), Ahead: max(position-1, 0),
+				Active: active, Limit: limit, WaitMS: time.Since(started).Milliseconds(),
+			}
+			if estimate := providerQueueETA(historyPath, status.Position, limit); estimate > 0 {
+				eta := time.Now().UTC().Add(estimate)
+				status.ETAAt = &eta
+			}
+			onWait(status)
 			lastNotice = time.Now()
 		}
 		timer := time.NewTimer(time.Second)
@@ -193,16 +265,17 @@ func AcquireProvider(ctx context.Context, provider string, limit int, onWait fun
 	}
 }
 
-func tryProviderSlot(path string) (ProviderLease, bool, error) {
+func tryProviderSlot(path, provider string, request ProviderQueueRequest) (ProviderLease, bool, error) {
+	started := time.Now().UTC()
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, privateFileMode)
 	if err == nil {
-		_, writeErr := fmt.Fprintf(file, "pid=%d\nstarted=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
+		_, writeErr := fmt.Fprintf(file, "pid=%d\nstarted=%s\nrun_id=%s\nreviewer=%s\n", os.Getpid(), started.Format(time.RFC3339Nano), request.RunID, request.Reviewer)
 		closeErr := file.Close()
 		if writeErr != nil || closeErr != nil {
 			_ = os.Remove(path)
 			return ProviderLease{}, false, errors.Join(writeErr, closeErr)
 		}
-		return ProviderLease{path: path}, true, nil
+		return ProviderLease{path: path, started: started, provider: provider, runID: request.RunID, reviewer: request.Reviewer}, true, nil
 	}
 	if !errors.Is(err, os.ErrExist) {
 		return ProviderLease{}, false, err
@@ -222,12 +295,114 @@ func tryProviderSlot(path string) (ProviderLease, bool, error) {
 	return ProviderLease{}, false, nil
 }
 
+func liveProviderTickets(queueDir string) ([]string, error) {
+	entries, err := os.ReadDir(queueDir)
+	if err != nil {
+		return nil, err
+	}
+	var tickets []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "ticket-") || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(queueDir, entry.Name())
+		var ticket providerTicket
+		readErr := ReadJSON(path, &ticket)
+		info, statErr := entry.Info()
+		staleByAge := statErr == nil && time.Since(info.ModTime()) > 24*time.Hour
+		if readErr != nil || staleByAge || (ticket.PID > 0 && !processAlive(ticket.PID)) {
+			_ = os.Remove(path)
+			continue
+		}
+		tickets = append(tickets, entry.Name())
+	}
+	sort.Strings(tickets)
+	return tickets, nil
+}
+
+func ticketPosition(tickets []string, name string) int {
+	for index, ticket := range tickets {
+		if ticket == name {
+			return index + 1
+		}
+	}
+	return 0
+}
+
+func activeProviderSlots(queueDir string, limit int) (int, error) {
+	active := 0
+	for slot := 0; slot < limit; slot++ {
+		path := filepath.Join(queueDir, fmt.Sprintf("slot-%d.lock", slot))
+		contents, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		info, statErr := os.Stat(path)
+		staleByAge := statErr == nil && time.Since(info.ModTime()) > 24*time.Hour
+		pid := lockPID(string(contents))
+		if staleByAge || (pid > 0 && !processAlive(pid)) {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return 0, err
+			}
+			continue
+		}
+		active++
+	}
+	return active, nil
+}
+
+func providerQueueETA(historyPath string, position, limit int) time.Duration {
+	file, err := os.Open(historyPath)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	var durations []time.Duration
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var entry providerHistoryEntry
+		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.DurationMS > 0 {
+			durations = append(durations, time.Duration(entry.DurationMS)*time.Millisecond)
+			if len(durations) > 20 {
+				durations = durations[1:]
+			}
+		}
+	}
+	if len(durations) == 0 {
+		return 0
+	}
+	var total time.Duration
+	for _, duration := range durations {
+		total += duration
+	}
+	average := total / time.Duration(len(durations))
+	waves := (max(position, 1) + limit - 1) / limit
+	return time.Duration(waves) * average
+}
+
 func (l ProviderLease) Release() error {
 	if l.path == "" {
 		return nil
 	}
 	if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	if l.historyPath != "" && !l.started.IsZero() {
+		entry := providerHistoryEntry{FinishedAt: time.Now().UTC(), DurationMS: time.Since(l.started).Milliseconds(), RunID: l.runID, Reviewer: l.reviewer}
+		contents, err := json.Marshal(entry)
+		if err == nil {
+			file, openErr := os.OpenFile(l.historyPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, privateFileMode)
+			if openErr == nil {
+				_, writeErr := file.Write(append(contents, '\n'))
+				closeErr := file.Close()
+				if writeErr != nil || closeErr != nil {
+					return errors.Join(writeErr, closeErr)
+				}
+			}
+		}
 	}
 	return nil
 }
