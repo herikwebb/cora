@@ -32,6 +32,7 @@ type Request struct {
 	Timeout         time.Duration
 	AllowAPIBilling bool
 	Attempt         int
+	ChangedPaths    []string
 }
 
 type Adapter interface {
@@ -127,7 +128,7 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 		applyTelemetry(&result, telemetry)
 	}
 	if processResult.Err != nil {
-		result.Error = "Codex review failed: " + stderrFailure(stderrPath, processResult.Err)
+		result.Error = "Codex review failed: " + codexFailure(eventsPath, stderrPath, processResult.Err)
 		classifyFailure(&result, time.Now())
 		return result
 	}
@@ -260,13 +261,16 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 		"--output-format", "json",
 		"--json-schema", string(compactSchema),
 	}
+	if c.Config.MaxBudgetUSD > 0 {
+		args = append(args, "--max-budget-usd", strconv.FormatFloat(c.Config.MaxBudgetUSD, 'f', -1, 64))
+	}
 	if c.Config.Model != "" {
 		args = append(args, "--model", c.Config.Model)
 	}
 	if c.Config.Effort != "" {
 		args = append(args, "--effort", c.Config.Effort)
 	}
-	args = append(args, request.Prompt)
+	args = append(args, claudePrompt(request.Prompt, c.Config))
 
 	rawPath := filepath.Join(request.RunDir, fileStem(c.Name())+".raw.json")
 	stderrPath := filepath.Join(request.RunDir, fileStem(c.Name())+".stderr.log")
@@ -287,11 +291,17 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	if processResult.Err != nil {
 		result.Error = "Claude review failed: " + claudeFailure(rawPath, stderrPath, processResult.Err)
 		classifyFailure(&result, time.Now())
+		if claudeReachedMaxTurns(rawPath, result.Error) {
+			attachPartialClaudeReport(&result, request)
+		}
 		return result
 	}
 	if parseErr != nil {
 		result.Error = "parse Claude report: " + parseErr.Error()
 		classifyFailure(&result, time.Now())
+		if claudeReachedMaxTurns(rawPath, result.Error) {
+			attachPartialClaudeReport(&result, request)
+		}
 		return result
 	}
 	report := parsed.Report
@@ -305,6 +315,64 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	return result
 }
 
+func claudePrompt(prompt string, cfg config.Reviewer) string {
+	toolTurns := cfg.MaxTurns - cfg.FinalizationTurns
+	return prompt + fmt.Sprintf(`
+
+CORA turn-budget contract:
+- Stop repository inspection and tool use no later than turn %d.
+- Reserve the final %d turn(s) exclusively for producing the required structured report.
+- If inspection is incomplete, return a best-effort report with verdict "abstain", context_complete false, every unreviewed path in omitted_paths, and remaining uncertainty in residual_risks.
+- Never spend the final reserved turns on more investigation.
+`, toolTurns, cfg.FinalizationTurns)
+}
+
+func claudeReachedMaxTurns(path, message string) bool {
+	normalized := strings.ToLower(message)
+	if strings.Contains(normalized, "max_turns") || strings.Contains(normalized, "max turns") {
+		return true
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var envelope struct {
+		TerminalReason string `json:"terminal_reason"`
+		Subtype        string `json:"subtype"`
+	}
+	if json.Unmarshal(contents, &envelope) != nil {
+		return false
+	}
+	terminal := strings.ToLower(envelope.TerminalReason + " " + envelope.Subtype)
+	return strings.Contains(terminal, "max_turns") || strings.Contains(terminal, "max turns")
+}
+
+func attachPartialClaudeReport(result *model.ReviewerResult, request Request) {
+	report := model.ReviewReport{
+		SchemaVersion:   model.SchemaVersion,
+		Reviewer:        result.Reviewer,
+		BaseSHA:         request.Target.BaseSHA,
+		HeadSHA:         request.Target.HeadSHA,
+		Verdict:         "abstain",
+		ContextComplete: false,
+		Summary:         "Claude reached its turn ceiling before producing a complete structured review.",
+		Findings:        []model.Finding{},
+		ReviewedPaths:   []string{},
+		OmittedPaths:    append([]string(nil), request.ChangedPaths...),
+		ResidualRisks:   []string{result.Error},
+	}
+	result.Status = "partial"
+	result.Report = &report
+	contents, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return
+	}
+	path := filepath.Join(request.RunDir, fileStem(result.Reviewer)+".partial.json")
+	if preparePrivateFile(path) == nil {
+		_ = os.WriteFile(path, append(contents, '\n'), 0o600)
+	}
+}
+
 var (
 	quotaResetPattern    = regexp.MustCompile(`(?i)reset(?:s)?(?:\s+at)?\s+(\d{1,2}):(\d{2})\s*(am|pm)`)
 	quotaTimezonePattern = regexp.MustCompile(`\(([A-Za-z][A-Za-z0-9_+\-/]+(?:/[A-Za-z0-9_+\-]+)+)\)`)
@@ -312,6 +380,12 @@ var (
 )
 
 func classifyFailure(result *model.ReviewerResult, now time.Time) {
+	normalized := strings.ToLower(result.Error)
+	if strings.Contains(normalized, "model") && strings.Contains(normalized, "not supported") {
+		result.FailureKind = "unsupported_model"
+		result.Retryable = false
+		return
+	}
 	retryAt, quota := QuotaRetryAt(result.Error, now)
 	if !quota {
 		return
@@ -321,6 +395,50 @@ func classifyFailure(result *model.ReviewerResult, now time.Time) {
 	if !retryAt.IsZero() {
 		result.RetryAt = &retryAt
 	}
+}
+
+func codexFailure(eventsPath, stderrPath string, processErr error) string {
+	file, err := os.Open(eventsPath)
+	if err == nil {
+		defer file.Close()
+		var last string
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+			var event map[string]any
+			if json.Unmarshal(scanner.Bytes(), &event) != nil {
+				continue
+			}
+			typeName, _ := event["type"].(string)
+			if typeName != "error" && typeName != "turn.failed" {
+				continue
+			}
+			message := findString(event, "message")
+			if decoded := decodeProviderError(message); decoded != "" {
+				last = decoded
+			}
+		}
+		if strings.TrimSpace(last) != "" {
+			return last
+		}
+	}
+	return stderrFailure(stderrPath, processErr)
+}
+
+func decodeProviderError(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(message), &envelope) == nil && strings.TrimSpace(envelope.Error.Message) != "" {
+		return strings.TrimSpace(envelope.Error.Message)
+	}
+	return message
 }
 
 // QuotaRetryAt recognizes provider quota failures and extracts their reset

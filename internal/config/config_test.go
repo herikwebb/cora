@@ -65,6 +65,9 @@ command = ["go", "test", "./..."]
 
 func TestDefaultsUseHighEffortClaudeOpusAndFableEscalation(t *testing.T) {
 	cfg := Defaults()
+	if cfg.Reviewers.Codex.Model != "gpt-5.6-sol" || cfg.Reviewers.Codex.Effort != "high" {
+		t.Fatalf("Codex defaults = model %q effort %q", cfg.Reviewers.Codex.Model, cfg.Reviewers.Codex.Effort)
+	}
 	if cfg.Reviewers.Claude.Model != "opus" || cfg.Reviewers.Claude.Effort != "high" {
 		t.Fatalf("Claude defaults = model %q effort %q", cfg.Reviewers.Claude.Model, cfg.Reviewers.Claude.Effort)
 	}
@@ -74,8 +77,11 @@ func TestDefaultsUseHighEffortClaudeOpusAndFableEscalation(t *testing.T) {
 	if cfg.Reviewers.Claude.MaxConcurrency != 1 || cfg.Reviewers.Codex.MaxConcurrency != 2 {
 		t.Fatalf("provider concurrency defaults = %#v", cfg.Reviewers)
 	}
-	if !cfg.Escalation.AdjudicateDisagreements {
-		t.Fatal("disagreement adjudication should default on")
+	if cfg.Reviewers.Claude.FinalizationTurns != 2 {
+		t.Fatalf("Claude finalization reserve = %d", cfg.Reviewers.Claude.FinalizationTurns)
+	}
+	if cfg.Escalation.AdjudicateDisagreements {
+		t.Fatal("disagreement adjudication should require explicit opt-in")
 	}
 }
 

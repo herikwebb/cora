@@ -29,12 +29,14 @@ func (d Duration) MarshalText() ([]byte, error) {
 }
 
 type Reviewer struct {
-	Enabled        bool   `toml:"enabled"`
-	Command        string `toml:"command"`
-	Model          string `toml:"model"`
-	Effort         string `toml:"effort"`
-	MaxTurns       int    `toml:"max_turns"`
-	MaxConcurrency int    `toml:"max_concurrency"`
+	Enabled           bool    `toml:"enabled"`
+	Command           string  `toml:"command"`
+	Model             string  `toml:"model"`
+	Effort            string  `toml:"effort"`
+	MaxTurns          int     `toml:"max_turns"`
+	FinalizationTurns int     `toml:"finalization_turns"`
+	MaxBudgetUSD      float64 `toml:"max_budget_usd"`
+	MaxConcurrency    int     `toml:"max_concurrency"`
 }
 
 type Reviewers struct {
@@ -68,6 +70,7 @@ type Config struct {
 	Base               string              `toml:"base"`
 	ReviewerTimeout    Duration            `toml:"reviewer_timeout"`
 	OverallTimeout     Duration            `toml:"overall_timeout"`
+	QueueTimeout       Duration            `toml:"queue_timeout"`
 	RequireCleanTree   bool                `toml:"require_clean_tree"`
 	AllowAPIBilling    bool                `toml:"allow_api_billing"`
 	AllowUnsafeChecks  bool                `toml:"allow_unsafe_host_checks"`
@@ -85,6 +88,7 @@ func Defaults() Config {
 	return Config{
 		ReviewerTimeout:  Duration{Duration: 15 * time.Minute},
 		OverallTimeout:   Duration{Duration: 45 * time.Minute},
+		QueueTimeout:     Duration{Duration: 24 * time.Hour},
 		RequireCleanTree: true,
 		MinimumApprovals: 2,
 		BlockingSeverities: []string{
@@ -95,24 +99,25 @@ func Defaults() Config {
 			Codex: Reviewer{
 				Enabled:        true,
 				Command:        "codex",
-				Model:          "gpt-5.6",
+				Model:          "gpt-5.6-sol",
 				Effort:         "high",
 				MaxConcurrency: 2,
 			},
 			Claude: Reviewer{
-				Enabled:        true,
-				Command:        "claude",
-				Model:          "opus",
-				Effort:         "high",
-				MaxTurns:       50,
-				MaxConcurrency: 1,
+				Enabled:           true,
+				Command:           "claude",
+				Model:             "opus",
+				Effort:            "high",
+				MaxTurns:          50,
+				FinalizationTurns: 2,
+				MaxConcurrency:    1,
 			},
 		},
 		Escalation: Escalation{
 			Enabled:                 true,
 			Model:                   "fable",
 			Effort:                  "high",
-			AdjudicateDisagreements: true,
+			AdjudicateDisagreements: false,
 			SecurityPathMarkers: []string{
 				"/.cora/", "/.codex/", "/.claude/", "/.github/workflows/",
 				"/auth/", "/authentication/", "/authorization/", "/security/",
@@ -232,6 +237,9 @@ func (c Config) Validate() error {
 	if c.OverallTimeout.Duration <= 0 {
 		return errors.New("overall_timeout must be positive")
 	}
+	if c.QueueTimeout.Duration <= 0 {
+		return errors.New("queue_timeout must be positive")
+	}
 	enabledReviewers := 0
 	if c.Reviewers.Codex.Enabled {
 		enabledReviewers++
@@ -253,6 +261,12 @@ func (c Config) Validate() error {
 	}
 	if c.Reviewers.Claude.MaxTurns < 1 {
 		return errors.New("reviewers.claude.max_turns must be positive")
+	}
+	if c.Reviewers.Claude.FinalizationTurns < 1 || c.Reviewers.Claude.FinalizationTurns >= c.Reviewers.Claude.MaxTurns {
+		return errors.New("reviewers.claude.finalization_turns must be positive and less than max_turns")
+	}
+	if c.Reviewers.Claude.MaxBudgetUSD < 0 {
+		return errors.New("reviewers.claude.max_budget_usd cannot be negative")
 	}
 	if c.Reviewers.Codex.Enabled && c.Reviewers.Codex.MaxConcurrency < 1 {
 		return errors.New("reviewers.codex.max_concurrency must be positive")

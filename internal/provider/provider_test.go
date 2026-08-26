@@ -2,10 +2,12 @@ package provider
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +23,7 @@ func TestCodexReviewArgsUseGenericExecForAuditedPrompt(t *testing.T) {
 		SchemaPath: "/tmp/schema.json",
 		Policy:     "trusted policy",
 	}
-	got := codexReviewArgs(config.Reviewer{Model: "gpt-5.6", Effort: "high"}, request, "/tmp/result.json")
+	got := codexReviewArgs(config.Reviewer{Model: "gpt-5.6-sol", Effort: "high"}, request, "/tmp/result.json")
 	want := []string{
 		"exec", "--sandbox", "read-only",
 		"--cd", "/tmp/cora-reviewer",
@@ -29,7 +31,7 @@ func TestCodexReviewArgsUseGenericExecForAuditedPrompt(t *testing.T) {
 		"--skip-git-repo-check", "--ignore-rules",
 		"--ephemeral", "--ignore-user-config",
 		"--config", `developer_instructions="trusted policy"`,
-		"--model", "gpt-5.6",
+		"--model", "gpt-5.6-sol",
 		"--config", `model_reasoning_effort="high"`,
 		"--output-schema", "/tmp/schema.json",
 		"--json", "--output-last-message", "/tmp/result.json", "-",
@@ -49,6 +51,53 @@ func TestClassifyQuotaFailureExtractsRetryTime(t *testing.T) {
 	want := time.Date(2026, 8, 25, 11, 50, 0, 0, now.Location())
 	if !result.RetryAt.Equal(want) {
 		t.Fatalf("retry time = %s, want %s", result.RetryAt, want)
+	}
+}
+
+func TestCodexFailureUsesProviderErrorEvent(t *testing.T) {
+	directory := t.TempDir()
+	events := filepath.Join(directory, "events.jsonl")
+	contents := `{"type":"error","message":"Model metadata for gpt-5.6 not found"}
+{"type":"turn.failed","message":"{\"error\":{\"message\":\"The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account.\"}}"}
+`
+	if err := os.WriteFile(events, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := codexFailure(events, filepath.Join(directory, "stderr.log"), errors.New("exit status 1"))
+	want := "The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account."
+	if got != want {
+		t.Fatalf("failure = %q, want %q", got, want)
+	}
+}
+
+func TestClaudePromptReservesFinalizationTurns(t *testing.T) {
+	got := claudePrompt("review this", config.Reviewer{MaxTurns: 50, FinalizationTurns: 2})
+	for _, want := range []string{"no later than turn 48", "final 2 turn(s)", `verdict "abstain"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Claude prompt does not contain %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestAttachPartialClaudeReportPersistsFailClosedEvidence(t *testing.T) {
+	directory := t.TempDir()
+	result := model.ReviewerResult{Reviewer: "claude", Status: "incomplete", Error: "Claude review failed: max_turns"}
+	request := Request{
+		RunDir: directory, Target: model.Target{BaseSHA: "base", HeadSHA: "head"},
+		ChangedPaths: []string{"app.go", "auth.go"},
+	}
+	attachPartialClaudeReport(&result, request)
+	if result.Status != "partial" || result.Report == nil || result.Report.ContextComplete || result.Report.Verdict != "abstain" {
+		t.Fatalf("partial result = %#v", result)
+	}
+	if !reflect.DeepEqual(result.Report.OmittedPaths, request.ChangedPaths) {
+		t.Fatalf("omitted paths = %v", result.Report.OmittedPaths)
+	}
+	path := filepath.Join(directory, "claude.partial.json")
+	if info, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o600 {
+		t.Fatalf("partial report permissions = %#o", info.Mode().Perm())
 	}
 }
 
