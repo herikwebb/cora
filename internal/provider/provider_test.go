@@ -70,6 +70,29 @@ func TestCodexFailureUsesProviderErrorEvent(t *testing.T) {
 	}
 }
 
+func TestValidateReportRequiresReachabilityForBlockingFindings(t *testing.T) {
+	report := model.ReviewReport{
+		SchemaVersion: model.SchemaVersion,
+		Verdict:       "request_changes",
+		Findings: []model.Finding{{
+			ID: "major-1", Severity: "major", Confidence: 0.9,
+			Claim: "Untrusted input reaches the command", Evidence: "handler calls execute", SuggestedFix: "validate the input",
+		}},
+	}
+	if err := validateReport(report); err == nil || !strings.Contains(err.Error(), "trigger-to-impact reachability") {
+		t.Fatalf("missing reachability error = %v", err)
+	}
+
+	report.Findings[0].Reachability = &model.Reachability{
+		Status: "demonstrated", Trigger: "an authenticated request supplies command",
+		Path:   []string{"handler.go:20 accepts command", "runner.go:45 passes command to exec"},
+		Impact: "the process executes attacker-selected input",
+	}
+	if err := validateReport(report); err != nil {
+		t.Fatalf("demonstrated reachability rejected: %v", err)
+	}
+}
+
 func TestClaudePromptReservesFinalizationTurns(t *testing.T) {
 	got := claudePrompt("review this", config.Reviewer{MaxTurns: 50, FinalizationTurns: 2})
 	for _, want := range []string{"no later than turn 48", "final 2 turn(s)", `verdict "abstain"`} {

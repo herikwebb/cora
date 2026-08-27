@@ -57,10 +57,17 @@ func EnabledWithClaudeEscalation(cfg config.Config, cause string) []Adapter {
 }
 
 type Codex struct {
-	Config config.Reviewer
+	Config          config.Reviewer
+	ReviewerName    string
+	EscalationCause string
 }
 
-func (Codex) Name() string     { return "codex" }
+func (c Codex) Name() string {
+	if c.ReviewerName != "" {
+		return c.ReviewerName
+	}
+	return "codex"
+}
 func (Codex) Provider() string { return "codex" }
 
 func (c Codex) Review(parent context.Context, request Request) model.ReviewerResult {
@@ -68,6 +75,7 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 	result := model.ReviewerResult{
 		Reviewer: c.Name(), Status: "incomplete", Tool: c.Config.Command, Attempt: normalizedAttempt(request.Attempt),
 		Model: c.Config.Model, ModelSource: "configured", Effort: c.Config.Effort,
+		EscalationCause: c.EscalationCause,
 	}
 	env := processx.ReviewerEnvironment(request.AllowAPIBilling)
 
@@ -990,6 +998,11 @@ func validateReport(report model.ReviewReport) error {
 		}
 		if strings.TrimSpace(finding.ID) == "" || strings.TrimSpace(finding.Claim) == "" || strings.TrimSpace(finding.Evidence) == "" {
 			return fmt.Errorf("finding %d is missing required evidence", i)
+		}
+		if finding.Severity == "blocker" || finding.Severity == "major" {
+			if finding.Reachability == nil || finding.Reachability.Status != "demonstrated" || strings.TrimSpace(finding.Reachability.Trigger) == "" || len(finding.Reachability.Path) == 0 || strings.TrimSpace(finding.Reachability.Impact) == "" {
+				return fmt.Errorf("finding %d does not demonstrate trigger-to-impact reachability", i)
+			}
 		}
 	}
 	return nil

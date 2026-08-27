@@ -47,8 +47,42 @@
           "line": { "type": "integer", "minimum": 0 },
           "claim": { "type": "string" },
           "evidence": { "type": "string" },
-          "suggested_fix": { "type": "string" }
-        }
+          "suggested_fix": { "type": "string" },
+          "disposition": {
+            "type": "string",
+            "enum": ["confirmed", "demoted", "disproved", "uncertain"]
+          },
+          "reachability": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status", "trigger", "path", "impact", "preconditions"],
+            "properties": {
+              "status": { "type": "string", "enum": ["demonstrated", "not_demonstrated", "not_applicable", "uncertain"] },
+              "trigger": { "type": "string" },
+              "path": { "type": "array", "items": { "type": "string" } },
+              "impact": { "type": "string" },
+              "preconditions": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "severity": { "enum": ["blocker", "major"] } } },
+            "then": {
+              "required": ["reachability"],
+              "properties": {
+                "reachability": {
+                  "properties": {
+                    "status": { "const": "demonstrated" },
+                    "trigger": { "minLength": 1 },
+                    "path": { "minItems": 1 },
+                    "impact": { "minLength": 1 }
+                  }
+                }
+              }
+            }
+          }
+        ]
       }
     },
     "reviewed_paths": {

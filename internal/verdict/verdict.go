@@ -13,6 +13,10 @@ import (
 )
 
 func Evaluate(runID string, target model.Target, reviewers []model.ReviewerResult, checks []model.CheckResult, blocking []string, minimumApprovals int, now time.Time) model.Decision {
+	return EvaluateWithCrossExaminations(runID, target, reviewers, checks, blocking, minimumApprovals, nil, now)
+}
+
+func EvaluateWithCrossExaminations(runID string, target model.Target, reviewers []model.ReviewerResult, checks []model.CheckResult, blocking []string, minimumApprovals int, crossExaminations []model.CrossExamination, now time.Time) model.Decision {
 	decision := model.Decision{
 		SchemaVersion:  model.SchemaVersion,
 		RunID:          runID,
@@ -27,8 +31,9 @@ func Evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 			"minor":   0,
 			"note":    0,
 		},
-		Checks:    make(map[string]string, len(checks)),
-		CreatedAt: now.UTC(),
+		Checks:            make(map[string]string, len(checks)),
+		CreatedAt:         now.UTC(),
+		CrossExaminations: append([]model.CrossExamination(nil), crossExaminations...),
 	}
 
 	blockingSet := make(map[string]bool, len(blocking))
@@ -44,7 +49,7 @@ func Evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 
 	incomplete := false
 	abstained := false
-	changesRequested := false
+	explicitChangesRequested := false
 	approvals := 0
 	var findings []findingWithReviewer
 	var residualRisks []string
@@ -76,21 +81,35 @@ func Evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 		case "approve":
 			approvals++
 		case "request_changes":
-			changesRequested = true
+			hasBlockingFinding := false
+			for _, finding := range report.Findings {
+				if blockingSet[finding.Severity] {
+					hasBlockingFinding = true
+					break
+				}
+			}
+			if !hasBlockingFinding {
+				explicitChangesRequested = true
+			}
 		case "abstain":
 			abstained = true
 		}
 		for _, finding := range report.Findings {
 			findings = append(findings, findingWithReviewer{reviewer: reviewer.Reviewer, finding: finding})
-			if blockingSet[finding.Severity] {
-				changesRequested = true
-			}
 		}
 		residualRisks = append(residualRisks, report.ResidualRisks...)
 	}
-	decision.Findings = consolidateFindings(findings)
+	consolidated := consolidateFindings(findings)
+	decision.Findings, decision.RejectedFindings, incomplete = applyCrossExaminations(consolidated, crossExaminations, incomplete)
+	changesRequested := explicitChangesRequested
 	for _, finding := range decision.Findings {
 		decision.OpenFindings[finding.Severity]++
+		if blockingSet[finding.Severity] {
+			changesRequested = true
+		}
+	}
+	if crossExaminationApproval(crossExaminations) {
+		approvals++
 	}
 	decision.ResidualRisks = uniqueStrings(residualRisks)
 	if len(verdictNames) > 1 {
@@ -135,7 +154,10 @@ func Evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 	default:
 		decision.State = model.StateApproved
 		nonBlocking := decision.OpenFindings["minor"] + decision.OpenFindings["note"]
-		if nonBlocking > 0 {
+		if crossExaminationApproval(crossExaminations) {
+			decision.OutcomeQualifier = "cross_examined"
+			decision.Reason = "approval quorum met after independent cross-examination resolved disputed blocking findings"
+		} else if nonBlocking > 0 {
 			decision.OutcomeQualifier = "non_blocking_findings"
 			decision.Reason = fmt.Sprintf("all %d reviewers approved the exact change with %d non-blocking findings", len(reviewers), nonBlocking)
 		} else {
@@ -143,6 +165,86 @@ func Evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 		}
 	}
 	return decision
+}
+
+// BlockingCandidates returns sole-reviewer blocker/major findings that can
+// change the verdict if an independent cross-examiner disproves or demotes
+// them. Corroborated findings already satisfy the consensus burden.
+func BlockingCandidates(reviewers []model.ReviewerResult) []model.ConsolidatedFinding {
+	var findings []findingWithReviewer
+	for _, reviewer := range reviewers {
+		if reviewer.Status != "completed" || reviewer.Report == nil || strings.Contains(reviewer.Reviewer, "cross-examination") {
+			continue
+		}
+		for _, finding := range reviewer.Report.Findings {
+			if finding.Severity == "blocker" || finding.Severity == "major" {
+				findings = append(findings, findingWithReviewer{reviewer: reviewer.Reviewer, finding: finding})
+			}
+		}
+	}
+	consolidated := consolidateFindings(findings)
+	candidates := make([]model.ConsolidatedFinding, 0, len(consolidated))
+	for _, finding := range consolidated {
+		if len(finding.Reviewers) == 1 {
+			candidates = append(candidates, finding)
+		}
+	}
+	return candidates
+}
+
+func applyCrossExaminations(findings []model.ConsolidatedFinding, examinations []model.CrossExamination, incomplete bool) ([]model.ConsolidatedFinding, []model.ConsolidatedFinding, bool) {
+	byFinding := make(map[string]model.CrossExamination, len(examinations))
+	for _, examination := range examinations {
+		byFinding[examination.FindingID] = examination
+	}
+	open := make([]model.ConsolidatedFinding, 0, len(findings))
+	var rejected []model.ConsolidatedFinding
+	for _, finding := range findings {
+		examination, found := byFinding[finding.ID]
+		if !found {
+			open = append(open, finding)
+			continue
+		}
+		finding.OriginalSeverity = finding.Severity
+		finding.Disposition = examination.Disposition
+		finding.CrossExaminer = examination.Reviewer
+		finding.Reachability = examination.Reachability
+		if examination.Status != "completed" || examination.Disposition == "uncertain" {
+			incomplete = true
+			open = append(open, finding)
+			continue
+		}
+		switch examination.Disposition {
+		case "confirmed":
+			if examination.EffectiveSeverity != "" {
+				finding.Severity = examination.EffectiveSeverity
+			}
+			finding.Reviewers = appendUniqueString(finding.Reviewers, examination.Reviewer)
+			open = append(open, finding)
+		case "demoted":
+			finding.Severity = examination.EffectiveSeverity
+			finding.Reviewers = appendUniqueString(finding.Reviewers, examination.Reviewer)
+			open = append(open, finding)
+		case "disproved":
+			rejected = append(rejected, finding)
+		default:
+			incomplete = true
+			open = append(open, finding)
+		}
+	}
+	return open, rejected, incomplete
+}
+
+func crossExaminationApproval(examinations []model.CrossExamination) bool {
+	if len(examinations) == 0 {
+		return false
+	}
+	for _, examination := range examinations {
+		if examination.Status != "completed" || (examination.Disposition != "demoted" && examination.Disposition != "disproved") {
+			return false
+		}
+	}
+	return true
 }
 
 type findingWithReviewer struct {
@@ -166,7 +268,8 @@ func consolidateFindings(items []findingWithReviewer) []model.ConsolidatedFindin
 				Confidence: item.finding.Confidence, File: item.finding.File, Line: item.finding.Line,
 				Claim: item.finding.Claim, Evidence: nonEmptyStrings(item.finding.Evidence),
 				SuggestedFixes: nonEmptyStrings(item.finding.SuggestedFix), Reviewers: []string{item.reviewer},
-				SourceIDs: nonEmptyStrings(item.finding.ID),
+				SourceIDs:    nonEmptyStrings(item.finding.ID),
+				Reachability: item.finding.Reachability,
 			})
 			continue
 		}
@@ -177,6 +280,7 @@ func consolidateFindings(items []findingWithReviewer) []model.ConsolidatedFindin
 		if item.finding.Confidence > merged.Confidence {
 			merged.Confidence = item.finding.Confidence
 			merged.Claim = item.finding.Claim
+			merged.Reachability = item.finding.Reachability
 		}
 		merged.Evidence = appendUniqueString(merged.Evidence, item.finding.Evidence)
 		merged.SuggestedFixes = appendUniqueString(merged.SuggestedFixes, item.finding.SuggestedFix)

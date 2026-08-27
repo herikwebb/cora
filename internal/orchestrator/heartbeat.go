@@ -31,7 +31,7 @@ func newRunHeartbeat(run record.Run, started time.Time, progress io.Writer) *run
 		run: run, progress: progress, stop: make(chan struct{}), done: make(chan struct{}),
 		value: model.Heartbeat{
 			RunID: run.ID, State: "active", Phase: "reviewers", StartedAt: started,
-			UpdatedAt: time.Now().UTC(), PID: os.Getpid(), Reviewers: map[string]string{}, Checks: map[string]string{}, Queues: map[string]model.ProviderQueueStatus{},
+			UpdatedAt: time.Now().UTC(), PID: os.Getpid(), Reviewers: map[string]string{}, ReviewerStartedAt: map[string]time.Time{}, Checks: map[string]string{}, Queues: map[string]model.ProviderQueueStatus{},
 		},
 	}
 }
@@ -84,6 +84,13 @@ func (h *runHeartbeat) Phase(phase string) {
 func (h *runHeartbeat) Reviewer(name, state string) {
 	h.mu.Lock()
 	h.value.Reviewers[name] = state
+	if state == "running" {
+		if h.value.ReviewerStartedAt[name].IsZero() {
+			h.value.ReviewerStartedAt[name] = time.Now().UTC()
+		}
+	} else {
+		delete(h.value.ReviewerStartedAt, name)
+	}
 	h.value.UpdatedAt = time.Now().UTC()
 	h.mu.Unlock()
 	h.write()
@@ -113,6 +120,9 @@ func (h *runHeartbeat) Finish(state string) {
 func (h *runHeartbeat) write() {
 	h.writeMu.Lock()
 	defer h.writeMu.Unlock()
+	h.mu.Lock()
+	h.value.UpdatedAt = time.Now().UTC()
+	h.mu.Unlock()
 	_ = record.WriteHeartbeat(h.run, h.snapshot())
 }
 
@@ -121,9 +131,18 @@ func (h *runHeartbeat) snapshot() model.Heartbeat {
 	defer h.mu.Unlock()
 	value := h.value
 	value.Reviewers = cloneStates(h.value.Reviewers)
+	value.ReviewerStartedAt = cloneTimes(h.value.ReviewerStartedAt)
 	value.Checks = cloneStates(h.value.Checks)
 	value.Queues = cloneQueues(h.value.Queues)
 	return value
+}
+
+func cloneTimes(source map[string]time.Time) map[string]time.Time {
+	clone := make(map[string]time.Time, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }
 
 func cloneQueues(source map[string]model.ProviderQueueStatus) map[string]model.ProviderQueueStatus {
@@ -151,7 +170,11 @@ func heartbeatDetail(heartbeat model.Heartbeat) string {
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			parts = append(parts, name+"="+states[name])
+			detail := name + "=" + states[name]
+			if states[name] == "running" && !heartbeat.ReviewerStartedAt[name].IsZero() {
+				detail += "(" + formatDuration(time.Since(heartbeat.ReviewerStartedAt[name])) + ")"
+			}
+			parts = append(parts, detail)
 		}
 	}
 	queueNames := make([]string, 0, len(heartbeat.Queues))
@@ -163,9 +186,16 @@ func heartbeatDetail(heartbeat model.Heartbeat) string {
 		queue := heartbeat.Queues[name]
 		detail := fmt.Sprintf("%s=queue:%d", name, queue.Position)
 		if queue.ETAAt != nil {
-			detail += "~" + formatDuration(time.Until(*queue.ETAAt))
+			detail += "~" + formatDuration(nonNegativeDuration(time.Until(*queue.ETAAt)))
 		}
 		parts = append(parts, detail)
 	}
 	return strings.Join(parts, " ")
+}
+
+func nonNegativeDuration(duration time.Duration) time.Duration {
+	if duration < 0 {
+		return 0
+	}
+	return duration
 }

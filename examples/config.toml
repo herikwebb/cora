@@ -3,6 +3,10 @@ base = "upstream/main"
 reviewer_timeout = "15m"
 overall_timeout = "45m"
 queue_timeout = "24h"
+strict = false
+# Require an adversarial source-to-sink trace before a sole-reviewer blocker or
+# major can determine the final verdict.
+cross_examine_blocking_findings = true
 require_clean_tree = true
 allow_api_billing = false
 # Host checks can read the local filesystem and use the network. Leave this
@@ -29,8 +33,9 @@ finalization_turns = 2
 max_budget_usd = 0
 max_concurrency = 1
 
-# Security-sensitive changes use this Claude model. Set adjudication to true
-# only when the additional provider usage for disputes is intentional.
+# Security-sensitive changes and targeted cross-examination use this Claude
+# model. Set broad adjudication to true only when its additional provider usage
+# is intentional.
 [escalation]
 enabled = true
 model = "fable"

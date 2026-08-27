@@ -67,30 +67,33 @@ type Escalation struct {
 }
 
 type Config struct {
-	Base               string              `toml:"base"`
-	ReviewerTimeout    Duration            `toml:"reviewer_timeout"`
-	OverallTimeout     Duration            `toml:"overall_timeout"`
-	QueueTimeout       Duration            `toml:"queue_timeout"`
-	RequireCleanTree   bool                `toml:"require_clean_tree"`
-	AllowAPIBilling    bool                `toml:"allow_api_billing"`
-	AllowUnsafeChecks  bool                `toml:"allow_unsafe_host_checks"`
-	MinimumApprovals   int                 `toml:"minimum_approvals"`
-	BlockingSeverities []string            `toml:"blocking_severities"`
-	PromptFile         string              `toml:"prompt_file"`
-	Reviewers          Reviewers           `toml:"reviewers"`
-	Escalation         Escalation          `toml:"escalation"`
-	Checks             []Check             `toml:"checks"`
-	ValidationProfiles []ValidationProfile `toml:"validation_profiles"`
-	LoadedFiles        []string            `toml:"-"`
+	Base                         string              `toml:"base"`
+	ReviewerTimeout              Duration            `toml:"reviewer_timeout"`
+	OverallTimeout               Duration            `toml:"overall_timeout"`
+	QueueTimeout                 Duration            `toml:"queue_timeout"`
+	StrictPolicy                 bool                `toml:"strict"`
+	CrossExamineBlockingFindings bool                `toml:"cross_examine_blocking_findings"`
+	RequireCleanTree             bool                `toml:"require_clean_tree"`
+	AllowAPIBilling              bool                `toml:"allow_api_billing"`
+	AllowUnsafeChecks            bool                `toml:"allow_unsafe_host_checks"`
+	MinimumApprovals             int                 `toml:"minimum_approvals"`
+	BlockingSeverities           []string            `toml:"blocking_severities"`
+	PromptFile                   string              `toml:"prompt_file"`
+	Reviewers                    Reviewers           `toml:"reviewers"`
+	Escalation                   Escalation          `toml:"escalation"`
+	Checks                       []Check             `toml:"checks"`
+	ValidationProfiles           []ValidationProfile `toml:"validation_profiles"`
+	LoadedFiles                  []string            `toml:"-"`
 }
 
 func Defaults() Config {
 	return Config{
-		ReviewerTimeout:  Duration{Duration: 15 * time.Minute},
-		OverallTimeout:   Duration{Duration: 45 * time.Minute},
-		QueueTimeout:     Duration{Duration: 24 * time.Hour},
-		RequireCleanTree: true,
-		MinimumApprovals: 2,
+		ReviewerTimeout:              Duration{Duration: 15 * time.Minute},
+		OverallTimeout:               Duration{Duration: 45 * time.Minute},
+		QueueTimeout:                 Duration{Duration: 24 * time.Hour},
+		CrossExamineBlockingFindings: true,
+		RequireCleanTree:             true,
+		MinimumApprovals:             2,
 		BlockingSeverities: []string{
 			"blocker",
 			"major",
@@ -354,6 +357,18 @@ func ApplyProfiles(cfg Config, names []string) (Config, error) {
 			Checks: []Check{
 				{Name: "go-test", Command: []string{"go", "test", "./..."}, Timeout: Duration{Duration: 15 * time.Minute}},
 				{Name: "go-vet", Command: []string{"go", "vet", "./..."}, Timeout: Duration{Duration: 10 * time.Minute}},
+			},
+		},
+		"node": {
+			Name: "node",
+			Checks: []Check{
+				{Name: "node-test", Command: []string{"npm", "test"}, Timeout: Duration{Duration: 20 * time.Minute}},
+			},
+		},
+		"python": {
+			Name: "python",
+			Checks: []Check{
+				{Name: "python-test", Command: []string{"python3", "-m", "pytest"}, Timeout: Duration{Duration: 20 * time.Minute}},
 			},
 		},
 	}

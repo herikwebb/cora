@@ -116,6 +116,95 @@ func TestEvaluateQualifiesApprovalWithNonBlockingFindings(t *testing.T) {
 	}
 }
 
+func TestEvaluateTreatsMinorAsBlockingWhenPolicyIncludesIt(t *testing.T) {
+	codex := completedReview("codex", "approve")
+	codex.Report.Findings = []model.Finding{{ID: "C", Severity: "minor", File: "app.go", Line: 5, Claim: "Missing validation"}}
+	decision := Evaluate("run", finalTarget(), []model.ReviewerResult{codex, completedReview("claude", "approve")}, nil, []string{"blocker", "major", "minor"}, 2, time.Unix(1, 0))
+	if decision.State != model.StateChangesRequested {
+		t.Fatalf("strict minor decision = %#v", decision)
+	}
+}
+
+func TestCrossExaminationCanDisproveUncorroboratedMajor(t *testing.T) {
+	reporter := completedReview("codex", "request_changes")
+	reporter.Report.Findings = []model.Finding{blockingFinding("C1")}
+	reviewers := []model.ReviewerResult{reporter, completedReview("claude", "approve")}
+	candidate := BlockingCandidates(reviewers)[0]
+	examinations := []model.CrossExamination{{
+		FindingID: candidate.ID, Reviewer: "claude-cross-examination", Status: "completed",
+		Disposition: "disproved", OriginalSeverity: "major", EffectiveSeverity: "note",
+		Rationale: "the validated value is used instead", Reachability: &model.Reachability{
+			Status: "not_demonstrated", Path: []string{"handler.go:20 rejects the value"}, Impact: "the alleged sink is never reached",
+		},
+	}}
+	decision := EvaluateWithCrossExaminations("run", finalTarget(), reviewers, nil, []string{"blocker", "major"}, 2, examinations, time.Unix(1, 0))
+	if decision.State != model.StateApproved || decision.OutcomeQualifier != "cross_examined" {
+		t.Fatalf("cross-examined decision = %#v", decision)
+	}
+	if len(decision.Findings) != 0 || len(decision.RejectedFindings) != 1 || decision.RejectedFindings[0].Disposition != "disproved" {
+		t.Fatalf("rejected findings = %#v, open = %#v", decision.RejectedFindings, decision.Findings)
+	}
+}
+
+func TestCrossExaminationDemotionRespectsBlockingPolicy(t *testing.T) {
+	reporter := completedReview("codex", "request_changes")
+	reporter.Report.Findings = []model.Finding{blockingFinding("C1")}
+	reviewers := []model.ReviewerResult{reporter, completedReview("claude", "approve")}
+	candidate := BlockingCandidates(reviewers)[0]
+	examinations := []model.CrossExamination{{
+		FindingID: candidate.ID, Reviewer: "claude-cross-examination", Status: "completed",
+		Disposition: "demoted", OriginalSeverity: "major", EffectiveSeverity: "minor",
+		Rationale: "the behavior is reachable but has only diagnostic impact",
+	}}
+
+	standard := EvaluateWithCrossExaminations("run", finalTarget(), reviewers, nil, []string{"blocker", "major"}, 2, examinations, time.Unix(1, 0))
+	if standard.State != model.StateApproved || len(standard.Findings) != 1 || standard.Findings[0].Severity != "minor" {
+		t.Fatalf("standard demotion decision = %#v", standard)
+	}
+	strict := EvaluateWithCrossExaminations("run", finalTarget(), reviewers, nil, []string{"blocker", "major", "minor"}, 2, examinations, time.Unix(1, 0))
+	if strict.State != model.StateChangesRequested {
+		t.Fatalf("strict demotion decision = %#v", strict)
+	}
+}
+
+func TestCrossExaminationConfirmedOrIncompleteFailsClosed(t *testing.T) {
+	reporter := completedReview("codex", "request_changes")
+	reporter.Report.Findings = []model.Finding{blockingFinding("C1")}
+	reviewers := []model.ReviewerResult{reporter, completedReview("claude", "approve")}
+	candidate := BlockingCandidates(reviewers)[0]
+
+	confirmed := []model.CrossExamination{{
+		FindingID: candidate.ID, Reviewer: "claude-cross-examination", Status: "completed",
+		Disposition: "confirmed", OriginalSeverity: "major", EffectiveSeverity: "major",
+		Reachability: blockingFinding("cross").Reachability,
+	}}
+	decision := EvaluateWithCrossExaminations("run", finalTarget(), reviewers, nil, []string{"blocker", "major"}, 2, confirmed, time.Unix(1, 0))
+	if decision.State != model.StateChangesRequested {
+		t.Fatalf("confirmed decision = %#v", decision)
+	}
+
+	incomplete := []model.CrossExamination{{
+		FindingID: candidate.ID, Reviewer: "claude-cross-examination", Status: "incomplete",
+		OriginalSeverity: "major", Error: "cross-examiner timed out",
+	}}
+	decision = EvaluateWithCrossExaminations("run", finalTarget(), reviewers, nil, []string{"blocker", "major"}, 2, incomplete, time.Unix(1, 0))
+	if decision.State != model.StateIncomplete {
+		t.Fatalf("incomplete cross-examination decision = %#v", decision)
+	}
+}
+
+func TestBlockingCandidatesExcludesCorroboratedFindings(t *testing.T) {
+	codex := completedReview("codex", "request_changes")
+	codex.Report.Findings = []model.Finding{blockingFinding("C1")}
+	claude := completedReview("claude", "request_changes")
+	claudeFinding := blockingFinding("A1")
+	claudeFinding.Line = codex.Report.Findings[0].Line + 1
+	claude.Report.Findings = []model.Finding{claudeFinding}
+	if candidates := BlockingCandidates([]model.ReviewerResult{codex, claude}); len(candidates) != 0 {
+		t.Fatalf("corroborated finding was selected for cross-examination: %#v", candidates)
+	}
+}
+
 func TestEvaluateRetainsPartialReportEvidenceAndFailsClosed(t *testing.T) {
 	partial := model.ReviewerResult{
 		Reviewer: "claude", Status: "partial", Error: "max turns",
@@ -142,6 +231,18 @@ func completedReview(name, reportVerdict string) model.ReviewerResult {
 			SchemaVersion:   model.SchemaVersion,
 			Verdict:         reportVerdict,
 			ContextComplete: true,
+		},
+	}
+}
+
+func blockingFinding(id string) model.Finding {
+	return model.Finding{
+		ID: id, Severity: "major", Confidence: 0.95, File: "handler.go", Line: 20,
+		Claim: "Untrusted command input reaches process execution", Evidence: "handler passes command into runner", SuggestedFix: "validate the command",
+		Reachability: &model.Reachability{
+			Status: "demonstrated", Trigger: "an authenticated request provides command input",
+			Path:   []string{"handler.go:20 accepts input", "runner.go:45 invokes the process"},
+			Impact: "attacker-selected input is executed", Preconditions: []string{"the runner is enabled"},
 		},
 	}
 }

@@ -5,10 +5,12 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/herikwebb/cora/internal/gitx"
 	"github.com/herikwebb/cora/internal/model"
 	"github.com/herikwebb/cora/internal/record"
+	"github.com/herikwebb/cora/internal/verdict"
 )
 
 func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
@@ -256,6 +259,7 @@ func TestRunnerEscalatesDisputedReviewToFable(t *testing.T) {
 	writeExecutable(t, claudePath, fakeDisputeClaudeScript)
 
 	cfg := config.Defaults()
+	cfg.CrossExamineBlockingFindings = false
 	cfg.Escalation.AdjudicateDisagreements = true
 	cfg.Reviewers.Codex.Command = codexPath
 	cfg.Reviewers.Claude.Command = claudePath
@@ -303,6 +307,73 @@ func TestRunnerEscalatesDisputedReviewToFable(t *testing.T) {
 	}
 }
 
+func TestRunnerCrossExaminesAndDisprovesSoleMajor(t *testing.T) {
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
+	repoRoot := orchestratorTestRepo(t)
+	gitRun(t, repoRoot, "switch", "-c", "feature")
+	if err := os.WriteFile(filepath.Join(repoRoot, "app.txt"), []byte("base\nfeature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repoRoot, "add", "app.txt")
+	gitRun(t, repoRoot, "commit", "-m", "feat(app): add disputed feature")
+
+	repo, err := gitx.Discover(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := repo.ResolveTarget(context.Background(), gitx.TargetOptions{Base: "main", RequireClean: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initialReport model.ReviewReport
+	if err := json.Unmarshal([]byte(disputingReport), &initialReport); err != nil {
+		t.Fatal(err)
+	}
+	candidates := verdict.BlockingCandidates([]model.ReviewerResult{{Reviewer: "codex", Status: "completed", Report: &initialReport}})
+	if len(candidates) != 1 {
+		t.Fatalf("blocking candidates = %#v", candidates)
+	}
+
+	binDir := t.TempDir()
+	codexPath := filepath.Join(binDir, "codex")
+	claudePath := filepath.Join(binDir, "claude")
+	writeExecutable(t, codexPath, fakeDisputingCodexScript)
+	writeExecutable(t, claudePath, fakeCrossExaminingClaudeScript(candidates[0].ID))
+	cfg := config.Defaults()
+	cfg.Reviewers.Codex.Command = codexPath
+	cfg.Reviewers.Claude.Command = claudePath
+	cfg.ReviewerTimeout.Duration = 5 * time.Second
+	cfg.OverallTimeout.Duration = 10 * time.Second
+	var progress bytes.Buffer
+	decision, err := (Runner{Version: "test", Progress: &progress}).Run(context.Background(), repo, target, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.State != model.StateApproved || decision.OutcomeQualifier != "cross_examined" || len(decision.RejectedFindings) != 1 {
+		t.Fatalf("cross-examined decision = %#v", decision)
+	}
+	if len(decision.CrossExaminations) != 1 || decision.CrossExaminations[0].Disposition != "disproved" {
+		t.Fatalf("cross examinations = %#v", decision.CrossExaminations)
+	}
+	if !strings.Contains(progress.String(), "cross-examining 1 uncorroborated blocking finding") {
+		t.Fatalf("progress did not show cross-examination:\n%s", progress.String())
+	}
+	run, err := record.New(repo.CommonDir).Resolve("latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := record.LoadManifest(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.CrossExamPromptHash == "" || len(manifest.CrossExaminations) != 1 || manifest.CrossExaminations[0].Model != "claude-fable-5" {
+		t.Fatalf("cross-examination manifest = %#v", manifest)
+	}
+	if _, err := os.Stat(filepath.Join(run.Path, "cross-examination.prompt.md")); err != nil {
+		t.Fatalf("cross-examination prompt was not persisted: %v", err)
+	}
+}
+
 func TestChangedControlFilesRecognizesNestedAgentConfiguration(t *testing.T) {
 	got := changedControlFiles([]string{
 		"src/app.go",
@@ -335,6 +406,73 @@ func TestSecuritySensitivePathsUsesConfiguredMarkers(t *testing.T) {
 	want := []string{".github/workflows/release.yml", "deploy/oauth-proxy.yaml", "internal/auth/session.go"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("securitySensitivePaths() = %v, want %v", got, want)
+	}
+}
+
+func TestBlockingCrossExaminationPromptRequiresSourceToSinkDisproof(t *testing.T) {
+	candidates := []model.ConsolidatedFinding{{
+		ID: "cora-123", Severity: "major", File: "handler.go", Line: 20,
+		Claim: "Untrusted input reaches the sink", Reviewers: []string{"codex"},
+	}}
+	prompt := blockingCrossExaminationPrompt("base prompt", candidates)
+	for _, want := range []string{"cora-123", "trigger-to-impact", "callers, guards, transformations", "disproved"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("cross-examination prompt does not contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestNormalizeCrossExaminationsDemotesExactCandidate(t *testing.T) {
+	candidates := []model.ConsolidatedFinding{{ID: "cora-123", Severity: "major"}}
+	results := []model.ReviewerResult{{
+		Reviewer: "claude-cross-examination", Status: "completed",
+		Report: &model.ReviewReport{ContextComplete: true, Findings: []model.Finding{{
+			ID: "cora-123", Severity: "minor", Disposition: "demoted",
+			Evidence: "the sink receives a normalized constant rather than user input",
+		}}},
+	}}
+	examinations := normalizeCrossExaminations(candidates, results)
+	if len(examinations) != 1 || examinations[0].Status != "completed" || examinations[0].Disposition != "demoted" || examinations[0].EffectiveSeverity != "minor" {
+		t.Fatalf("normalized cross-examination = %#v", examinations)
+	}
+}
+
+func TestNormalizeCrossExaminationsRejectsMismatchedCandidate(t *testing.T) {
+	candidates := []model.ConsolidatedFinding{{ID: "cora-123", Severity: "major"}}
+	results := []model.ReviewerResult{{
+		Reviewer: "claude-cross-examination", Status: "completed",
+		Report: &model.ReviewReport{ContextComplete: true, Findings: []model.Finding{{
+			ID: "different", Severity: "note", Disposition: "disproved",
+			Evidence: "unrelated", Reachability: &model.Reachability{Status: "not_demonstrated"},
+		}}},
+	}}
+	examinations := normalizeCrossExaminations(candidates, results)
+	if len(examinations) != 1 || examinations[0].Status != "incomplete" || !strings.Contains(examinations[0].Error, "omitted candidate") {
+		t.Fatalf("mismatched cross-examination = %#v", examinations)
+	}
+}
+
+func TestCrossExaminationSkipsWhenAnotherRequiredReviewCannotComplete(t *testing.T) {
+	reviewers := []model.ReviewerResult{
+		{Reviewer: "codex", Status: "completed", Report: &model.ReviewReport{ContextComplete: true}},
+		{Reviewer: "claude", Status: "completed", Report: &model.ReviewReport{ContextComplete: true}},
+		{Reviewer: "claude-escalation", Status: "incomplete", Error: "quota exceeded"},
+	}
+	if crossExaminationCanAffectOutcome(reviewers, nil) {
+		t.Fatal("cross-examination cannot change an outcome already forced incomplete")
+	}
+}
+
+func TestStrictPolicyBlocksMinorsAndRequiresValidation(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.StrictPolicy = true
+	severities := effectiveBlockingSeverities(cfg)
+	if !slices.Contains(severities, "minor") {
+		t.Fatalf("strict blocking severities = %v", severities)
+	}
+	checks := applyStrictValidationPolicy(true, nil)
+	if len(checks) != 1 || checks[0].Status != "incomplete" || summarizeValidation(checks) != "incomplete" {
+		t.Fatalf("strict validation checks = %#v", checks)
 	}
 }
 
@@ -502,7 +640,7 @@ fi
 printf '%s\n' '{"type":"result","is_error":false,"num_turns":2,"total_cost_usd":0.02,"resolved_model":"claude-fable-5","modelUsage":{"claude-fable-5":{"inputTokens":700,"cacheReadInputTokens":200,"outputTokens":100,"thinkingTokens":80,"costUSD":0.02}},"structured_output":` + validReport + `}'
 `
 
-const disputingReport = `{"schema_version":"1","verdict":"request_changes","context_complete":true,"summary":"changes needed","findings":[{"id":"major-1","severity":"major","confidence":0.95,"file":"app.txt","line":2,"claim":"The feature is disputed","evidence":"The fixture intentionally disagrees","suggested_fix":"Resolve the dispute"}],"reviewed_paths":["app.txt"],"omitted_paths":[],"residual_risks":[]}`
+const disputingReport = `{"schema_version":"1","verdict":"request_changes","context_complete":true,"summary":"changes needed","findings":[{"id":"major-1","severity":"major","confidence":0.95,"file":"app.txt","line":2,"claim":"The feature is disputed","evidence":"The fixture intentionally disagrees","suggested_fix":"Resolve the dispute","reachability":{"status":"demonstrated","trigger":"the feature input is accepted","path":["app.txt:2 applies the feature behavior"],"impact":"the disputed behavior is observable","preconditions":["the feature is enabled"]}}],"reviewed_paths":["app.txt"],"omitted_paths":[],"residual_risks":[]}`
 
 const fakeDisputingCodexScript = `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "codex-cli test"; exit 0; fi
@@ -539,3 +677,35 @@ resolved="claude-opus-4-6"
 if [ "$model" = "fable" ]; then resolved="claude-fable-5"; fi
 printf '%s\n' '{"type":"result","is_error":false,"num_turns":2,"total_cost_usd":0.02,"resolved_model":"'"$resolved"'","usage":{"input_tokens":700,"output_tokens":100,"thinking_tokens":80},"structured_output":` + validReport + `}'
 `
+
+func fakeCrossExaminingClaudeScript(candidateID string) string {
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "2.1.test"; exit 0; fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}'
+  exit 0
+fi
+model=""
+effort=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--model" ]; then shift; model="$1";
+  elif [ "$1" = "--effort" ]; then shift; effort="$1";
+  fi
+  shift
+done
+if [ "$effort" != "high" ]; then
+  echo "unexpected Claude effort: $effort" >&2
+  exit 21
+fi
+if [ "$model" = "opus" ]; then
+  printf '%s\n' '{"type":"result","is_error":false,"num_turns":2,"total_cost_usd":0.02,"resolved_model":"claude-opus-4-6","usage":{"input_tokens":700,"output_tokens":100,"thinking_tokens":80},"structured_output":` + validReport + `}'
+  exit 0
+fi
+if [ "$model" != "fable" ]; then
+  echo "unexpected Claude model: $model" >&2
+  exit 21
+fi
+printf '%s\n' '{"type":"result","is_error":false,"num_turns":2,"total_cost_usd":0.02,"resolved_model":"claude-fable-5","usage":{"input_tokens":700,"output_tokens":100,"thinking_tokens":80},"structured_output":{"schema_version":"1","verdict":"approve","context_complete":true,"summary":"the alleged path is unreachable","findings":[{"id":"__CANDIDATE_ID__","severity":"note","confidence":0.99,"file":"app.txt","line":2,"claim":"The alleged path is unreachable","evidence":"The consumer replaces the value before use","suggested_fix":"No blocking change is required","disposition":"disproved","reachability":{"status":"not_demonstrated","trigger":"the feature input is accepted","path":["app.txt:2 is normalized before consumption"],"impact":"the alleged behavior cannot occur","preconditions":[]}}],"reviewed_paths":["app.txt"],"omitted_paths":[],"residual_risks":[]}}'
+`
+	return strings.ReplaceAll(script, "__CANDIDATE_ID__", candidateID)
+}

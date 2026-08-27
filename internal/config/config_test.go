@@ -83,6 +83,9 @@ func TestDefaultsUseHighEffortClaudeOpusAndFableEscalation(t *testing.T) {
 	if cfg.Escalation.AdjudicateDisagreements {
 		t.Fatal("disagreement adjudication should require explicit opt-in")
 	}
+	if !cfg.CrossExamineBlockingFindings {
+		t.Fatal("targeted blocking-finding cross-examination should default on")
+	}
 }
 
 func TestApplyBuiltInGoValidationProfile(t *testing.T) {
@@ -95,6 +98,16 @@ func TestApplyBuiltInGoValidationProfile(t *testing.T) {
 	}
 	if cfg.Checks[0].Name != "go-test" || cfg.Checks[1].Name != "go-vet" {
 		t.Fatalf("Go profile check names = %#v", cfg.Checks)
+	}
+}
+
+func TestApplyBuiltInNodeAndPythonValidationProfiles(t *testing.T) {
+	cfg, err := ApplyProfiles(Defaults(), []string{"node", "python"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Checks) != 2 || cfg.Checks[0].Name != "node-test" || cfg.Checks[1].Name != "python-test" {
+		t.Fatalf("built-in checks = %#v", cfg.Checks)
 	}
 }
 
