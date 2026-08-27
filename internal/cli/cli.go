@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -106,6 +107,7 @@ func newReviewCommand(opts *options) *cobra.Command {
 	var allowUnsafeChecks bool
 	var securitySensitive bool
 	var adjudicate bool
+	var strict bool
 	var profiles []string
 	command := &cobra.Command{
 		Use:   "review",
@@ -176,9 +178,15 @@ func newReviewCommand(opts *options) *cobra.Command {
 			if adjudicate {
 				cfg.Escalation.AdjudicateDisagreements = true
 			}
+			if strict {
+				cfg.StrictPolicy = true
+			}
 			target, err = resolve(candidateBase, cfg.RequireCleanTree)
 			if err != nil {
 				return err
+			}
+			if len(profiles) == 0 && len(cfg.Checks) == 0 && cfg.AllowUnsafeChecks {
+				profiles = []string{"auto"}
 			}
 			profiles, err = expandAutoProfiles(ctx, repo, target, profiles)
 			if err != nil {
@@ -214,6 +222,7 @@ func newReviewCommand(opts *options) *cobra.Command {
 	command.Flags().BoolVar(&allowUnsafeChecks, "allow-unsafe-checks", false, "allow configured checks to execute unsandboxed on the host")
 	command.Flags().BoolVar(&securitySensitive, "security-sensitive", false, "escalate Claude to the configured security review model and effort")
 	command.Flags().BoolVar(&adjudicate, "adjudicate", false, "run a Fable adjudicator when reviewers disagree")
+	command.Flags().BoolVar(&strict, "strict", false, "treat minor findings as blocking and require validation checks")
 	command.Flags().StringSliceVar(&profiles, "profile", nil, "validation profile to run (repeatable; auto detects a built-in profile)")
 	return command
 }
@@ -223,6 +232,7 @@ func newRetryCommand(opts *options) *cobra.Command {
 	var noWait bool
 	var allowAPIBilling bool
 	var adjudicate bool
+	var strict bool
 	command := &cobra.Command{
 		Use:   "retry [run-id]",
 		Short: "Retry selected reviewers while reusing completed work",
@@ -283,6 +293,9 @@ func newRetryCommand(opts *options) *cobra.Command {
 			if adjudicate {
 				cfg.Escalation.AdjudicateDisagreements = true
 			}
+			if strict {
+				cfg.StrictPolicy = true
+			}
 			if (selected["codex"] && !cfg.Reviewers.Codex.Enabled) || (selected["claude"] && !cfg.Reviewers.Claude.Enabled) {
 				return errors.New("selected reviewer is disabled by the trusted configuration")
 			}
@@ -319,6 +332,7 @@ func newRetryCommand(opts *options) *cobra.Command {
 	command.Flags().BoolVar(&noWait, "no-wait", false, "return instead of waiting for a recorded provider quota reset")
 	command.Flags().BoolVar(&allowAPIBilling, "allow-api-billing", false, "allow API-key or other separately billed authentication")
 	command.Flags().BoolVar(&adjudicate, "adjudicate", false, "run a Fable adjudicator when reviewers disagree")
+	command.Flags().BoolVar(&strict, "strict", false, "treat minor findings as blocking and require validation checks")
 	return command
 }
 
@@ -385,11 +399,29 @@ func expandAutoProfiles(ctx context.Context, repo gitx.Repo, target model.Target
 			}
 			continue
 		}
-		if _, found, err := repo.ReadFileAt(ctx, target.HeadSHA, "go.mod"); err != nil {
-			return nil, err
-		} else if found && !seen["go"] {
-			expanded = append(expanded, "go")
-			seen["go"] = true
+		markers := []struct {
+			profile string
+			paths   []string
+		}{
+			{profile: "go", paths: []string{"go.mod"}},
+			{profile: "node", paths: []string{"package.json"}},
+			{profile: "python", paths: []string{"pyproject.toml", "pytest.ini", "setup.cfg"}},
+		}
+		for _, marker := range markers {
+			if seen[marker.profile] {
+				continue
+			}
+			for _, path := range marker.paths {
+				_, found, err := repo.ReadFileAt(ctx, target.HeadSHA, path)
+				if err != nil {
+					return nil, err
+				}
+				if found {
+					expanded = append(expanded, marker.profile)
+					seen[marker.profile] = true
+					break
+				}
+			}
 		}
 	}
 	return expanded, nil
@@ -425,9 +457,7 @@ func newStatusCommand(opts *options) *cobra.Command {
 					fmt.Fprintln(command.OutOrStdout(), "No active CORA runs.")
 					return nil
 				}
-				for _, summary := range activeRuns {
-					printRunSummary(summary)
-				}
+				printActiveRuns(command.OutOrStdout(), activeRuns)
 				return nil
 			}
 			run, err := store.Resolve("latest")
@@ -557,6 +587,13 @@ func loadRunSummary(run record.Run) (model.RunSummary, error) {
 		summary.Reviewers = heartbeat.Reviewers
 		summary.Checks = heartbeat.Checks
 		summary.Queues = heartbeat.Queues
+		summary.ReviewerElapsedMS = make(map[string]int64)
+		for name, state := range heartbeat.Reviewers {
+			started := heartbeat.ReviewerStartedAt[name]
+			if state == "running" && !started.IsZero() {
+				summary.ReviewerElapsedMS[name] = nonNegativeMilliseconds(now.Sub(started))
+			}
+		}
 		if heartbeat.State == "active" && now.Sub(heartbeat.UpdatedAt) > 2*heartbeatFreshnessWindow() {
 			summary.State = "interrupted"
 		}
@@ -576,7 +613,11 @@ func printRunSummary(summary model.RunSummary) {
 	}
 	fmt.Printf("Head: %s\nElapsed: %s\nRecord: %s\n", shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), summary.RecordPath)
 	for _, name := range sortedStateNames(summary.Reviewers) {
-		fmt.Printf("%-18s %s\n", name+":", summary.Reviewers[name])
+		state := summary.Reviewers[name]
+		if elapsed := summary.ReviewerElapsedMS[name]; state == "running" && elapsed > 0 {
+			state += " for " + formatMilliseconds(elapsed)
+		}
+		fmt.Printf("%-18s %s\n", name+":", state)
 	}
 	for _, name := range sortedStateNames(summary.Checks) {
 		fmt.Printf("%-18s %s\n", "check "+name+":", summary.Checks[name])
@@ -590,10 +631,35 @@ func printRunSummary(summary model.RunSummary) {
 		queue := summary.Queues[name]
 		eta := "unknown"
 		if queue.ETAAt != nil {
-			eta = queue.ETAAt.Local().Format(time.RFC3339)
+			eta = formatMilliseconds(nonNegativeMilliseconds(time.Until(*queue.ETAAt)))
 		}
-		fmt.Printf("%-18s position=%d ahead=%d active=%d/%d eta=%s\n", "queue "+name+":", queue.Position, queue.Ahead, queue.Active, queue.Limit, eta)
+		fmt.Printf("%-18s position=%d ahead=%d active=%d/%d eta_in=%s\n", "queue "+name+":", queue.Position, queue.Ahead, queue.Active, queue.Limit, eta)
 	}
+}
+
+func printActiveRuns(writer io.Writer, summaries []model.RunSummary) {
+	fmt.Fprintln(writer, "RUN                                      HEAD      ELAPSED   PHASE       REVIEWERS")
+	for _, summary := range summaries {
+		fmt.Fprintf(writer, "%-40s %-9s %-9s %-11s %s\n", summary.RunID, shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), summary.Phase, activeReviewerSummary(summary))
+	}
+}
+
+func activeReviewerSummary(summary model.RunSummary) string {
+	parts := make([]string, 0, len(summary.Reviewers))
+	for _, name := range sortedStateNames(summary.Reviewers) {
+		state := summary.Reviewers[name]
+		if elapsed := summary.ReviewerElapsedMS[name]; state == "running" && elapsed > 0 {
+			state += "(" + formatMilliseconds(elapsed) + ")"
+		}
+		if queue, found := summary.Queues[name]; found {
+			state = fmt.Sprintf("queued#%d", queue.Position)
+			if queue.ETAAt != nil {
+				state += "~" + formatMilliseconds(nonNegativeMilliseconds(time.Until(*queue.ETAAt)))
+			}
+		}
+		parts = append(parts, name+"="+state)
+	}
+	return strings.Join(parts, " ")
 }
 
 func sortedStateNames(states map[string]string) []string {
@@ -607,6 +673,13 @@ func sortedStateNames(states map[string]string) []string {
 
 func formatMilliseconds(milliseconds int64) string {
 	return (time.Duration(milliseconds) * time.Millisecond).Round(100 * time.Millisecond).String()
+}
+
+func nonNegativeMilliseconds(duration time.Duration) int64 {
+	if duration < 0 {
+		return 0
+	}
+	return duration.Milliseconds()
 }
 
 func newShowCommand(opts *options) *cobra.Command {
@@ -647,28 +720,9 @@ func newShowCommand(opts *options) *cobra.Command {
 			printDecision(decision)
 			fmt.Printf("Started:    %s\n", manifest.StartedAt.Local().Format(time.RFC3339))
 			fmt.Printf("Finished:   %s\n", manifest.FinishedAt.Local().Format(time.RFC3339))
-			if len(decision.Findings) > 0 {
-				fmt.Println("\nConsolidated findings:")
-				for _, finding := range decision.Findings {
-					fmt.Printf("  [%s] %s:%d %s (%s)\n", finding.Severity, finding.File, finding.Line, finding.Claim, strings.Join(finding.Reviewers, ", "))
-					if verbose {
-						fmt.Printf("    Confidence: %.0f%%\n", finding.Confidence*100)
-						for _, evidence := range finding.Evidence {
-							fmt.Printf("    Evidence: %s\n", evidence)
-						}
-						for _, fix := range finding.SuggestedFixes {
-							fmt.Printf("    Suggested fix: %s\n", fix)
-						}
-					}
-				}
-			}
-			if verbose && len(decision.ResidualRisks) > 0 {
-				fmt.Println("\nResidual risks:")
-				for _, risk := range decision.ResidualRisks {
-					fmt.Printf("  - %s\n", risk)
-				}
-			}
-			for _, reviewer := range manifest.Reviewers {
+			printConsolidatedDetails(command.OutOrStdout(), decision)
+			allReviewers := append(append([]model.ReviewerResult(nil), manifest.Reviewers...), manifest.CrossExaminations...)
+			for _, reviewer := range allReviewers {
 				modelName := reviewer.Model
 				if modelName == "" {
 					modelName = "unknown"
@@ -718,8 +772,82 @@ func newShowCommand(opts *options) *cobra.Command {
 			return nil
 		},
 	}
-	command.Flags().BoolVarP(&verbose, "verbose", "v", false, "show evidence, suggested fixes, omitted paths, and residual risks")
+	command.Flags().BoolVarP(&verbose, "verbose", "v", false, "also show each original reviewer finding, omitted path, and residual risk")
 	return command
+}
+
+func printConsolidatedDetails(writer io.Writer, decision model.Decision) {
+	crossByFinding := make(map[string]model.CrossExamination, len(decision.CrossExaminations))
+	for _, examination := range decision.CrossExaminations {
+		crossByFinding[examination.FindingID] = examination
+	}
+	if len(decision.Findings) > 0 {
+		fmt.Fprintln(writer, "\nConsolidated findings:")
+		for _, finding := range decision.Findings {
+			fmt.Fprintf(writer, "  [%s] %s:%d %s (%s)\n", finding.Severity, finding.File, finding.Line, finding.Claim, strings.Join(finding.Reviewers, ", "))
+			fmt.Fprintf(writer, "    Confidence: %.0f%%\n", finding.Confidence*100)
+			for _, evidence := range finding.Evidence {
+				fmt.Fprintf(writer, "    Evidence: %s\n", evidence)
+			}
+			for _, fix := range finding.SuggestedFixes {
+				fmt.Fprintf(writer, "    Suggested fix: %s\n", fix)
+			}
+			if examination, found := crossByFinding[finding.ID]; found {
+				printCrossExaminationDetails(writer, examination)
+			} else {
+				printReachabilityDetails(writer, finding.Reachability, "    ")
+			}
+		}
+	}
+	if len(decision.RejectedFindings) > 0 {
+		fmt.Fprintln(writer, "\nDisproved findings:")
+		for _, finding := range decision.RejectedFindings {
+			fmt.Fprintf(writer, "  [%s] %s:%d %s\n", finding.OriginalSeverity, finding.File, finding.Line, finding.Claim)
+			fmt.Fprintf(writer, "    Confidence: %.0f%%\n", finding.Confidence*100)
+			for _, evidence := range finding.Evidence {
+				fmt.Fprintf(writer, "    Original evidence: %s\n", evidence)
+			}
+			if examination, found := crossByFinding[finding.ID]; found {
+				printCrossExaminationDetails(writer, examination)
+			}
+		}
+	}
+	if len(decision.ResidualRisks) > 0 {
+		fmt.Fprintln(writer, "\nResidual risks:")
+		for _, risk := range decision.ResidualRisks {
+			fmt.Fprintf(writer, "  - %s\n", risk)
+		}
+	}
+}
+
+func printCrossExaminationDetails(writer io.Writer, examination model.CrossExamination) {
+	fmt.Fprintf(writer, "    Cross-examination: %s by %s (%s -> %s)\n", examination.Disposition, examination.Reviewer, examination.OriginalSeverity, examination.EffectiveSeverity)
+	if examination.Rationale != "" {
+		fmt.Fprintf(writer, "    Rationale: %s\n", examination.Rationale)
+	}
+	if examination.Reachability == nil {
+		return
+	}
+	printReachabilityDetails(writer, examination.Reachability, "    ")
+}
+
+func printReachabilityDetails(writer io.Writer, reachability *model.Reachability, indent string) {
+	if reachability == nil {
+		return
+	}
+	fmt.Fprintf(writer, "%sReachability: %s\n", indent, reachability.Status)
+	if reachability.Trigger != "" {
+		fmt.Fprintf(writer, "%s  Trigger: %s\n", indent, reachability.Trigger)
+	}
+	if len(reachability.Path) > 0 {
+		fmt.Fprintf(writer, "%s  Path: %s\n", indent, strings.Join(reachability.Path, " -> "))
+	}
+	if reachability.Impact != "" {
+		fmt.Fprintf(writer, "%s  Impact: %s\n", indent, reachability.Impact)
+	}
+	if len(reachability.Preconditions) > 0 {
+		fmt.Fprintf(writer, "%s  Preconditions: %s\n", indent, strings.Join(reachability.Preconditions, ", "))
+	}
 }
 
 func newVerifyCommand(opts *options) *cobra.Command {
@@ -842,9 +970,20 @@ func printDecision(decision model.Decision) {
 	stateLabel := strings.ToUpper(decision.State)
 	if decision.State == model.StateApproved && decision.OutcomeQualifier == "non_blocking_findings" {
 		stateLabel = "APPROVED WITH NON-BLOCKING FINDINGS"
+	} else if decision.State == model.StateApproved && decision.OutcomeQualifier == "cross_examined" {
+		stateLabel = "APPROVED AFTER CROSS-EXAMINATION"
 	}
 	fmt.Printf("%s %s\n", stateLabel, shortSHA(decision.HeadSHA))
 	fmt.Printf("Reason: %s\n", decision.Reason)
+	policy := "standard"
+	if decision.StrictPolicy {
+		policy = "strict"
+	}
+	validation := decision.ValidationStatus
+	if validation == "" {
+		validation = "not_recorded"
+	}
+	fmt.Printf("Policy: %s\nValidation: %s\n", policy, validation)
 	reviewerErrors := loadReviewerErrors(decision)
 	names := make([]string, 0, len(decision.Reviewers))
 	for name := range decision.Reviewers {
@@ -875,6 +1014,16 @@ func printDecision(decision model.Decision) {
 	}
 	for _, disagreement := range decision.Disagreements {
 		fmt.Printf("Disagreement: %s\n", disagreement)
+	}
+	for _, examination := range decision.CrossExaminations {
+		fmt.Printf("Cross-examination: %s %s", examination.FindingID, examination.Status)
+		if examination.Disposition != "" {
+			fmt.Printf(" (%s: %s -> %s)", examination.Disposition, examination.OriginalSeverity, examination.EffectiveSeverity)
+		}
+		if examination.Error != "" {
+			fmt.Printf(" — %s", examination.Error)
+		}
+		fmt.Println()
 	}
 	if decision.RecordPath != "" {
 		fmt.Println("Record:", decision.RecordPath)

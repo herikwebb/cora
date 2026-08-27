@@ -126,6 +126,19 @@ func TestProviderLeaseQueueIsFIFOAndReportsETA(t *testing.T) {
 	}
 }
 
+func TestStableProviderETANeverSlidesForward(t *testing.T) {
+	started := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	initial := stableProviderETA(nil, started.Add(10*time.Minute))
+	later := stableProviderETA(initial, started.Add(15*time.Minute))
+	if !later.Equal(*initial) {
+		t.Fatalf("ETA slid forward from %s to %s", initial, later)
+	}
+	earlier := stableProviderETA(later, started.Add(5*time.Minute))
+	if !earlier.Equal(started.Add(5 * time.Minute)) {
+		t.Fatalf("ETA did not move earlier when capacity improved: %s", earlier)
+	}
+}
+
 func waitForTicketCount(t *testing.T, directory string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

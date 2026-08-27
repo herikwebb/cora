@@ -68,6 +68,9 @@ cora review --base upstream/main --security-sensitive
 # disagree. This can add substantial provider usage.
 cora review --base upstream/main --adjudicate
 
+# Treat minor findings as blocking and require at least one validation check.
+cora review --base upstream/main --strict --profile auto --allow-unsafe-checks
+
 # Run built-in Go validation in a disposable worktree. Host execution still
 # requires an explicit trust decision.
 cora review --base upstream/main --profile auto --allow-unsafe-checks
@@ -138,6 +141,8 @@ base = "upstream/main"
 reviewer_timeout = "15m"
 overall_timeout = "45m"
 queue_timeout = "24h"
+strict = false
+cross_examine_blocking_findings = true
 require_clean_tree = true
 allow_api_billing = false
 allow_unsafe_host_checks = false
@@ -201,15 +206,25 @@ removed afterward. Add only explicitly required variable names to a check's
 exposure, but it is not a filesystem or network sandbox.
 
 Named validation profiles group checks without forcing every repository to use
-one global check list. `--profile auto` currently selects Cora's built-in `go`
-profile when the reviewed commit contains `go.mod`; `--profile go` selects it
-directly. Trusted base configuration can define additional
+one global check list. `--profile auto` selects Cora's built-in `go`, `node`,
+and `python` profiles from `go.mod`, `package.json`, and common Python project
+markers; explicit `--profile go`, `--profile node`, and `--profile python`
+selection is also available. Trusted base configuration can define additional
 `[[validation_profiles]]`. Profile checks retain the same
 `--allow-unsafe-checks` requirement.
 
+When trusted host checks are enabled but no profile was selected, CORA performs
+the same auto-detection automatically. Without permission to execute reviewed
+code, CORA remains read-only and records `validation_status = "not_run"` plus a
+residual risk instead of implying that tests ran. Strict policy fails closed as
+`incomplete` when no validation profile or configured check is available.
+
 `minimum_approvals = 2` makes the default policy true two-agent consensus. All
-enabled reviewers must complete with full context; a blocking finding or a
-failed check requests changes, and an abstention sends the decision to a human.
+enabled reviewers must complete with full context; a corroborated blocking
+finding or a failed check requests changes, and an abstention sends the
+decision to a human.
+Set `strict = true` or pass `--strict` to add `minor` to the blocking severities
+and require at least one validation check. Notes remain non-blocking.
 
 Claude defaults to Opus at high effort. It reserves its final two turns for a
 structured response; if it nevertheless reaches the turn ceiling, CORA saves
@@ -220,11 +235,25 @@ cost ceiling.
 Changes to reviewer/control files or paths matching
 `escalation.security_path_markers` use Fable at high effort instead.
 `--security-sensitive` forces the same behavior when path matching is not
-sufficient. Disagreement adjudication is disabled by default because it adds
-cost and cannot overturn an earlier fail-closed blocking result. Pass
-`--adjudicate` or set `adjudicate_disagreements = true` to run a separate
-Fable/high adjudication and retain all three reports; adjudication never removes
-a finding from an earlier report.
+sufficient. Independently, `cross_examine_blocking_findings = true` sends each
+uncorroborated blocker or major through a targeted Fable/high adversarial pass
+when every ordinary reviewer and check completed and the result can still
+change. The cross-examiner must trace the concrete trigger-to-impact path and
+may confirm, demote, or disprove the candidate. Confirmed findings remain open;
+demoted findings retain their effective non-blocking severity; disproved
+findings remain in the audit record but no longer block approval. An incomplete
+cross-examination fails closed.
+
+Broad disagreement adjudication remains opt-in because it adds the cost of a
+complete third review. Pass `--adjudicate` or set
+`adjudicate_disagreements = true` to retain that independent Fable/high report
+in addition to the targeted blocking-finding policy.
+
+Every initial blocker or major must also include demonstrated reachability: an
+external trigger, an ordered code/data/control path through relevant guards and
+transformations, the observable impact, and required preconditions. A serious
+claim without that evidence is an incomplete reviewer result, not a blocking
+finding.
 
 `effort` accepts `low`, `medium`, `high`, `xhigh`, or `max`; Codex also accepts
 `none` and `minimal`. Codex defaults to `gpt-5.6-sol` at high effort so its effective
@@ -234,8 +263,9 @@ defaults change.
 The policy fails closed. A timeout, malformed response, missing reviewer,
 incomplete context, or interrupted check produces `incomplete`, never an
 approval. Reviewer processes run in parallel and are killed as process groups
-at their deadlines. If reviewers conflict, any blocking finding or explicit
-`request_changes` wins; otherwise an abstention requires human adjudication.
+at their deadlines. Corroborated or cross-exam-confirmed blocking findings and
+explicit `request_changes` verdicts without a corresponding adjudicable finding
+win; otherwise an abstention requires human adjudication.
 
 For deterministic, subscription-first execution, the Codex adapter requires a
 ChatGPT login, ignores user CLI configuration, and forces a read-only sandbox.
@@ -279,8 +309,9 @@ Go's nanosecond representation.
 
 Equivalent findings are consolidated by location and claim similarity for the
 decision and human summary while each original reviewer report remains intact.
-`cora show --verbose` adds confidence, evidence, suggested fixes, omitted paths,
-and residual risks.
+`cora show` includes consolidated confidence, evidence, suggested fixes, and
+residual risks by default. `cora show --verbose` additionally expands each
+original reviewer report, including omitted paths.
 
 ## Records
 
@@ -297,7 +328,9 @@ stream, and deterministic decision. Publishing signed records to a dedicated
 Git ref is planned as a separate command.
 
 Each active run updates `heartbeat.json` every 30 seconds and prints elapsed
-time to stderr. `cora status --active` lists live runs, and `cora list` supports
+time for both the run and running reviewers to stderr. `cora status --active`
+shows concurrent runs in one table with reviewer elapsed time and fixed-deadline
+queue ETA countdowns, and `cora list` supports
 state and head-SHA filters. `latest` is resolved by run start time instead of
 completion order, so concurrent reviews cannot overwrite its meaning.
 

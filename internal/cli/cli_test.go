@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +36,87 @@ func TestRootCommandUsesReviewInsteadOfRun(t *testing.T) {
 		if !slices.Contains(names, name) {
 			t.Fatalf("root commands %v do not include %s", names, name)
 		}
+	}
+}
+
+func TestPrintActiveRunsShowsConcurrentReviewerElapsedTime(t *testing.T) {
+	var output bytes.Buffer
+	printActiveRuns(&output, []model.RunSummary{
+		{RunID: "run-one", HeadSHA: "aaaaaaaaaa", ElapsedMS: 65_000, Phase: "reviewers", Reviewers: map[string]string{"codex": "running"}, ReviewerElapsedMS: map[string]int64{"codex": 42_000}},
+		{RunID: "run-two", HeadSHA: "bbbbbbbbbb", ElapsedMS: 30_000, Phase: "reviewers", Reviewers: map[string]string{"claude": "queued"}, Queues: map[string]model.ProviderQueueStatus{"claude": {Position: 2}}},
+	})
+	text := output.String()
+	for _, want := range []string{"run-one", "run-two", "codex=running(42s)", "claude=queued#2"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("active output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestPrintConsolidatedDetailsIncludesEvidenceFixesAndRisks(t *testing.T) {
+	var output bytes.Buffer
+	printConsolidatedDetails(&output, model.Decision{
+		Findings: []model.ConsolidatedFinding{{
+			Severity: "minor", Confidence: 0.8, File: "app.go", Line: 12, Claim: "leak",
+			Evidence: []string{"handle is never closed"}, SuggestedFixes: []string{"defer handle.Close()"}, Reviewers: []string{"codex"},
+		}},
+		ResidualRisks: []string{"integration test not run"},
+	})
+	text := output.String()
+	for _, want := range []string{"Confidence: 80%", "Evidence: handle is never closed", "Suggested fix: defer handle.Close()", "integration test not run"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("human details do not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestPrintConsolidatedDetailsExplainsDisprovedFinding(t *testing.T) {
+	var output bytes.Buffer
+	printConsolidatedDetails(&output, model.Decision{
+		RejectedFindings: []model.ConsolidatedFinding{{
+			ID: "cora-123", OriginalSeverity: "major", Confidence: 0.95,
+			File: "handler.go", Line: 20, Claim: "input reaches sink", Evidence: []string{"handler calls runner"},
+		}},
+		CrossExaminations: []model.CrossExamination{{
+			FindingID: "cora-123", Reviewer: "claude-cross-examination", Status: "completed",
+			Disposition: "disproved", OriginalSeverity: "major", EffectiveSeverity: "note",
+			Rationale:    "validation replaces the input before the call",
+			Reachability: &model.Reachability{Status: "not_demonstrated", Path: []string{"handler.go:18 validates", "runner.go:40 receives constant"}, Impact: "attacker input never reaches execution"},
+		}},
+	})
+	text := output.String()
+	for _, want := range []string{"Disproved findings", "Original evidence: handler calls runner", "disproved by claude-cross-examination", "validation replaces the input", "handler.go:18 validates -> runner.go:40 receives constant", "attacker input never reaches execution"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("disproved finding details do not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestExpandAutoProfilesDetectsCommonProjects(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	gitCLI(t, root, "init", "-b", "main")
+	gitCLI(t, root, "config", "user.name", "CORA Test")
+	gitCLI(t, root, "config", "user.email", "cora@example.invalid")
+	for _, path := range []string{"go.mod", "package.json", "pyproject.toml"} {
+		writeCLIFile(t, filepath.Join(root, path), "test\n")
+	}
+	gitCLI(t, root, "add", ".")
+	gitCLI(t, root, "commit", "-m", "chore: add project markers")
+	repo, err := gitx.Discover(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := repo.ResolveRevision(ctx, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := expandAutoProfiles(ctx, repo, model.Target{HeadSHA: head}, []string{"auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(profiles, []string{"go", "node", "python"}) {
+		t.Fatalf("auto profiles = %v", profiles)
 	}
 }
 

@@ -218,6 +218,7 @@ func AcquireProviderQueued(ctx context.Context, provider string, limit int, requ
 	defer os.Remove(ticketPath)
 	historyPath := filepath.Join(queueDir, "history.jsonl")
 	lastNotice := time.Time{}
+	var estimatedAt *time.Time
 	for {
 		tickets, err := liveProviderTickets(queueDir)
 		if err != nil {
@@ -249,7 +250,8 @@ func AcquireProviderQueued(ctx context.Context, provider string, limit int, requ
 				Active: active, Limit: limit, WaitMS: time.Since(started).Milliseconds(),
 			}
 			if estimate := providerQueueETA(historyPath, status.Position, limit); estimate > 0 {
-				eta := time.Now().UTC().Add(estimate)
+				estimatedAt = stableProviderETA(estimatedAt, started.Add(estimate))
+				eta := *estimatedAt
 				status.ETAAt = &eta
 			}
 			onWait(status)
@@ -263,6 +265,15 @@ func AcquireProviderQueued(ctx context.Context, provider string, limit int, requ
 		case <-timer.C:
 		}
 	}
+}
+
+func stableProviderETA(current *time.Time, candidate time.Time) *time.Time {
+	if current != nil && !candidate.Before(*current) {
+		value := *current
+		return &value
+	}
+	value := candidate
+	return &value
 }
 
 func tryProviderSlot(path, provider string, request ProviderQueueRequest) (ProviderLease, bool, error) {
