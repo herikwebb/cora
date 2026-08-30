@@ -2,7 +2,10 @@ package record
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -45,6 +48,17 @@ func TestStoreLifecycleAndLock(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(store.Root, "latest")); err != nil {
 		t.Fatal(err)
+	}
+	loop, err := store.CreateAutoFixLoop(time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC), "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(loop.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 || filepath.Base(filepath.Dir(loop.Path)) != "auto-fix" {
+		t.Fatalf("auto-fix record = %s, mode=%v", loop.Path, info.Mode().Perm())
 	}
 }
 
@@ -126,16 +140,149 @@ func TestProviderLeaseQueueIsFIFOAndReportsETA(t *testing.T) {
 	}
 }
 
-func TestStableProviderETANeverSlidesForward(t *testing.T) {
+func TestFixedProviderETACountsDownFromOneDeadline(t *testing.T) {
 	started := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
-	initial := stableProviderETA(nil, started.Add(10*time.Minute))
-	later := stableProviderETA(initial, started.Add(15*time.Minute))
+	initial := fixedProviderETA(nil, started, 10*time.Minute)
+	later := fixedProviderETA(initial, started.Add(30*time.Second), 15*time.Minute)
 	if !later.Equal(*initial) {
 		t.Fatalf("ETA slid forward from %s to %s", initial, later)
 	}
-	earlier := stableProviderETA(later, started.Add(5*time.Minute))
-	if !earlier.Equal(started.Add(5 * time.Minute)) {
-		t.Fatalf("ETA did not move earlier when capacity improved: %s", earlier)
+	if remaining := later.Sub(started.Add(30 * time.Second)); remaining != 9*time.Minute+30*time.Second {
+		t.Fatalf("ETA did not count down from its fixed deadline: %s", remaining)
+	}
+}
+
+func TestProviderQuotaPersistsAcrossProcessesAndBlocksAcquire(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	retryAt := time.Now().UTC().Add(time.Hour).Round(0)
+	providerMessage := "session limit reached"
+
+	command := exec.Command(os.Args[0], "-test.run=^TestProviderQuotaHelperProcess$")
+	command.Env = append(os.Environ(),
+		"CORA_RECORD_QUOTA_HELPER=1",
+		"CORA_RECORD_QUOTA_PROVIDER="+provider,
+		"CORA_RECORD_QUOTA_MESSAGE="+providerMessage,
+		"CORA_RECORD_QUOTA_RETRY_AT="+retryAt.Format(time.RFC3339Nano),
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("record quota in helper process: %v\n%s", err, output)
+	}
+
+	_, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "blocked"}, nil)
+	var quotaErr *ProviderQuotaError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("acquire error = %v, want ProviderQuotaError", err)
+	}
+	if quotaErr.Provider != provider || !quotaErr.RetryAt.Equal(retryAt) || quotaErr.ProviderMessage != providerMessage {
+		t.Fatalf("quota error = %#v", quotaErr)
+	}
+
+	quotaFiles, globErr := filepath.Glob(filepath.Join(root, safeComponent(provider), "quota-*.json"))
+	if globErr != nil || len(quotaFiles) != 1 {
+		t.Fatalf("quota files = %v, err=%v", quotaFiles, globErr)
+	}
+	quotaPath := quotaFiles[0]
+	info, statErr := os.Stat(quotaPath)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("quota mode = %#o, want 0600", info.Mode().Perm())
+	}
+	directoryInfo, statErr := os.Stat(filepath.Dir(quotaPath))
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if directoryInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("provider queue directory mode = %#o, want 0700", directoryInfo.Mode().Perm())
+	}
+}
+
+func TestProviderQuotaHelperProcess(t *testing.T) {
+	if os.Getenv("CORA_RECORD_QUOTA_HELPER") != "1" {
+		return
+	}
+	retryAt, err := time.Parse(time.RFC3339Nano, os.Getenv("CORA_RECORD_QUOTA_RETRY_AT"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := RecordProviderQuota(os.Getenv("CORA_RECORD_QUOTA_PROVIDER"), os.Getenv("CORA_RECORD_QUOTA_MESSAGE"), retryAt); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func TestExpiredProviderQuotaDoesNotBlock(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	if err := RecordProviderQuota(provider, "old quota error", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "allowed"}, nil)
+	if err != nil {
+		t.Fatalf("expired quota blocked acquisition: %v", err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProviderQuotaCannotBeWeakenedByOlderOrExpiredObservation(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	later := time.Now().UTC().Add(2 * time.Hour).Round(0)
+	if err := RecordProviderQuota(provider, "later reset", later); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordProviderQuota(provider, "stale earlier reset", later.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordProviderQuota(provider, "already expired", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "blocked"}, nil)
+	var quotaErr *ProviderQuotaError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("acquire error = %v, want ProviderQuotaError", err)
+	}
+	if !quotaErr.RetryAt.Equal(later) || quotaErr.ProviderMessage != "later reset" {
+		t.Fatalf("active quota was weakened: %#v", quotaErr)
+	}
+}
+
+func TestProviderQuotaRecordedWhileQueuedStopsWaiter(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	held, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "held"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+
+	result := make(chan error, 1)
+	go func() {
+		_, acquireErr := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "queued"}, nil)
+		result <- acquireErr
+	}()
+	waitForTicketCount(t, filepath.Join(root, safeComponent(provider)), 1)
+	if err := RecordProviderQuota(provider, "quota discovered by another process", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		var quotaErr *ProviderQuotaError
+		if !errors.As(err, &quotaErr) {
+			t.Fatalf("queued acquire error = %v, want ProviderQuotaError", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued acquisition did not observe provider quota")
 	}
 }
 

@@ -74,6 +74,9 @@ func TestDefaultsUseHighEffortClaudeOpusAndFableEscalation(t *testing.T) {
 	if !cfg.Escalation.Enabled || cfg.Escalation.Model != "fable" || cfg.Escalation.Effort != "high" {
 		t.Fatalf("escalation defaults = %#v", cfg.Escalation)
 	}
+	if cfg.Escalation.MaxTurns != nil || cfg.Escalation.MaxBudgetUSD != nil {
+		t.Fatalf("escalation limits should inherit Claude reviewer limits by default: %#v", cfg.Escalation)
+	}
 	if cfg.Reviewers.Claude.MaxConcurrency != 1 || cfg.Reviewers.Codex.MaxConcurrency != 2 {
 		t.Fatalf("provider concurrency defaults = %#v", cfg.Reviewers)
 	}
@@ -85,6 +88,74 @@ func TestDefaultsUseHighEffortClaudeOpusAndFableEscalation(t *testing.T) {
 	}
 	if !cfg.CrossExamineBlockingFindings {
 		t.Fatal("targeted blocking-finding cross-examination should default on")
+	}
+	if cfg.AutoFix.Command != "codex" || cfg.AutoFix.Model != "gpt-5.6-sol" || cfg.AutoFix.Effort != "high" || cfg.AutoFix.Threshold != "major" {
+		t.Fatalf("auto-fix defaults = %#v", cfg.AutoFix)
+	}
+	if cfg.AutoFix.MaxIterations != 5 || cfg.AutoFix.MaxTurns != 250 || cfg.AutoFix.MaxCostUSD != 50 || cfg.AutoFix.MaxDuration.Duration <= 0 || cfg.AutoFix.AgentTimeout.Duration <= 0 {
+		t.Fatalf("auto-fix limits = %#v", cfg.AutoFix)
+	}
+}
+
+func TestApplyRepositoryDecodesEscalationLimitOverrides(t *testing.T) {
+	cfg, err := ApplyRepository(Defaults(), ".cora/config.toml", []byte(`
+[escalation]
+max_turns = 40
+max_budget_usd = 6.5
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Escalation.MaxTurns == nil || *cfg.Escalation.MaxTurns != 40 {
+		t.Fatalf("escalation max turns = %#v", cfg.Escalation.MaxTurns)
+	}
+	if cfg.Escalation.MaxBudgetUSD == nil || *cfg.Escalation.MaxBudgetUSD != 6.5 {
+		t.Fatalf("escalation max budget = %#v", cfg.Escalation.MaxBudgetUSD)
+	}
+}
+
+func TestValidateEscalationLimitOverrides(t *testing.T) {
+	maxTurns := 0
+	cfg := Defaults()
+	cfg.Escalation.MaxTurns = &maxTurns
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "escalation.max_turns must be positive") {
+		t.Fatalf("zero escalation turn limit error = %v", err)
+	}
+
+	maxTurns = cfg.Reviewers.Claude.FinalizationTurns
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "greater than reviewers.claude.finalization_turns") {
+		t.Fatalf("escalation finalization reserve error = %v", err)
+	}
+
+	maxTurns = cfg.Reviewers.Claude.FinalizationTurns + 1
+	maxBudget := -1.0
+	cfg.Escalation.MaxBudgetUSD = &maxBudget
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "escalation.max_budget_usd") {
+		t.Fatalf("negative escalation budget error = %v", err)
+	}
+
+	maxBudget = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicitly disabling the escalation budget should be valid: %v", err)
+	}
+
+	cfg.Escalation.Enabled = false
+	maxTurns = 0
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "escalation.max_turns must be positive") {
+		t.Fatalf("cross-examination must validate escalation limits even when broad escalation is disabled: %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidAutoFixLimits(t *testing.T) {
+	cfg := Defaults()
+	cfg.AutoFix.Threshold = "note"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "auto_fix.until") {
+		t.Fatalf("invalid auto-fix threshold error = %v", err)
+	}
+	cfg = Defaults()
+	cfg.AutoFix.MaxIterations = 0
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "max_iterations") {
+		t.Fatalf("invalid auto-fix iteration error = %v", err)
 	}
 }
 

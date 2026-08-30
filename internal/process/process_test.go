@@ -28,6 +28,25 @@ func TestReviewerEnvironmentUsesAuthenticationAllowlist(t *testing.T) {
 	}
 }
 
+func TestReviewerWorkspaceEnvironmentRedirectsWritableCaches(t *testing.T) {
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	values := make(map[string]string)
+	for _, item := range ReviewerWorkspaceEnvironment(false, runtimeDir) {
+		name, value, _ := strings.Cut(item, "=")
+		values[name] = value
+	}
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP", "GOTMPDIR"} {
+		if values[name] != runtimeDir {
+			t.Fatalf("%s = %q, want %q", name, values[name], runtimeDir)
+		}
+	}
+	for _, name := range []string{"GOCACHE", "XDG_CACHE_HOME", "npm_config_cache", "YARN_CACHE_FOLDER", "PYTHONPYCACHEPREFIX"} {
+		if !strings.HasPrefix(values[name], runtimeDir+string(filepath.Separator)) {
+			t.Fatalf("%s was not redirected into runtime: %q", name, values[name])
+		}
+	}
+}
+
 func TestRunCreatesPrivateOutputFilesWithPermissiveUmask(t *testing.T) {
 	oldUmask := syscall.Umask(0)
 	t.Cleanup(func() { syscall.Umask(oldUmask) })

@@ -18,19 +18,20 @@ import (
 func TestCodexReviewArgsUseGenericExecForAuditedPrompt(t *testing.T) {
 	request := Request{
 		RepoRoot:   "/tmp/repo",
-		WorkDir:    "/tmp/cora-reviewer",
+		WorkDir:    "/tmp/repo",
+		RuntimeDir: "/tmp/cora-runtime",
 		Target:     model.Target{Mode: "branch", BaseSHA: "base-sha"},
 		SchemaPath: "/tmp/schema.json",
 		Policy:     "trusted policy",
 	}
 	got := codexReviewArgs(config.Reviewer{Model: "gpt-5.6-sol", Effort: "high"}, request, "/tmp/result.json")
 	want := []string{
-		"exec", "--sandbox", "read-only",
-		"--cd", "/tmp/cora-reviewer",
-		"--add-dir", "/tmp/repo",
+		"exec", "--sandbox", "workspace-write",
+		"--cd", "/tmp/repo",
 		"--skip-git-repo-check", "--ignore-rules",
 		"--ephemeral", "--ignore-user-config",
 		"--config", `developer_instructions="trusted policy"`,
+		"--add-dir", "/tmp/cora-runtime",
 		"--model", "gpt-5.6-sol",
 		"--config", `model_reasoning_effort="high"`,
 		"--output-schema", "/tmp/schema.json",
@@ -38,6 +39,76 @@ func TestCodexReviewArgsUseGenericExecForAuditedPrompt(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Codex args = %v, want %v", got, want)
+	}
+}
+
+func TestClaudeReviewerSettingsRequireStrictSandbox(t *testing.T) {
+	var settings struct {
+		Sandbox struct {
+			Enabled                  bool `json:"enabled"`
+			FailIfUnavailable        bool `json:"failIfUnavailable"`
+			AutoAllowBashIfSandboxed bool `json:"autoAllowBashIfSandboxed"`
+			AllowUnsandboxedCommands bool `json:"allowUnsandboxedCommands"`
+			Filesystem               struct {
+				AllowWrite []string `json:"allowWrite"`
+			} `json:"filesystem"`
+			Network struct {
+				DeniedDomains   []string `json:"deniedDomains"`
+				StrictAllowlist bool     `json:"strictAllowlist"`
+			} `json:"network"`
+		} `json:"sandbox"`
+	}
+	if err := json.Unmarshal([]byte(claudeReviewerSandboxSettings("/tmp/cora-runtime")), &settings); err != nil {
+		t.Fatal(err)
+	}
+	if !settings.Sandbox.Enabled || !settings.Sandbox.FailIfUnavailable || !settings.Sandbox.AutoAllowBashIfSandboxed || settings.Sandbox.AllowUnsandboxedCommands {
+		t.Fatalf("Claude sandbox settings = %#v", settings.Sandbox)
+	}
+	if !reflect.DeepEqual(settings.Sandbox.Filesystem.AllowWrite, []string{"/tmp/cora-runtime"}) || !reflect.DeepEqual(settings.Sandbox.Network.DeniedDomains, []string{"*"}) || !settings.Sandbox.Network.StrictAllowlist {
+		t.Fatalf("Claude sandbox boundaries = %#v", settings.Sandbox)
+	}
+}
+
+func TestCodexFixArgsUseAuditedWorkspaceWriteMode(t *testing.T) {
+	request := FixRequest{RepoRoot: "/tmp/repo", Policy: "trusted auto-fix policy"}
+	got := codexFixArgs(config.AutoFix{Model: "gpt-5.6-sol", Effort: "high"}, request, "/tmp/last.txt")
+	want := []string{
+		"exec", "--sandbox", "workspace-write", "--cd", "/tmp/repo",
+		"--skip-git-repo-check", "--ignore-rules", "--ephemeral", "--ignore-user-config",
+		"--config", `developer_instructions="trusted auto-fix policy"`,
+		"--model", "gpt-5.6-sol", "--config", `model_reasoning_effort="high"`,
+		"--json", "--output-last-message", "/tmp/last.txt", "-",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Codex fix args = %v, want %v", got, want)
+	}
+}
+
+func TestDescribeAdapterReturnsConfiguredReviewMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		adapter Adapter
+		want    AdapterDescriptor
+	}{
+		{
+			name: "codex value",
+			adapter: Codex{Config: config.Reviewer{Model: "gpt-5.6-sol", Effort: "high"},
+				EscalationCause: "security_sensitive"},
+			want: AdapterDescriptor{Model: "gpt-5.6-sol", Effort: "high", EscalationCause: "security_sensitive"},
+		},
+		{
+			name: "claude value",
+			adapter: Claude{Config: config.Reviewer{Model: "fable", Effort: "high"},
+				EscalationCause: "blocking_cross_examination"},
+			want: AdapterDescriptor{Model: "fable", Effort: "high", EscalationCause: "blocking_cross_examination"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := DescribeAdapter(test.adapter); got != test.want {
+				t.Fatalf("descriptor = %#v, want %#v", got, test.want)
+			}
+		})
 	}
 }
 
@@ -160,6 +231,43 @@ func TestReadCodexTelemetryRecordsResolvedModelUsageAndCost(t *testing.T) {
 	}
 	if !usage.APIEquivalentCostKnown || math.Abs(usage.APIEquivalentCostUSD-0.00928) > 0.0000001 {
 		t.Fatalf("API-equivalent cost = %.8f, want 0.00928", usage.APIEquivalentCostUSD)
+	}
+}
+
+func TestReadCodexTelemetryRecordsReasoningOutputTokens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	contents := `{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":300,"reasoning_output_tokens":125}}
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	telemetry, err := readCodexTelemetry(path, "gpt-5.6-sol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !telemetry.Usage.ThinkingTokensKnown || telemetry.Usage.ThinkingTokens != 125 {
+		t.Fatalf("thinking telemetry = %#v", telemetry.Usage)
+	}
+}
+
+func TestReadCodexTelemetryMarksMixedTurnThinkingPartial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	contents := `{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":300,"reasoning_output_tokens":125}}
+{"type":"turn.completed","usage":{"input_tokens":800,"output_tokens":200}}
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	telemetry, err := readCodexTelemetry(path, "gpt-5.6-sol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := telemetry.Usage
+	if usage.Turns != 2 || usage.InputTokens != 1800 || usage.OutputTokens != 500 || usage.ThinkingTokens != 125 {
+		t.Fatalf("usage telemetry = %#v", usage)
+	}
+	if usage.ThinkingTokensKnown || !usage.ThinkingTokensPartial {
+		t.Fatalf("thinking completeness = %#v", usage)
 	}
 }
 
@@ -299,6 +407,86 @@ func TestReadClaudeOutputRecordsResolvedModelTurnsThinkingAndCost(t *testing.T) 
 	}
 	if !usage.APIEquivalentCostKnown || usage.APIEquivalentCostUSD != 0.1234 {
 		t.Fatalf("cost telemetry = %#v", usage)
+	}
+}
+
+func TestReadClaudeOutputRecordsNestedThinkingTokens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude.json")
+	contents := `{
+  "type": "result",
+  "is_error": false,
+  "num_turns": 2,
+  "modelUsage": {
+    "claude-opus-5": {
+      "inputTokens": 1000,
+      "outputTokens": 200,
+      "output_tokens_details": {"thinking_tokens": 80}
+    }
+  },
+  "structured_output": {
+    "schema_version": "1",
+    "verdict": "approve",
+    "context_complete": true,
+    "summary": "Looks good",
+    "findings": [],
+    "reviewed_paths": ["app.go"],
+    "omitted_paths": [],
+    "residual_risks": []
+  }
+}`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := readClaudeOutput(path, "opus")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !output.Telemetry.Usage.ThinkingTokensKnown || output.Telemetry.Usage.ThinkingTokens != 80 {
+		t.Fatalf("thinking telemetry = %#v", output.Telemetry.Usage)
+	}
+}
+
+func TestReadClaudeOutputMarksMixedModelThinkingPartial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude.json")
+	contents := `{
+  "type": "result",
+  "is_error": false,
+  "num_turns": 3,
+  "modelUsage": {
+    "claude-fable-5": {
+      "inputTokens": 1000,
+      "outputTokens": 200,
+      "output_tokens_details": {"thinking_tokens": 80}
+    },
+    "claude-haiku-4-5": {
+      "inputTokens": 100,
+      "outputTokens": 20
+    }
+  },
+  "structured_output": {
+    "schema_version": "1",
+    "verdict": "approve",
+    "context_complete": true,
+    "summary": "Looks good",
+    "findings": [],
+    "reviewed_paths": ["app.go"],
+    "omitted_paths": [],
+    "residual_risks": []
+  }
+}`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := readClaudeOutput(path, "opus")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := output.Telemetry.Usage
+	if usage.InputTokens != 1100 || usage.OutputTokens != 220 || usage.ThinkingTokens != 80 {
+		t.Fatalf("usage telemetry = %#v", usage)
+	}
+	if usage.ThinkingTokensKnown || !usage.ThinkingTokensPartial {
+		t.Fatalf("thinking completeness = %#v", usage)
 	}
 }
 

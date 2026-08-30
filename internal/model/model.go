@@ -222,6 +222,8 @@ type Manifest struct {
 	StartedAt           time.Time          `json:"started_at"`
 	FinishedAt          time.Time          `json:"finished_at,omitempty"`
 	ParentRunID         string             `json:"parent_run_id,omitempty"`
+	AutoFixLoopID       string             `json:"auto_fix_loop_id,omitempty"`
+	AutoFixIteration    int                `json:"auto_fix_iteration,omitempty"`
 	Target              Target             `json:"target"`
 	Reviewers           []ReviewerResult   `json:"reviewers,omitempty"`
 	CrossExaminations   []ReviewerResult   `json:"cross_examinations,omitempty"`
@@ -239,6 +241,72 @@ type Manifest struct {
 	Usage               Usage              `json:"usage"`
 	IncrementalUsage    Usage              `json:"incremental_usage"`
 	CumulativeUsage     Usage              `json:"cumulative_usage"`
+}
+
+type AutoFixAttempt struct {
+	Agent             string   `json:"agent"`
+	Status            string   `json:"status"`
+	Model             string   `json:"model"`
+	ModelSource       string   `json:"model_source,omitempty"`
+	Effort            string   `json:"effort"`
+	Tool              string   `json:"tool"`
+	ToolVersion       string   `json:"tool_version,omitempty"`
+	Auth              string   `json:"auth,omitempty"`
+	Duration          Duration `json:"duration_ms"`
+	QueueDuration     Duration `json:"queue_duration_ms"`
+	ExecutionDuration Duration `json:"execution_duration_ms"`
+	ExitCode          int      `json:"exit_code,omitempty"`
+	PromptHash        string   `json:"prompt_hash"`
+	PolicyHash        string   `json:"policy_hash"`
+	BeforeDiffHash    string   `json:"before_diff_hash"`
+	AfterDiffHash     string   `json:"after_diff_hash,omitempty"`
+	ChangedPaths      []string `json:"changed_paths,omitempty"`
+	Usage             Usage    `json:"usage"`
+	Error             string   `json:"error,omitempty"`
+}
+
+type AutoFixIteration struct {
+	Number                int             `json:"number"`
+	ReviewRunID           string          `json:"review_run_id"`
+	ReviewRecordPath      string          `json:"review_record_path"`
+	ReviewState           string          `json:"review_state"`
+	ReviewDiffHash        string          `json:"review_diff_hash"`
+	QualifyingFindingIDs  []string        `json:"qualifying_finding_ids,omitempty"`
+	QualifyingFingerprint string          `json:"qualifying_fingerprint,omitempty"`
+	ReviewUsage           Usage           `json:"review_usage"`
+	Fix                   *AutoFixAttempt `json:"fix,omitempty"`
+}
+
+type AutoFixLoop struct {
+	SchemaVersion      string             `json:"schema_version"`
+	LoopID             string             `json:"loop_id"`
+	State              string             `json:"state"`
+	Reason             string             `json:"reason"`
+	Repository         string             `json:"repository"`
+	RepositoryIdentity string             `json:"repository_identity"`
+	BaseRef            string             `json:"base_ref"`
+	BaseSHA            string             `json:"base_sha"`
+	InitialHeadSHA     string             `json:"initial_head_sha"`
+	FinalDiffHash      string             `json:"final_diff_hash,omitempty"`
+	Threshold          string             `json:"until"`
+	Agent              string             `json:"agent"`
+	AgentModel         string             `json:"agent_model"`
+	AgentEffort        string             `json:"agent_effort"`
+	AgentTimeout       Duration           `json:"agent_timeout_ms"`
+	MaxIterations      int                `json:"max_iterations"`
+	MaxDuration        Duration           `json:"max_duration_ms"`
+	MaxTurns           int                `json:"max_turns"`
+	MaxCostUSD         float64            `json:"max_cost_usd"`
+	StartedAt          time.Time          `json:"started_at"`
+	FinishedAt         time.Time          `json:"finished_at,omitempty"`
+	Elapsed            Duration           `json:"elapsed_ms"`
+	Iterations         []AutoFixIteration `json:"iterations"`
+	Usage              Usage              `json:"usage"`
+	CoraVersion        string             `json:"cora_version"`
+	CoraSourceSHA      string             `json:"cora_source_sha"`
+	CoraBuildTime      string             `json:"cora_build_time,omitempty"`
+	FinalDecision      *Decision          `json:"final_decision,omitempty"`
+	RecordPath         string             `json:"record_path"`
 }
 
 type Heartbeat struct {
@@ -263,6 +331,8 @@ type RunSummary struct {
 	ElapsedMS          int64                          `json:"elapsed_ms"`
 	HeadSHA            string                         `json:"head_sha"`
 	ParentRunID        string                         `json:"parent_run_id,omitempty"`
+	AutoFixLoopID      string                         `json:"auto_fix_loop_id,omitempty"`
+	AutoFixIteration   int                            `json:"auto_fix_iteration,omitempty"`
 	RepositoryIdentity string                         `json:"repository_identity,omitempty"`
 	Reviewers          map[string]string              `json:"reviewers,omitempty"`
 	ReviewerElapsedMS  map[string]int64               `json:"reviewer_elapsed_ms,omitempty"`

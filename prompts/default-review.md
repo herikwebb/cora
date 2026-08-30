@@ -7,7 +7,9 @@ coverage. Do not report purely stylistic preferences unless they hide a defect.
 
 Rules:
 
-1. Remain read-only. Do not edit files, create commits, or change Git state.
+1. Do not intentionally edit source files, create commits, or change Git state.
+   You may run focused local tests in the disposable reviewer workspace; test,
+   build, cache, and temporary artifacts are allowed and will be discarded.
 2. Support every finding with concrete evidence from the repository.
 3. Use `blocker` only for catastrophic or unsafe-to-ship problems.
 4. Use `major` for defects that should block submission.

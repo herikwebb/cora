@@ -23,6 +23,7 @@ import (
 type Request struct {
 	RepoRoot        string
 	WorkDir         string
+	RuntimeDir      string
 	Target          model.Target
 	RunDir          string
 	SchemaPath      string
@@ -35,10 +36,45 @@ type Request struct {
 	ChangedPaths    []string
 }
 
+type FixRequest struct {
+	RepoRoot        string
+	RecordDir       string
+	Prompt          string
+	Policy          string
+	Timeout         time.Duration
+	AllowAPIBilling bool
+}
+
 type Adapter interface {
 	Name() string
 	Provider() string
 	Review(context.Context, Request) model.ReviewerResult
+}
+
+type AdapterDescriptor struct {
+	Model           string
+	Effort          string
+	EscalationCause string
+}
+
+// DescribeAdapter returns the configured review metadata available before an
+// adapter executes. Unknown adapter implementations have an empty descriptor.
+func DescribeAdapter(adapter Adapter) AdapterDescriptor {
+	switch value := adapter.(type) {
+	case Codex:
+		return AdapterDescriptor{Model: value.Config.Model, Effort: value.Config.Effort, EscalationCause: value.EscalationCause}
+	case *Codex:
+		if value != nil {
+			return AdapterDescriptor{Model: value.Config.Model, Effort: value.Config.Effort, EscalationCause: value.EscalationCause}
+		}
+	case Claude:
+		return AdapterDescriptor{Model: value.Config.Model, Effort: value.Config.Effort, EscalationCause: value.EscalationCause}
+	case *Claude:
+		if value != nil {
+			return AdapterDescriptor{Model: value.Config.Model, Effort: value.Config.Effort, EscalationCause: value.EscalationCause}
+		}
+	}
+	return AdapterDescriptor{}
 }
 
 func Enabled(cfg config.Config) []Adapter {
@@ -77,7 +113,7 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 		Model: c.Config.Model, ModelSource: "configured", Effort: c.Config.Effort,
 		EscalationCause: c.EscalationCause,
 	}
-	env := processx.ReviewerEnvironment(request.AllowAPIBilling)
+	env := processx.ReviewerWorkspaceEnvironment(request.AllowAPIBilling, request.RuntimeDir)
 
 	path, err := lookPathWithFallback(c.Config.Command, codexFallbackPaths())
 	if err != nil {
@@ -161,14 +197,16 @@ func codexReviewArgs(cfg config.Reviewer, request Request, rawPath string) []str
 	// the exact target and enforce the shared reviewer policy and schema.
 	args := []string{
 		"exec",
-		"--sandbox", "read-only",
+		"--sandbox", "workspace-write",
 		"--cd", request.WorkDir,
-		"--add-dir", request.RepoRoot,
 		"--skip-git-repo-check",
 		"--ignore-rules",
 		"--ephemeral",
 		"--ignore-user-config",
 		"--config", "developer_instructions=" + strconv.Quote(request.Policy),
+	}
+	if request.RuntimeDir != "" {
+		args = append(args, "--add-dir", request.RuntimeDir)
 	}
 	if cfg.Model != "" {
 		args = append(args, "--model", cfg.Model)
@@ -185,10 +223,117 @@ func codexReviewArgs(cfg config.Reviewer, request Request, rawPath string) []str
 	return args
 }
 
+func RunCodexFix(parent context.Context, cfg config.AutoFix, request FixRequest) model.AutoFixAttempt {
+	started := time.Now()
+	result := model.AutoFixAttempt{
+		Agent: "codex", Status: "incomplete", Tool: cfg.Command,
+		Model: cfg.Model, ModelSource: "configured", Effort: cfg.Effort,
+	}
+	env := processx.ReviewerEnvironment(request.AllowAPIBilling)
+	path, err := lookPathWithFallback(cfg.Command, codexFallbackPaths())
+	if err != nil {
+		result.Error = fmt.Sprintf("find Codex CLI: %v", err)
+		result.ExecutionDuration = model.NewDuration(time.Since(started))
+		return result
+	}
+	result.Tool = path
+	versionCtx, cancelVersion := context.WithTimeout(parent, 10*time.Second)
+	version, _, _ := processx.Capture(versionCtx, path, request.RepoRoot, env, "--version")
+	cancelVersion()
+	result.ToolVersion = strings.TrimSpace(string(version))
+	authCtx, cancelAuth := context.WithTimeout(parent, 15*time.Second)
+	authOut, authErrOut, authResult := processx.Capture(authCtx, path, request.RepoRoot, env, "login", "status")
+	cancelAuth()
+	if authResult.Err != nil {
+		result.Error = "Codex authentication check failed: " + firstNonEmpty(string(authErrOut), authResult.Err.Error())
+		result.ExecutionDuration = model.NewDuration(time.Since(started))
+		return result
+	}
+	if codexUsesChatGPT(authOut, authErrOut) {
+		result.Auth = "chatgpt"
+	} else if request.AllowAPIBilling {
+		result.Auth = "api-or-other"
+	} else {
+		result.Error = "Codex is not authenticated with ChatGPT; refusing possible API billing"
+		result.ExecutionDuration = model.NewDuration(time.Since(started))
+		return result
+	}
+
+	lastMessagePath := filepath.Join(request.RecordDir, "agent.last.txt")
+	if err := preparePrivateFile(lastMessagePath); err != nil {
+		result.Error = "prepare coding-agent output: " + err.Error()
+		result.ExecutionDuration = model.NewDuration(time.Since(started))
+		return result
+	}
+	args := codexFixArgs(cfg, request, lastMessagePath)
+	eventsPath := filepath.Join(request.RecordDir, "agent.events.jsonl")
+	stderrPath := filepath.Join(request.RecordDir, "agent.stderr.log")
+	fixCtx, cancelFix := context.WithTimeout(parent, request.Timeout)
+	processResult := processx.Run(fixCtx, processx.Spec{
+		Command: path, Args: args, Dir: request.RepoRoot, Stdin: []byte(request.Prompt), Env: env,
+		StdoutPath: eventsPath, StderrPath: stderrPath,
+	})
+	cancelFix()
+	result.ExecutionDuration = model.NewDuration(time.Since(started))
+	result.ExitCode = processResult.ExitCode
+	if telemetry, telemetryErr := readCodexTelemetry(eventsPath, result.Model); telemetryErr == nil {
+		applyFixTelemetry(&result, telemetry)
+	}
+	if processResult.Err != nil {
+		result.Error = "Codex coding agent failed: " + codexFailure(eventsPath, stderrPath, processResult.Err)
+		return result
+	}
+	result.Status = "completed"
+	return result
+}
+
+func codexFixArgs(cfg config.AutoFix, request FixRequest, lastMessagePath string) []string {
+	args := []string{
+		"exec", "--sandbox", "workspace-write", "--cd", request.RepoRoot,
+		"--skip-git-repo-check", "--ignore-rules", "--ephemeral", "--ignore-user-config",
+		"--config", "developer_instructions=" + strconv.Quote(request.Policy),
+	}
+	if cfg.Model != "" {
+		args = append(args, "--model", cfg.Model)
+	}
+	if cfg.Effort != "" {
+		args = append(args, "--config", "model_reasoning_effort="+strconv.Quote(cfg.Effort))
+	}
+	args = append(args, "--json", "--output-last-message", lastMessagePath, "-")
+	return args
+}
+
+func applyFixTelemetry(result *model.AutoFixAttempt, telemetry reviewerTelemetry) {
+	if telemetry.Model != "" {
+		result.Model = telemetry.Model
+		result.ModelSource = telemetry.ModelSource
+	}
+	result.Usage = telemetry.Usage
+}
+
 type Claude struct {
 	Config          config.Reviewer
 	ReviewerName    string
 	EscalationCause string
+}
+
+func claudeReviewerSandboxSettings(runtimeDir string) string {
+	filesystem := map[string]any{}
+	if runtimeDir != "" {
+		filesystem["allowWrite"] = []string{runtimeDir}
+	}
+	settings := map[string]any{
+		"sandbox": map[string]any{
+			"enabled": true, "failIfUnavailable": true,
+			"autoAllowBashIfSandboxed": true, "allowUnsandboxedCommands": false,
+			"filesystem": filesystem,
+			"network": map[string]any{
+				"allowedDomains": []string{}, "deniedDomains": []string{"*"}, "strictAllowlist": true,
+			},
+		},
+	}
+	encoded, _ := json.Marshal(settings)
+	return string(encoded)
 }
 
 func (c Claude) Name() string {
@@ -207,7 +352,7 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 		Model: c.Config.Model, ModelSource: "configured", Effort: c.Config.Effort,
 		EscalationCause: c.EscalationCause,
 	}
-	env := processx.ReviewerEnvironment(request.AllowAPIBilling)
+	env := processx.ReviewerWorkspaceEnvironment(request.AllowAPIBilling, request.RuntimeDir)
 
 	path, err := exec.LookPath(c.Config.Command)
 	if err != nil {
@@ -259,11 +404,10 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	args := []string{
 		"-p",
 		"--safe-mode",
-		"--permission-mode", "plan",
-		"--tools", "Read,Glob,Grep",
+		"--permission-mode", "dontAsk",
+		"--tools", "Read,Glob,Grep,Bash",
+		"--settings", claudeReviewerSandboxSettings(request.RuntimeDir),
 		"--append-system-prompt", request.Policy,
-		"--add-dir", request.RepoRoot,
-		"--add-dir", request.RunDir,
 		"--max-turns", strconv.Itoa(c.Config.MaxTurns),
 		"--no-session-persistence",
 		"--output-format", "json",
@@ -642,7 +786,7 @@ func readCodexTelemetry(path, fallbackModel string) (reviewerTelemetry, error) {
 			completed.Turns++
 			completed.TurnsKnown = true
 			if found {
-				completed = addUsage(completed, usage)
+				completed = addUsage(completed, usage, completedUsage)
 				completedUsage = true
 			}
 		} else if found && usageMagnitude(usage) >= usageMagnitude(fallback) {
@@ -687,6 +831,7 @@ func claudeTelemetry(contents []byte, fallbackModel string) reviewerTelemetry {
 	if modelUsage, ok := mapValue(document, "modelUsage", "model_usage"); ok {
 		var bestModel string
 		var bestMagnitude int64
+		aggregatedUsage := false
 		for name, raw := range modelUsage {
 			entry, ok := raw.(map[string]any)
 			if !ok {
@@ -694,7 +839,8 @@ func claudeTelemetry(contents []byte, fallbackModel string) reviewerTelemetry {
 			}
 			usage, found := claudeUsageFromMap(entry)
 			if found {
-				telemetry.Usage = addUsage(telemetry.Usage, usage)
+				telemetry.Usage = addUsage(telemetry.Usage, usage, aggregatedUsage)
+				aggregatedUsage = true
 			}
 			magnitude := usageMagnitude(usage)
 			if magnitude > bestMagnitude || bestModel == "" {
@@ -773,10 +919,18 @@ func usageFromMap(object map[string]any) (model.Usage, bool) {
 	cached, cachedKnown := intValueKnown(object, "cached_input_tokens", "cachedInputTokens", "cache_read_input_tokens", "cacheReadInputTokens")
 	_, creationKnown := intValueKnown(object, "cache_creation_input_tokens", "cacheCreationInputTokens")
 	output, outputKnown := intValueKnown(object, "output_tokens", "outputTokens")
-	thinking, thinkingKnown := intValueKnown(object, "reasoning_tokens", "reasoningTokens", "thinking_tokens", "thinkingTokens")
+	thinking, thinkingKnown := intValueKnown(object,
+		"reasoning_tokens", "reasoningTokens",
+		"reasoning_output_tokens", "reasoningOutputTokens",
+		"thinking_tokens", "thinkingTokens",
+	)
 	if !thinkingKnown {
 		if details, ok := mapValue(object, "output_tokens_details", "outputTokensDetails"); ok {
-			thinking, thinkingKnown = intValueKnown(details, "reasoning_tokens", "reasoningTokens")
+			thinking, thinkingKnown = intValueKnown(details,
+				"reasoning_tokens", "reasoningTokens",
+				"reasoning_output_tokens", "reasoningOutputTokens",
+				"thinking_tokens", "thinkingTokens",
+			)
 		}
 	}
 	if !inputKnown && !cachedKnown && !creationKnown && !outputKnown && !thinkingKnown {
@@ -831,14 +985,22 @@ func extractClaudeUsage(value any) (model.Usage, bool) {
 	return best, found
 }
 
-func addUsage(left, right model.Usage) model.Usage {
+func addUsage(left, right model.Usage, hasLeftUsage bool) model.Usage {
 	turns := left.Turns
 	turnsKnown := left.TurnsKnown
 	left.InputTokens += right.InputTokens
 	left.CachedInputTokens += right.CachedInputTokens
 	left.OutputTokens += right.OutputTokens
 	left.ThinkingTokens += right.ThinkingTokens
-	left.ThinkingTokensKnown = left.ThinkingTokensKnown || right.ThinkingTokensKnown
+	if !hasLeftUsage {
+		left.ThinkingTokensKnown = right.ThinkingTokensKnown && !right.ThinkingTokensPartial
+		left.ThinkingTokensPartial = right.ThinkingTokensPartial
+	} else {
+		anyThinkingKnown := left.ThinkingTokensKnown || left.ThinkingTokensPartial || right.ThinkingTokensKnown || right.ThinkingTokensPartial
+		allThinkingKnown := left.ThinkingTokensKnown && !left.ThinkingTokensPartial && right.ThinkingTokensKnown && !right.ThinkingTokensPartial
+		left.ThinkingTokensKnown = allThinkingKnown
+		left.ThinkingTokensPartial = anyThinkingKnown && !allThinkingKnown
+	}
 	left.Turns = turns
 	left.TurnsKnown = turnsKnown
 	return left

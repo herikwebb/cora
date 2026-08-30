@@ -61,9 +61,24 @@ type Escalation struct {
 	Enabled                 bool     `toml:"enabled"`
 	Model                   string   `toml:"model"`
 	Effort                  string   `toml:"effort"`
+	MaxTurns                *int     `toml:"max_turns"`
+	MaxBudgetUSD            *float64 `toml:"max_budget_usd"`
 	SecurityPathMarkers     []string `toml:"security_path_markers"`
 	ForceSecuritySensitive  bool     `toml:"-"`
 	AdjudicateDisagreements bool     `toml:"adjudicate_disagreements"`
+}
+
+type AutoFix struct {
+	Command        string   `toml:"command"`
+	Model          string   `toml:"model"`
+	Effort         string   `toml:"effort"`
+	Threshold      string   `toml:"until"`
+	AgentTimeout   Duration `toml:"agent_timeout"`
+	MaxDuration    Duration `toml:"max_duration"`
+	MaxIterations  int      `toml:"max_iterations"`
+	MaxTurns       int      `toml:"max_turns"`
+	MaxCostUSD     float64  `toml:"max_cost_usd"`
+	MaxConcurrency int      `toml:"max_concurrency"`
 }
 
 type Config struct {
@@ -81,6 +96,7 @@ type Config struct {
 	PromptFile                   string              `toml:"prompt_file"`
 	Reviewers                    Reviewers           `toml:"reviewers"`
 	Escalation                   Escalation          `toml:"escalation"`
+	AutoFix                      AutoFix             `toml:"auto_fix"`
 	Checks                       []Check             `toml:"checks"`
 	ValidationProfiles           []ValidationProfile `toml:"validation_profiles"`
 	LoadedFiles                  []string            `toml:"-"`
@@ -127,6 +143,11 @@ func Defaults() Config {
 				"/crypto/", "/cryptography/", "/iam/", "/permissions/",
 				"/secrets/", "/credentials/", "oauth", "jwt",
 			},
+		},
+		AutoFix: AutoFix{
+			Command: "codex", Model: "gpt-5.6-sol", Effort: "high", Threshold: "major",
+			AgentTimeout: Duration{Duration: 20 * time.Minute}, MaxDuration: Duration{Duration: time.Hour},
+			MaxIterations: 5, MaxTurns: 250, MaxCostUSD: 50, MaxConcurrency: 1,
 		},
 	}
 }
@@ -283,13 +304,56 @@ func (c Config) Validate() error {
 	if err := validateEffort("reviewers.claude.effort", c.Reviewers.Claude.Effort, false); err != nil {
 		return err
 	}
-	if c.Escalation.Enabled {
+	if c.Escalation.Enabled || c.CrossExamineBlockingFindings {
 		if strings.TrimSpace(c.Escalation.Model) == "" {
-			return errors.New("escalation.model cannot be empty when escalation is enabled")
+			return errors.New("escalation.model cannot be empty when escalation or cross-examination is enabled")
 		}
 		if err := validateEffort("escalation.effort", c.Escalation.Effort, false); err != nil {
 			return err
 		}
+		if c.Escalation.MaxTurns != nil {
+			if *c.Escalation.MaxTurns < 1 {
+				return errors.New("escalation.max_turns must be positive when set")
+			}
+			if *c.Escalation.MaxTurns <= c.Reviewers.Claude.FinalizationTurns {
+				return errors.New("escalation.max_turns must be greater than reviewers.claude.finalization_turns")
+			}
+		}
+		if c.Escalation.MaxBudgetUSD != nil && *c.Escalation.MaxBudgetUSD < 0 {
+			return errors.New("escalation.max_budget_usd cannot be negative")
+		}
+	}
+	if strings.TrimSpace(c.AutoFix.Command) == "" {
+		return errors.New("auto_fix.command cannot be empty")
+	}
+	if strings.TrimSpace(c.AutoFix.Model) == "" {
+		return errors.New("auto_fix.model cannot be empty")
+	}
+	if err := validateEffort("auto_fix.effort", c.AutoFix.Effort, true); err != nil {
+		return err
+	}
+	switch c.AutoFix.Threshold {
+	case "blocker", "major", "minor":
+	default:
+		return errors.New("auto_fix.until must be blocker, major, or minor")
+	}
+	if c.AutoFix.AgentTimeout.Duration <= 0 {
+		return errors.New("auto_fix.agent_timeout must be positive")
+	}
+	if c.AutoFix.MaxDuration.Duration <= 0 {
+		return errors.New("auto_fix.max_duration must be positive")
+	}
+	if c.AutoFix.MaxIterations < 1 {
+		return errors.New("auto_fix.max_iterations must be positive")
+	}
+	if c.AutoFix.MaxTurns < 1 {
+		return errors.New("auto_fix.max_turns must be positive")
+	}
+	if c.AutoFix.MaxCostUSD <= 0 {
+		return errors.New("auto_fix.max_cost_usd must be positive")
+	}
+	if c.AutoFix.MaxConcurrency < 1 {
+		return errors.New("auto_fix.max_concurrency must be positive")
 	}
 	if len(c.BlockingSeverities) == 0 {
 		return errors.New("blocking_severities cannot be empty")

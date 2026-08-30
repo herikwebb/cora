@@ -28,6 +28,7 @@ type Workspace struct {
 	repository Repo
 	parent     string
 	temporary  bool
+	linked     bool
 }
 
 type TargetOptions struct {
@@ -104,7 +105,7 @@ func (r Repo) ResolveTarget(ctx context.Context, opts TargetOptions) (model.Targ
 // It reuses the caller's clean checkout when possible and creates a detached
 // temporary Git worktree for an arbitrary commit or dirty caller checkout.
 func (r Repo) PrepareWorkspace(ctx context.Context, target model.Target) (Workspace, error) {
-	if target.Mode == "uncommitted" {
+	if workingTreeTarget(target) {
 		return Workspace{Root: r.Root, repository: r}, nil
 	}
 	currentHead, err := r.ResolveRevision(ctx, "HEAD")
@@ -117,13 +118,43 @@ func (r Repo) PrepareWorkspace(ctx context.Context, target model.Target) (Worksp
 	return r.createTemporaryWorkspace(ctx, target.HeadSHA)
 }
 
-// PrepareDisposableWorkspace always creates a detached worktree. Checks can
-// modify or delete files there without mutating the user's checkout.
+// PrepareDisposableWorkspace creates an independent local clone with no
+// remotes. Reviewers and checks can modify files or Git state there without
+// mutating the user's checkout or the source repository's shared Git data.
 func (r Repo) PrepareDisposableWorkspace(ctx context.Context, target model.Target) (Workspace, error) {
-	if target.Mode == "uncommitted" {
-		return Workspace{}, errors.New("disposable checks require a committed target")
+	var patch []byte
+	var err error
+	if workingTreeTarget(target) {
+		patch, err = r.ReviewDiff(ctx, target)
+		if err != nil {
+			return Workspace{}, err
+		}
 	}
-	return r.createTemporaryWorkspace(ctx, target.HeadSHA)
+	return r.PrepareDisposableWorkspaceSnapshot(ctx, target, patch)
+}
+
+// PrepareDisposableWorkspaceSnapshot creates a disposable workspace from the
+// supplied immutable patch. Callers that already captured and fingerprinted a
+// working-tree review must use this method so concurrent source-tree edits
+// cannot make different reviewers inspect different content.
+func (r Repo) PrepareDisposableWorkspaceSnapshot(ctx context.Context, target model.Target, patch []byte) (Workspace, error) {
+	headSHA := target.HeadSHA
+	if workingTreeTarget(target) {
+		headSHA = target.BaseSHA
+	}
+	workspace, err := r.createDisposableClone(ctx, headSHA)
+	if err != nil {
+		return Workspace{}, err
+	}
+	if !workingTreeTarget(target) {
+		return workspace, nil
+	}
+	err = gitInput(ctx, workspace.Root, patch, "apply", "--binary", "--whitespace=nowarn", "-")
+	if err != nil {
+		_ = workspace.Close(context.Background())
+		return Workspace{}, fmt.Errorf("materialize working-tree snapshot: %w", err)
+	}
+	return workspace, nil
 }
 
 func (r Repo) createTemporaryWorkspace(ctx context.Context, headSHA string) (Workspace, error) {
@@ -136,17 +167,46 @@ func (r Repo) createTemporaryWorkspace(ctx context.Context, headSHA string) (Wor
 		_ = os.RemoveAll(parent)
 		return Workspace{}, fmt.Errorf("create temporary review worktree: %w", err)
 	}
-	return Workspace{Root: worktree, repository: r, parent: parent, temporary: true}, nil
+	return Workspace{Root: worktree, repository: r, parent: parent, temporary: true, linked: true}, nil
+}
+
+func (r Repo) createDisposableClone(ctx context.Context, headSHA string) (Workspace, error) {
+	parent, err := os.MkdirTemp("", "cora-disposable-")
+	if err != nil {
+		return Workspace{}, fmt.Errorf("create disposable workspace directory: %w", err)
+	}
+	workspace := Workspace{Root: filepath.Join(parent, "workspace"), repository: r, parent: parent, temporary: true}
+	cleanup := func(cause error) (Workspace, error) {
+		_ = os.RemoveAll(parent)
+		return Workspace{}, cause
+	}
+	if _, err := gitBytes(ctx, parent, "clone", "--quiet", "--no-checkout", "--no-hardlinks", "--", r.Root, workspace.Root); err != nil {
+		return cleanup(fmt.Errorf("clone disposable workspace: %w", err))
+	}
+	if _, err := gitBytes(ctx, workspace.Root, "remote", "remove", "origin"); err != nil {
+		return cleanup(fmt.Errorf("remove disposable workspace remote: %w", err))
+	}
+	if _, err := gitBytes(ctx, workspace.Root, "checkout", "--quiet", "--detach", "--force", headSHA); err != nil {
+		return cleanup(fmt.Errorf("checkout disposable workspace: %w", err))
+	}
+	return workspace, nil
 }
 
 func (w *Workspace) Close(ctx context.Context) error {
 	if w == nil || !w.temporary {
 		return nil
 	}
-	if w.parent == "" || w.Root != filepath.Join(w.parent, "worktree") {
+	directoryName := "workspace"
+	if w.linked {
+		directoryName = "worktree"
+	}
+	if w.parent == "" || w.Root != filepath.Join(w.parent, directoryName) {
 		return errors.New("refusing to remove an invalid temporary review workspace")
 	}
-	_, removeErr := gitBytes(ctx, w.repository.Root, "worktree", "remove", "--force", w.Root)
+	var removeErr error
+	if w.linked {
+		_, removeErr = gitBytes(ctx, w.repository.Root, "worktree", "remove", "--force", w.Root)
+	}
 	filesystemErr := os.RemoveAll(w.parent)
 	w.temporary = false
 	if removeErr != nil {
@@ -298,6 +358,40 @@ func (r Repo) resolveUncommitted(ctx context.Context, dirty bool) (model.Target,
 	}, nil
 }
 
+// ResolveAutoFixTarget fingerprints the complete current working tree against
+// the original review base. Unlike the general --uncommitted mode, this exact
+// snapshot can be approved and subsequently verified by the auto-fix loop.
+func (r Repo) ResolveAutoFixTarget(ctx context.Context, baseRef, baseSHA, expectedHeadSHA string) (model.Target, error) {
+	head, err := r.ResolveRevision(ctx, "HEAD")
+	if err != nil {
+		return model.Target{}, err
+	}
+	if head != expectedHeadSHA {
+		return model.Target{}, errors.New("auto-fix agent changed HEAD or Git branch state")
+	}
+	patch, err := r.workingTreeDiff(ctx, baseSHA)
+	if err != nil {
+		return model.Target{}, err
+	}
+	if len(patch) == 0 {
+		return model.Target{}, errors.New("auto-fix working tree has no changes relative to the original base")
+	}
+	sum := sha256.Sum256(patch)
+	return model.Target{
+		Mode: "working-tree", BaseRef: baseRef, HeadRef: "working-tree",
+		BaseSHA: baseSHA, HeadSHA: head, DiffHash: hex.EncodeToString(sum[:]),
+		Dirty: true, Finalizable: true,
+	}, nil
+}
+
+func (r Repo) CurrentBranch(ctx context.Context) (string, error) {
+	branch, err := gitOutput(ctx, r.Root, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil || branch == "" {
+		return "", errors.New("auto-fix requires a checked-out feature branch")
+	}
+	return branch, nil
+}
+
 func (r Repo) DetectBase(ctx context.Context) (string, error) {
 	for _, remote := range []string{"upstream", "origin"} {
 		ref, err := gitOutput(ctx, r.Root, "symbolic-ref", "--quiet", "--short", "refs/remotes/"+remote+"/HEAD")
@@ -387,6 +481,10 @@ func (r Repo) VerifyTarget(ctx context.Context, target model.Target) (bool, erro
 		current, err := r.worktreeHash(ctx)
 		return current == target.DiffHash, err
 	}
+	if target.Mode == "working-tree" {
+		current, err := r.ResolveAutoFixTarget(ctx, target.BaseRef, target.BaseSHA, target.HeadSHA)
+		return err == nil && current.DiffHash == target.DiffHash, err
+	}
 	current, _, err := r.diffHash(ctx, target.BaseSHA, target.HeadSHA)
 	return current == target.DiffHash, err
 }
@@ -394,7 +492,7 @@ func (r Repo) VerifyTarget(ctx context.Context, target model.Target) (bool, erro
 // ReviewDiff returns the exact patch supplied to reviewers and stored in the
 // audit record. Untracked working-tree files are represented as new files.
 func (r Repo) ReviewDiff(ctx context.Context, target model.Target) ([]byte, error) {
-	if target.Mode != "uncommitted" {
+	if !workingTreeTarget(target) {
 		diff, err := gitBytes(ctx, r.Root, "diff", "--binary", "--no-ext-diff", "--no-textconv", target.BaseSHA, target.HeadSHA)
 		if err != nil {
 			return nil, fmt.Errorf("render review diff: %w", err)
@@ -402,7 +500,11 @@ func (r Repo) ReviewDiff(ctx context.Context, target model.Target) ([]byte, erro
 		return diff, nil
 	}
 
-	diff, err := gitBytes(ctx, r.Root, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD")
+	return r.workingTreeDiff(ctx, target.BaseSHA)
+}
+
+func (r Repo) workingTreeDiff(ctx context.Context, baseSHA string) ([]byte, error) {
+	diff, err := gitBytes(ctx, r.Root, "diff", "--binary", "--no-ext-diff", "--no-textconv", baseSHA)
 	if err != nil {
 		return nil, fmt.Errorf("render working tree diff: %w", err)
 	}
@@ -430,8 +532,8 @@ func (r Repo) ReviewDiff(ctx context.Context, target model.Target) ([]byte, erro
 func (r Repo) ChangedPaths(ctx context.Context, target model.Target) ([]string, error) {
 	var raw []byte
 	var err error
-	if target.Mode == "uncommitted" {
-		raw, err = gitBytes(ctx, r.Root, "diff", "--name-only", "-z", "--no-ext-diff", "HEAD")
+	if workingTreeTarget(target) {
+		raw, err = gitBytes(ctx, r.Root, "diff", "--name-only", "-z", "--no-ext-diff", target.BaseSHA)
 	} else {
 		raw, err = gitBytes(ctx, r.Root, "diff", "--name-only", "-z", "--no-ext-diff", target.BaseSHA, target.HeadSHA)
 	}
@@ -439,7 +541,7 @@ func (r Repo) ChangedPaths(ctx context.Context, target model.Target) ([]string, 
 		return nil, fmt.Errorf("list changed paths: %w", err)
 	}
 	paths := splitNUL(raw)
-	if target.Mode == "uncommitted" {
+	if workingTreeTarget(target) {
 		untrackedRaw, untrackedErr := gitBytes(ctx, r.Root, "ls-files", "--others", "--exclude-standard", "-z")
 		if untrackedErr != nil {
 			return nil, fmt.Errorf("list untracked paths: %w", untrackedErr)
@@ -458,6 +560,10 @@ func (r Repo) ChangedPaths(ctx context.Context, target model.Target) ([]string, 
 	}
 	sort.Strings(paths)
 	return paths, nil
+}
+
+func workingTreeTarget(target model.Target) bool {
+	return target.Mode == "uncommitted" || target.Mode == "working-tree"
 }
 
 // ReadFileAt returns a repository file from an exact Git revision. A missing
@@ -556,6 +662,17 @@ func gitBytes(ctx context.Context, dir string, args ...string) ([]byte, error) {
 		return nil, errors.New(firstGitError(stderr.String(), err))
 	}
 	return output, nil
+}
+
+func gitInput(ctx context.Context, dir string, input []byte, args ...string) error {
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	command.Stdin = bytes.NewReader(input)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		return errors.New(firstGitError(stderr.String(), err))
+	}
+	return nil
 }
 
 func firstGitError(stderr string, err error) string {

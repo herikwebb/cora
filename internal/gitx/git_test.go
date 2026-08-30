@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,6 +104,107 @@ func TestResolveTargetsAndVerifyFingerprint(t *testing.T) {
 	valid, err = repo.VerifyTarget(ctx, worktree)
 	if err != nil || valid {
 		t.Fatalf("changed worktree should invalidate fingerprint: %v, %v", valid, err)
+	}
+}
+
+func TestResolveAutoFixTargetCapturesFullBranchAndWorkingTree(t *testing.T) {
+	ctx := context.Background()
+	root := newGitRepository(t)
+	base := gitTestOutput(t, root, "rev-parse", "HEAD")
+	gitTest(t, root, "switch", "-c", "feature")
+	writeGitFile(t, filepath.Join(root, "app.txt"), "base\nfeature\n")
+	gitTest(t, root, "add", "app.txt")
+	gitTest(t, root, "commit", "-m", "feat(app): add feature")
+	head := gitTestOutput(t, root, "rev-parse", "HEAD")
+	writeGitFile(t, filepath.Join(root, "app.txt"), "base\nfeature\nfixed\n")
+	writeGitFile(t, filepath.Join(root, "new.txt"), "new file\n")
+	repo, err := Discover(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := repo.ResolveAutoFixTarget(ctx, "main", base, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Mode != "working-tree" || !target.Finalizable || target.BaseSHA != base || target.HeadSHA != head {
+		t.Fatalf("auto-fix target = %#v", target)
+	}
+	diff, err := repo.ReviewDiff(ctx, target)
+	if err != nil || !strings.Contains(string(diff), "+feature") || !strings.Contains(string(diff), "+fixed") || !strings.Contains(string(diff), "new.txt") {
+		t.Fatalf("full auto-fix diff:\n%s\nerror: %v", diff, err)
+	}
+	workspace, err := repo.PrepareDisposableWorkspace(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close(ctx)
+	if info, err := os.Stat(filepath.Join(workspace.Root, ".git")); err != nil || !info.IsDir() {
+		t.Fatalf("disposable workspace does not have independent Git data: %v", err)
+	}
+	if remotes := gitTestOutput(t, workspace.Root, "remote"); remotes != "" {
+		t.Fatalf("disposable workspace retained remotes: %q", remotes)
+	}
+	if contents, err := os.ReadFile(filepath.Join(workspace.Root, "app.txt")); err != nil || string(contents) != "base\nfeature\nfixed\n" {
+		t.Fatalf("materialized app.txt = %q, %v", contents, err)
+	}
+	if contents, err := os.ReadFile(filepath.Join(workspace.Root, "new.txt")); err != nil || string(contents) != "new file\n" {
+		t.Fatalf("materialized new.txt = %q, %v", contents, err)
+	}
+	if valid, err := repo.VerifyTarget(ctx, target); err != nil || !valid {
+		t.Fatalf("verify exact auto-fix target = %v, %v", valid, err)
+	}
+	sourceStatus := gitTestOutput(t, root, "status", "--short")
+	writeGitFile(t, filepath.Join(workspace.Root, "reviewer.tmp"), "disposable\n")
+	gitTest(t, workspace.Root, "add", ".")
+	gitTest(t, workspace.Root, "-c", "user.name=CORA Reviewer", "-c", "user.email=reviewer@example.invalid", "commit", "-m", "test: mutate disposable clone")
+	if status := gitTestOutput(t, root, "status", "--short"); status != sourceStatus {
+		t.Fatalf("disposable Git mutation changed source status: before=%q after=%q", sourceStatus, status)
+	}
+	if current := gitTestOutput(t, root, "rev-parse", "HEAD"); current != head {
+		t.Fatalf("disposable Git mutation changed source HEAD: %s", current)
+	}
+	writeGitFile(t, filepath.Join(root, "app.txt"), "changed again\n")
+	if valid, err := repo.VerifyTarget(ctx, target); err != nil || valid {
+		t.Fatalf("changed auto-fix target should be stale = %v, %v", valid, err)
+	}
+}
+
+func TestPrepareDisposableWorkspaceSnapshotUsesCapturedPatch(t *testing.T) {
+	ctx := context.Background()
+	root := newGitRepository(t)
+	base := gitTestOutput(t, root, "rev-parse", "HEAD")
+	gitTest(t, root, "switch", "-c", "feature")
+	writeGitFile(t, filepath.Join(root, "app.txt"), "base\nfeature\n")
+	gitTest(t, root, "add", "app.txt")
+	gitTest(t, root, "commit", "-m", "feat(app): add feature")
+	head := gitTestOutput(t, root, "rev-parse", "HEAD")
+	writeGitFile(t, filepath.Join(root, "app.txt"), "base\nfeature\nreviewed fix\n")
+
+	repo, err := Discover(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := repo.ResolveAutoFixTarget(ctx, "main", base, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturedPatch, err := repo.ReviewDiff(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeGitFile(t, filepath.Join(root, "app.txt"), "base\nfeature\nunreviewed concurrent edit\n")
+
+	workspace, err := repo.PrepareDisposableWorkspaceSnapshot(ctx, target, capturedPatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close(ctx)
+	contents, err := os.ReadFile(filepath.Join(workspace.Root, "app.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(contents), "base\nfeature\nreviewed fix\n"; got != want {
+		t.Fatalf("snapshot contents = %q, want %q", got, want)
 	}
 }
 

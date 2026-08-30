@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,9 +19,35 @@ import (
 	"github.com/herikwebb/cora/internal/config"
 	"github.com/herikwebb/cora/internal/gitx"
 	"github.com/herikwebb/cora/internal/model"
+	"github.com/herikwebb/cora/internal/provider"
 	"github.com/herikwebb/cora/internal/record"
 	"github.com/herikwebb/cora/internal/verdict"
 )
+
+type quotaBlockedAdapter struct {
+	called *bool
+}
+
+func (a quotaBlockedAdapter) Name() string     { return "claude" }
+func (a quotaBlockedAdapter) Provider() string { return "claude" }
+func (a quotaBlockedAdapter) Review(context.Context, provider.Request) model.ReviewerResult {
+	*a.called = true
+	return model.ReviewerResult{Reviewer: "claude", Status: "completed"}
+}
+
+type quotaReportingAdapter struct {
+	retryAt time.Time
+}
+
+func (a quotaReportingAdapter) Name() string     { return "claude" }
+func (a quotaReportingAdapter) Provider() string { return "claude" }
+func (a quotaReportingAdapter) Review(context.Context, provider.Request) model.ReviewerResult {
+	retryAt := a.retryAt
+	return model.ReviewerResult{
+		Reviewer: "claude", Status: "incomplete", FailureKind: "quota", Retryable: true,
+		RetryAt: &retryAt, Error: "session limit reached",
+	}
+}
 
 func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
@@ -89,6 +116,9 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	if contents, readErr := os.ReadFile(filepath.Join(repoRoot, "app.txt")); readErr != nil || string(contents) != "base\nfeature\n" {
 		t.Fatalf("disposable check modified caller checkout: contents=%q err=%v", contents, readErr)
 	}
+	if _, statErr := os.Stat(filepath.Join(repoRoot, "reviewer-test-artifact")); !os.IsNotExist(statErr) {
+		t.Fatalf("reviewer artifact escaped disposable workspace: %v", statErr)
+	}
 	for _, message := range []string{
 		"cora: run ",
 		"reviewer codex started",
@@ -96,7 +126,7 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 		"reviewer codex completed",
 		"reviewer claude completed",
 		"model=claude-fable-5 effort=high",
-		"turns=3 thinking=200 api-equivalent=$0.0293",
+		"provider-turns=3 thinking=200 api-equivalent=$0.0293",
 		"check diff-check started",
 		"check diff-check passed",
 		"finished: approved",
@@ -120,11 +150,11 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	if manifest.CoraSourceSHA != "source-sha" || manifest.CoraBuildTime != "2026-08-25T12:00:00Z" || manifest.RepositoryIdentity == "" {
 		t.Fatalf("build/repository identity = %#v", manifest)
 	}
-	if manifest.Security.ReviewerIsolation != "neutral-directory-read-only" || manifest.Security.RepositoryPolicy != "ignored" {
+	if manifest.Security.ReviewerIsolation != "per-reviewer-disposable-clone-workspace-write-sandboxed" || manifest.Security.RepositoryPolicy != "ignored" {
 		t.Fatalf("reviewer isolation metadata = %#v", manifest.Security)
 	}
 	for _, check := range manifest.Checks {
-		if check.Isolation != "disposable-worktree-minimal-env" {
+		if check.Isolation != "disposable-clone-minimal-env" {
 			t.Fatalf("check isolation metadata = %#v", check)
 		}
 	}
@@ -178,7 +208,7 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	}
 	retryDecision, err := runner.RunWithOptions(context.Background(), repo, target, cfg, RunOptions{
 		ParentRunID: latest.ID, RetryReviewers: map[string]bool{"claude": true}, ReuseReviewers: previous,
-		ReuseChecks: true, Checks: manifest.Checks,
+		ReuseChecks: true, Checks: manifest.Checks, AutoFixLoopID: "loop-1", AutoFixIteration: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +224,7 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retryManifest.ParentRunID != latest.ID || len(retryManifest.Reviewers) != 2 {
+	if retryManifest.ParentRunID != latest.ID || retryManifest.AutoFixLoopID != "loop-1" || retryManifest.AutoFixIteration != 2 || len(retryManifest.Reviewers) != 2 {
 		t.Fatalf("retry manifest = %#v", retryManifest)
 	}
 	if retryManifest.CumulativeUsage.APIEquivalentCostUSD <= retryManifest.IncrementalUsage.APIEquivalentCostUSD {
@@ -215,6 +245,150 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 				t.Fatalf("Claude retry metadata = %#v", reviewer)
 			}
 		}
+	}
+}
+
+func TestReviewerFinishedProgressIncludesProviderFailure(t *testing.T) {
+	result := model.ReviewerResult{
+		Reviewer: "claude", Status: "incomplete",
+		ExecutionDuration: model.NewDuration(2 * time.Second), QueueDuration: model.NewDuration(time.Second),
+		Error: "Claude review failed:\nprovider quota exhausted; resets at 11:50am ET",
+	}
+	progress := reviewerFinishedProgress(result)
+	for _, want := range []string{"reviewer claude incomplete", "Claude review failed: provider quota exhausted", "resets at 11:50am ET"} {
+		if !strings.Contains(progress, want) {
+			t.Fatalf("progress %q does not contain %q", progress, want)
+		}
+	}
+	if strings.Contains(progress, "\n") {
+		t.Fatalf("provider failure was not normalized to one live progress line: %q", progress)
+	}
+}
+
+func TestSummarizeNewUsagePreservesPartialProviderMetrics(t *testing.T) {
+	usage := summarizeNewUsage([]model.ReviewerResult{{
+		Reviewer: "claude", Usage: model.Usage{
+			Turns: 2, TurnsPartial: true,
+			ThinkingTokens: 80, ThinkingTokensPartial: true,
+			APIEquivalentCostUSD: 1.25, APIEquivalentCostPartial: true,
+		},
+	}})
+	if usage.TurnsKnown || !usage.TurnsPartial || usage.ThinkingTokensKnown || !usage.ThinkingTokensPartial || usage.APIEquivalentCostKnown || !usage.APIEquivalentCostPartial {
+		t.Fatalf("partial provider usage was not preserved: %#v", usage)
+	}
+}
+
+func TestRunReviewerAdaptersSurfacesPersistedProviderQuota(t *testing.T) {
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
+	retryAt := time.Now().UTC().Add(time.Hour).Round(0)
+	if err := record.RecordProviderQuota("claude", "session limit reached", retryAt); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	execution := newExecutionBudget(context.Background(), time.Minute)
+	defer execution.Close()
+	results, err := runReviewerAdapters(
+		context.Background(), execution, []provider.Adapter{quotaBlockedAdapter{called: &called}},
+		gitx.Repo{}, record.Run{ID: "quota-gated"}, model.Target{}, nil, nil, config.Defaults(), "", "", "",
+		reviewerCallbacks{}, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("quota-gated provider was invoked")
+	}
+	if len(results) != 1 || results[0].FailureKind != "quota" || !results[0].Retryable || results[0].RetryAt == nil || !results[0].RetryAt.Equal(retryAt) {
+		t.Fatalf("quota-gated result = %#v", results)
+	}
+	if !results[0].Usage.TurnsKnown || !results[0].Usage.ThinkingTokensKnown || !results[0].Usage.APIEquivalentCostKnown || results[0].Usage.Turns != 0 || results[0].Usage.ThinkingTokens != 0 || results[0].Usage.APIEquivalentCostUSD != 0 {
+		t.Fatalf("quota-gated usage should be known zero: %#v", results[0].Usage)
+	}
+	if !strings.Contains(results[0].Error, "session limit reached") {
+		t.Fatalf("quota-gated error omitted provider failure: %q", results[0].Error)
+	}
+}
+
+func TestRunReviewerAdaptersPreservesQuotaGatedEscalationMetadata(t *testing.T) {
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
+	retryAt := time.Now().UTC().Add(time.Hour).Round(0)
+	if err := record.RecordProviderQuota("claude", "session limit reached", retryAt); err != nil {
+		t.Fatal(err)
+	}
+	execution := newExecutionBudget(context.Background(), time.Minute)
+	defer execution.Close()
+	adapter := provider.Claude{
+		Config:       config.Reviewer{Command: "must-not-run", Model: "fable", Effort: "high"},
+		ReviewerName: "claude-cross-examination", EscalationCause: "blocking_cross_examination",
+	}
+	results, err := runReviewerAdapters(
+		context.Background(), execution, []provider.Adapter{adapter}, gitx.Repo{},
+		record.Run{ID: "quota-gated-cross-examination"}, model.Target{}, nil, nil, config.Defaults(), "", "", "",
+		reviewerCallbacks{}, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Model != "fable" || results[0].ModelSource != "configured" || results[0].Effort != "high" || results[0].EscalationCause != "blocking_cross_examination" {
+		t.Fatalf("quota-gated escalation metadata = %#v", results)
+	}
+}
+
+func TestRunReviewerAdaptersPersistsReportedProviderQuota(t *testing.T) {
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
+	root := orchestratorTestRepo(t)
+	gitRun(t, root, "switch", "-c", "feature")
+	if err := os.WriteFile(filepath.Join(root, "app.txt"), []byte("base\nfeature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", "app.txt")
+	gitRun(t, root, "commit", "-m", "feat: exercise quota reporting")
+	repo, err := gitx.Discover(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := repo.ResolveTarget(context.Background(), gitx.TargetOptions{Base: "main", RequireClean: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryAt := time.Now().UTC().Add(time.Hour).Round(0)
+	execution := newExecutionBudget(context.Background(), time.Minute)
+	defer execution.Close()
+	results, err := runReviewerAdapters(
+		context.Background(), execution, []provider.Adapter{quotaReportingAdapter{retryAt: retryAt}},
+		repo, record.Run{ID: "quota-reported", Path: t.TempDir()}, target, nil, nil, config.Defaults(), "", "", "",
+		reviewerCallbacks{}, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].FailureKind != "quota" {
+		t.Fatalf("quota-reporting result = %#v", results)
+	}
+	_, acquireErr := record.AcquireProviderQueued(context.Background(), "claude", 1, record.ProviderQueueRequest{Reviewer: "later"}, nil)
+	var quotaErr *record.ProviderQuotaError
+	if !errors.As(acquireErr, &quotaErr) || !quotaErr.RetryAt.Equal(retryAt) {
+		t.Fatalf("persisted quota acquire error = %#v", acquireErr)
+	}
+}
+
+func TestEffectiveEscalationReviewerInheritsAndOverridesLimits(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Reviewers.Claude.MaxTurns = 50
+	cfg.Reviewers.Claude.MaxBudgetUSD = 9
+
+	inherited := effectiveEscalationReviewer(cfg)
+	if inherited.Model != "fable" || inherited.Effort != "high" || inherited.MaxTurns != 50 || inherited.MaxBudgetUSD != 9 {
+		t.Fatalf("inherited escalation reviewer = %#v", inherited)
+	}
+
+	maxTurns := 35
+	maxBudgetUSD := 0.0
+	cfg.Escalation.MaxTurns = &maxTurns
+	cfg.Escalation.MaxBudgetUSD = &maxBudgetUSD
+	overridden := effectiveEscalationReviewer(cfg)
+	if overridden.MaxTurns != 35 || overridden.MaxBudgetUSD != 0 {
+		t.Fatalf("overridden escalation reviewer = %#v", overridden)
 	}
 }
 
@@ -577,7 +751,7 @@ while [ "$#" -gt 0 ]; do
     output="$1"
   elif [ "$1" = "--sandbox" ]; then
     shift
-    if [ "$1" = "read-only" ]; then
+    if [ "$1" = "workspace-write" ]; then
       seen_sandbox="true"
     fi
   elif [ "$1" = "--model" ]; then
@@ -597,6 +771,11 @@ if [ "$seen_sandbox" != "true" ] || [ "$seen_model" != "true" ] || [ "$seen_effo
   echo "missing safe invocation flags" >&2
   exit 21
 fi
+if [ -z "$GOCACHE" ] || [ -z "$TMPDIR" ]; then
+  echo "missing disposable runtime" >&2
+  exit 22
+fi
+printf reviewer > reviewer-test-artifact
 printf '%s\n' '` + validReport + `' > "$output"
 echo '{"type":"thread.started","model_name":"gpt-5.6-sol"}'
 echo '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":300,"reasoning_tokens":120}}'
@@ -615,15 +794,27 @@ if [ -n "$ANTHROPIC_API_KEY" ]; then
   echo "API key leaked" >&2
   exit 20
 fi
-seen_plan="false"
+seen_permissions="false"
+seen_tools="false"
+seen_settings_enabled="false"
+seen_settings_strict="false"
+seen_settings_network="false"
 model=""
 effort=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--permission-mode" ]; then
     shift
-    if [ "$1" = "plan" ]; then
-      seen_plan="true"
+    if [ "$1" = "dontAsk" ]; then
+      seen_permissions="true"
     fi
+  elif [ "$1" = "--tools" ]; then
+    shift
+    if [ "$1" = "Read,Glob,Grep,Bash" ]; then seen_tools="true"; fi
+  elif [ "$1" = "--settings" ]; then
+    shift
+    case "$1" in *'"enabled":true'*) seen_settings_enabled="true" ;; esac
+    case "$1" in *'"allowUnsandboxedCommands":false'*) seen_settings_strict="true" ;; esac
+    case "$1" in *'"deniedDomains":["*"]'*) seen_settings_network="true" ;; esac
   elif [ "$1" = "--model" ]; then
     shift
     model="$1"
@@ -633,10 +824,15 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
-if [ "$seen_plan" != "true" ] || [ "$model" != "fable" ] || [ "$effort" != "high" ]; then
-  echo "missing plan mode" >&2
+if [ "$seen_permissions" != "true" ] || [ "$seen_tools" != "true" ] || [ "$seen_settings_enabled" != "true" ] || [ "$seen_settings_strict" != "true" ] || [ "$seen_settings_network" != "true" ] || [ "$model" != "fable" ] || [ "$effort" != "high" ]; then
+  echo "missing strict sandbox mode" >&2
   exit 21
 fi
+if [ -z "$GOCACHE" ] || [ -z "$TMPDIR" ]; then
+  echo "missing disposable runtime" >&2
+  exit 22
+fi
+printf reviewer > reviewer-test-artifact
 printf '%s\n' '{"type":"result","is_error":false,"num_turns":2,"total_cost_usd":0.02,"resolved_model":"claude-fable-5","modelUsage":{"claude-fable-5":{"inputTokens":700,"cacheReadInputTokens":200,"outputTokens":100,"thinkingTokens":80,"costUSD":0.02}},"structured_output":` + validReport + `}'
 `
 

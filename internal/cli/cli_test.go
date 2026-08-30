@@ -39,6 +39,45 @@ func TestRootCommandUsesReviewInsteadOfRun(t *testing.T) {
 	}
 }
 
+func TestReviewCommandExposesBoundedAutoFixFlags(t *testing.T) {
+	command := newReviewCommand(&options{})
+	for _, name := range []string{"auto-fix", "until", "max-iterations", "max-duration", "max-turns", "max-cost-usd", "agent-timeout"} {
+		if command.Flags().Lookup(name) == nil {
+			t.Fatalf("review command is missing --%s", name)
+		}
+	}
+}
+
+func TestAutoFixOnlyFlagsRequireExplicitOptIn(t *testing.T) {
+	command := newReviewCommand(&options{})
+	command.SetArgs([]string{"--until", "minor"})
+	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "requires --auto-fix") {
+		t.Fatalf("auto-fix opt-in error = %v", err)
+	}
+	command = newReviewCommand(&options{})
+	command.SetArgs([]string{"--auto-fix", "--max-iterations", "0"})
+	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "must be positive") {
+		t.Fatalf("auto-fix limit error = %v", err)
+	}
+}
+
+func TestPrintAutoFixLoopShowsStopReasonAndUsage(t *testing.T) {
+	var output bytes.Buffer
+	printAutoFixLoop(&output, model.AutoFixLoop{
+		LoopID: "loop-1", State: model.StateIncomplete, Reason: "equivalent findings repeated",
+		Threshold: "minor", MaxIterations: 5, FinalDiffHash: "1234567890", Elapsed: model.NewDuration(time.Minute),
+		Usage:      model.Usage{Turns: 4, TurnsKnown: true, APIEquivalentCostUSD: 1.25, APIEquivalentCostKnown: true},
+		Iterations: []model.AutoFixIteration{{Number: 1, ReviewRunID: "run-1", ReviewState: model.StateChangesRequested, QualifyingFindingIDs: []string{"f1"}}},
+		RecordPath: "/tmp/loop-1",
+	})
+	text := output.String()
+	for _, want := range []string{"INCOMPLETE AUTO-FIX loop-1", "equivalent findings repeated", "Iterations: 1/5", "provider-turns=4", "$1.2500", "run-1", "/tmp/loop-1"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("auto-fix output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestPrintActiveRunsShowsConcurrentReviewerElapsedTime(t *testing.T) {
 	var output bytes.Buffer
 	printActiveRuns(&output, []model.RunSummary{

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -127,6 +128,44 @@ func ReviewerEnvironment(allowAPIBilling bool) []string {
 		}
 	}
 	return environment
+}
+
+// ReviewerWorkspaceEnvironment redirects common test and build caches into a
+// disposable runtime directory while retaining the minimal authentication
+// environment needed by provider CLIs.
+func ReviewerWorkspaceEnvironment(allowAPIBilling bool, runtimeDir string) []string {
+	environment := ReviewerEnvironment(allowAPIBilling)
+	if strings.TrimSpace(runtimeDir) == "" {
+		return environment
+	}
+	overrides := map[string]string{
+		"TMPDIR": runtimeDir, "TMP": runtimeDir, "TEMP": runtimeDir,
+		"GOTMPDIR": runtimeDir, "GOCACHE": filepath.Join(runtimeDir, "go-build"),
+		"XDG_CACHE_HOME":      filepath.Join(runtimeDir, "cache"),
+		"npm_config_cache":    filepath.Join(runtimeDir, "npm"),
+		"YARN_CACHE_FOLDER":   filepath.Join(runtimeDir, "yarn"),
+		"PYTHONPYCACHEPREFIX": filepath.Join(runtimeDir, "python"),
+	}
+	values := make(map[string]string, len(environment)+len(overrides))
+	for _, entry := range environment {
+		name, value, found := strings.Cut(entry, "=")
+		if found {
+			values[name] = value
+		}
+	}
+	for name, value := range overrides {
+		values[name] = value
+	}
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	result := make([]string, 0, len(names))
+	for _, name := range names {
+		result = append(result, name+"="+values[name])
+	}
+	return result
 }
 
 // MinimalEnvironment returns an environment suitable for an explicitly

@@ -44,6 +44,22 @@ type ProviderQueueRequest struct {
 	Reviewer string
 }
 
+// ProviderQuotaError reports an unexpired provider cooldown shared by all
+// CORA processes for the current user.
+type ProviderQuotaError struct {
+	Provider        string
+	RetryAt         time.Time
+	ProviderMessage string
+}
+
+func (e *ProviderQuotaError) Error() string {
+	message := fmt.Sprintf("provider %s is quota-limited until %s", e.Provider, e.RetryAt.Format(time.RFC3339))
+	if strings.TrimSpace(e.ProviderMessage) != "" {
+		message += ": " + strings.TrimSpace(e.ProviderMessage)
+	}
+	return message
+}
+
 type providerTicket struct {
 	PID        int       `json:"pid"`
 	EnqueuedAt time.Time `json:"enqueued_at"`
@@ -58,7 +74,15 @@ type providerHistoryEntry struct {
 	Reviewer   string    `json:"reviewer,omitempty"`
 }
 
+type providerQuotaRecord struct {
+	Provider        string    `json:"provider"`
+	ProviderMessage string    `json:"provider_error"`
+	RetryAt         time.Time `json:"retry_at"`
+	RecordedAt      time.Time `json:"recorded_at"`
+}
+
 var providerTicketSequence atomic.Uint64
+var providerQuotaSequence atomic.Uint64
 
 const (
 	privateDirMode  os.FileMode = 0o700
@@ -70,10 +94,19 @@ func New(commonDir string) Store {
 }
 
 func (s Store) Create(started time.Time, headSHA string) (Run, error) {
+	return s.createRecord("runs", started, headSHA)
+}
+
+func (s Store) CreateAutoFixLoop(started time.Time, headSHA string) (Run, error) {
+	return s.createRecord("auto-fix", started, headSHA)
+}
+
+func (s Store) createRecord(collection string, started time.Time, headSHA string) (Run, error) {
 	if err := ensurePrivateDir(s.Root); err != nil {
 		return Run{}, fmt.Errorf("secure CORA record directory: %w", err)
 	}
-	if err := ensurePrivateDir(filepath.Join(s.Root, "runs")); err != nil {
+	root := filepath.Join(s.Root, collection)
+	if err := ensurePrivateDir(root); err != nil {
 		return Run{}, fmt.Errorf("create CORA record directory: %w", err)
 	}
 	short := headSHA
@@ -86,7 +119,7 @@ func (s Store) Create(started time.Time, headSHA string) (Run, error) {
 		if attempt > 0 {
 			id = fmt.Sprintf("%s-%02d", baseID, attempt)
 		}
-		path := filepath.Join(s.Root, "runs", id)
+		path := filepath.Join(root, id)
 		if err := os.Mkdir(path, privateDirMode); err == nil {
 			return Run{ID: id, Path: path}, nil
 		} else if !errors.Is(err, os.ErrExist) {
@@ -190,22 +223,38 @@ func AcquireProvider(ctx context.Context, provider string, limit int, onWait fun
 	})
 }
 
+// RecordProviderQuota persists a provider-reported cooldown in the same
+// user-global directory used by the provider concurrency queue.
+func RecordProviderQuota(provider, providerMessage string, retryAt time.Time) error {
+	if retryAt.IsZero() {
+		return errors.New("provider quota retry time must be set")
+	}
+	queueDir, err := providerQueueDirectory(provider)
+	if err != nil {
+		return err
+	}
+	record := providerQuotaRecord{
+		Provider: provider, ProviderMessage: strings.TrimSpace(providerMessage),
+		RetryAt: retryAt, RecordedAt: time.Now().UTC(),
+	}
+	name := fmt.Sprintf("quota-%020d-%d-%06d.json", record.RecordedAt.UnixNano(), os.Getpid(), providerQuotaSequence.Add(1))
+	if err := WriteJSON(filepath.Join(queueDir, name), record); err != nil {
+		return fmt.Errorf("record provider quota: %w", err)
+	}
+	return nil
+}
+
 // AcquireProviderQueued obtains a provider slot in FIFO order and reports a
 // best-effort position and ETA based on recent execution durations.
 func AcquireProviderQueued(ctx context.Context, provider string, limit int, request ProviderQueueRequest, onWait func(model.ProviderQueueStatus)) (ProviderLease, error) {
 	if limit < 1 {
 		return ProviderLease{}, errors.New("provider concurrency limit must be positive")
 	}
-	queueRoot := strings.TrimSpace(os.Getenv("CORA_PROVIDER_QUEUE_DIR"))
-	if queueRoot == "" {
-		cacheDir, err := os.UserCacheDir()
-		if err != nil {
-			return ProviderLease{}, fmt.Errorf("resolve provider queue directory: %w", err)
-		}
-		queueRoot = filepath.Join(cacheDir, "cora", "provider-queue")
+	queueDir, err := providerQueueDirectory(provider)
+	if err != nil {
+		return ProviderLease{}, err
 	}
-	queueDir := filepath.Join(queueRoot, safeComponent(provider))
-	if err := ensurePrivateDir(queueDir); err != nil {
+	if err := providerQuotaGate(queueDir, provider, time.Now()); err != nil {
 		return ProviderLease{}, err
 	}
 	started := time.Now().UTC()
@@ -220,6 +269,9 @@ func AcquireProviderQueued(ctx context.Context, provider string, limit int, requ
 	lastNotice := time.Time{}
 	var estimatedAt *time.Time
 	for {
+		if err := providerQuotaGate(queueDir, provider, time.Now()); err != nil {
+			return ProviderLease{}, err
+		}
 		tickets, err := liveProviderTickets(queueDir)
 		if err != nil {
 			return ProviderLease{}, err
@@ -250,7 +302,7 @@ func AcquireProviderQueued(ctx context.Context, provider string, limit int, requ
 				Active: active, Limit: limit, WaitMS: time.Since(started).Milliseconds(),
 			}
 			if estimate := providerQueueETA(historyPath, status.Position, limit); estimate > 0 {
-				estimatedAt = stableProviderETA(estimatedAt, started.Add(estimate))
+				estimatedAt = fixedProviderETA(estimatedAt, time.Now().UTC(), estimate)
 				eta := *estimatedAt
 				status.ETAAt = &eta
 			}
@@ -267,12 +319,74 @@ func AcquireProviderQueued(ctx context.Context, provider string, limit int, requ
 	}
 }
 
-func stableProviderETA(current *time.Time, candidate time.Time) *time.Time {
-	if current != nil && !candidate.Before(*current) {
+func providerQueueDirectory(provider string) (string, error) {
+	queueRoot := strings.TrimSpace(os.Getenv("CORA_PROVIDER_QUEUE_DIR"))
+	if queueRoot == "" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve provider queue directory: %w", err)
+		}
+		queueRoot = filepath.Join(cacheDir, "cora", "provider-queue")
+	}
+	queueDir := filepath.Join(queueRoot, safeComponent(provider))
+	if err := ensurePrivateDir(queueDir); err != nil {
+		return "", err
+	}
+	return queueDir, nil
+}
+
+func providerQuotaGate(queueDir, provider string, now time.Time) error {
+	entries, err := os.ReadDir(queueDir)
+	if err != nil {
+		return fmt.Errorf("read provider quota directory: %w", err)
+	}
+	var active *providerQuotaRecord
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || (name != "quota.json" && (!strings.HasPrefix(name, "quota-") || !strings.HasSuffix(name, ".json"))) {
+			continue
+		}
+		path := filepath.Join(queueDir, name)
+		var candidate providerQuotaRecord
+		if err := ReadJSON(path, &candidate); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("read provider quota: %w", err)
+		}
+		if !candidate.RetryAt.After(now) {
+			if name != "quota.json" {
+				_ = os.Remove(path)
+			}
+			continue
+		}
+		if active == nil || candidate.RetryAt.After(active.RetryAt) || (candidate.RetryAt.Equal(active.RetryAt) && candidate.RecordedAt.After(active.RecordedAt)) {
+			copy := candidate
+			active = &copy
+		}
+	}
+	if active == nil {
+		return nil
+	}
+	recordedProvider := active.Provider
+	if strings.TrimSpace(recordedProvider) == "" {
+		recordedProvider = provider
+	}
+	return &ProviderQuotaError{
+		Provider: recordedProvider, RetryAt: active.RetryAt,
+		ProviderMessage: active.ProviderMessage,
+	}
+}
+
+// fixedProviderETA chooses one absolute deadline for a queue wait. Subsequent
+// notices keep that deadline, so every display derives a countdown from the
+// same instant instead of repeatedly adding an estimate to the current time.
+func fixedProviderETA(current *time.Time, observedAt time.Time, estimate time.Duration) *time.Time {
+	if current != nil {
 		value := *current
 		return &value
 	}
-	value := candidate
+	value := observedAt.Add(estimate)
 	return &value
 }
 

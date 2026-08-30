@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/herikwebb/cora/internal/autofix"
 	"github.com/herikwebb/cora/internal/config"
 	"github.com/herikwebb/cora/internal/gitx"
 	"github.com/herikwebb/cora/internal/model"
@@ -109,12 +110,45 @@ func newReviewCommand(opts *options) *cobra.Command {
 	var adjudicate bool
 	var strict bool
 	var profiles []string
+	var autoFix bool
+	var until string
+	var maxIterations int
+	var maxDuration time.Duration
+	var maxTurns int
+	var maxCostUSD float64
+	var agentTimeout time.Duration
 	command := &cobra.Command{
 		Use:   "review",
 		Short: "Review changes independently and evaluate consensus",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			ctx := command.Context()
+			autoOnlyFlags := []string{"until", "max-iterations", "max-duration", "max-turns", "max-cost-usd", "agent-timeout"}
+			if !autoFix {
+				for _, name := range autoOnlyFlags {
+					if command.Flags().Changed(name) {
+						return fmt.Errorf("--%s requires --auto-fix", name)
+					}
+				}
+			}
+			if autoFix && (commit != "" || revisionRange != "" || uncommitted || parent != 0) {
+				return errors.New("--auto-fix supports only the checked-out branch target; do not combine it with --commit, --range, --uncommitted, or --parent")
+			}
+			if command.Flags().Changed("max-iterations") && maxIterations < 1 {
+				return errors.New("--max-iterations must be positive")
+			}
+			if command.Flags().Changed("max-duration") && maxDuration <= 0 {
+				return errors.New("--max-duration must be positive")
+			}
+			if command.Flags().Changed("max-turns") && maxTurns < 1 {
+				return errors.New("--max-turns must be positive")
+			}
+			if command.Flags().Changed("max-cost-usd") && maxCostUSD <= 0 {
+				return errors.New("--max-cost-usd must be positive")
+			}
+			if command.Flags().Changed("agent-timeout") && agentTimeout <= 0 {
+				return errors.New("--agent-timeout must be positive")
+			}
 			repo, err := gitx.Discover(ctx, opts.repo)
 			if err != nil {
 				return err
@@ -181,7 +215,28 @@ func newReviewCommand(opts *options) *cobra.Command {
 			if strict {
 				cfg.StrictPolicy = true
 			}
-			target, err = resolve(candidateBase, cfg.RequireCleanTree)
+			if until != "" {
+				cfg.AutoFix.Threshold = strings.ToLower(strings.TrimSpace(until))
+			}
+			if maxIterations > 0 {
+				cfg.AutoFix.MaxIterations = maxIterations
+			}
+			if maxDuration > 0 {
+				cfg.AutoFix.MaxDuration.Duration = maxDuration
+			}
+			if maxTurns > 0 {
+				cfg.AutoFix.MaxTurns = maxTurns
+			}
+			if maxCostUSD > 0 {
+				cfg.AutoFix.MaxCostUSD = maxCostUSD
+			}
+			if agentTimeout > 0 {
+				cfg.AutoFix.AgentTimeout.Duration = agentTimeout
+			}
+			if err := cfg.Validate(); err != nil {
+				return err
+			}
+			target, err = resolve(candidateBase, cfg.RequireCleanTree || autoFix)
 			if err != nil {
 				return err
 			}
@@ -195,6 +250,26 @@ func newReviewCommand(opts *options) *cobra.Command {
 			cfg, err = config.ApplyProfiles(cfg, profiles)
 			if err != nil {
 				return err
+			}
+			if autoFix {
+				loop, err := (autofix.Runner{
+					Reviewer: runner(command), Progress: command.ErrOrStderr(),
+					Version: Version, SourceSHA: SourceSHA, BuildTime: BuildTime,
+				}).Run(ctx, repo, target, cfg)
+				if err != nil {
+					return err
+				}
+				if opts.json {
+					if err := printJSON(loop); err != nil {
+						return err
+					}
+				} else {
+					printAutoFixLoop(command.OutOrStdout(), loop)
+				}
+				if loop.State != model.StateApproved {
+					return stateError{state: loop.State}
+				}
+				return nil
 			}
 			decision, err := runner(command).Run(ctx, repo, target, cfg)
 			if err != nil {
@@ -224,7 +299,38 @@ func newReviewCommand(opts *options) *cobra.Command {
 	command.Flags().BoolVar(&adjudicate, "adjudicate", false, "run a Fable adjudicator when reviewers disagree")
 	command.Flags().BoolVar(&strict, "strict", false, "treat minor findings as blocking and require validation checks")
 	command.Flags().StringSliceVar(&profiles, "profile", nil, "validation profile to run (repeatable; auto detects a built-in profile)")
+	command.Flags().BoolVar(&autoFix, "auto-fix", false, "iteratively launch a coding agent and re-review qualifying findings")
+	command.Flags().StringVar(&until, "until", "", "auto-fix severity threshold: blocker, major, or minor")
+	command.Flags().IntVar(&maxIterations, "max-iterations", 0, "maximum auto-fix review iterations (defaults to configuration)")
+	command.Flags().DurationVar(&maxDuration, "max-duration", 0, "maximum total auto-fix duration (defaults to configuration)")
+	command.Flags().IntVar(&maxTurns, "max-turns", 0, "maximum cumulative provider turns for auto-fix")
+	command.Flags().Float64Var(&maxCostUSD, "max-cost-usd", 0, "maximum cumulative API-equivalent auto-fix cost")
+	command.Flags().DurationVar(&agentTimeout, "agent-timeout", 0, "timeout for each coding-agent attempt")
 	return command
+}
+
+func printAutoFixLoop(writer io.Writer, loop model.AutoFixLoop) {
+	fmt.Fprintf(writer, "%s AUTO-FIX %s\n", strings.ToUpper(loop.State), loop.LoopID)
+	fmt.Fprintf(writer, "Reason: %s\n", loop.Reason)
+	fmt.Fprintf(writer, "Iterations: %d/%d\n", len(loop.Iterations), loop.MaxIterations)
+	fmt.Fprintf(writer, "Threshold: %s\n", loop.Threshold)
+	fmt.Fprintf(writer, "Final diff: %s\n", shortSHA(loop.FinalDiffHash))
+	fmt.Fprintf(writer, "Elapsed: %s\n", formatMilliseconds(loop.Elapsed.Milliseconds()))
+	fmt.Fprintf(writer, "Usage: %s\n", formatUsage(loop.Usage))
+	for _, iteration := range loop.Iterations {
+		fmt.Fprintf(writer, "  iteration %d: review=%s findings=%d run=%s", iteration.Number, iteration.ReviewState, len(iteration.QualifyingFindingIDs), iteration.ReviewRunID)
+		if iteration.Fix != nil {
+			fmt.Fprintf(writer, " fix=%s", iteration.Fix.Status)
+		}
+		fmt.Fprintln(writer)
+	}
+	for _, iteration := range loop.Iterations {
+		if iteration.Fix != nil {
+			fmt.Fprintln(writer, "Working tree: modified by the coding agent; inspect and commit manually.")
+			break
+		}
+	}
+	fmt.Fprintln(writer, "Record:", loop.RecordPath)
 }
 
 func newRetryCommand(opts *options) *cobra.Command {
@@ -527,6 +633,9 @@ func newListCommand(opts *options) *cobra.Command {
 			fmt.Fprintln(command.OutOrStdout(), "RUN                                      STATE               HEAD      ELAPSED   PARENT")
 			for _, summary := range filtered {
 				parent := summary.ParentRunID
+				if parent == "" && summary.AutoFixLoopID != "" {
+					parent = fmt.Sprintf("%s#%d", summary.AutoFixLoopID, summary.AutoFixIteration)
+				}
 				if parent == "" {
 					parent = "-"
 				}
@@ -573,7 +682,8 @@ func loadRunSummary(run record.Run) (model.RunSummary, error) {
 	summary := model.RunSummary{
 		RunID: run.ID, State: "incomplete", StartedAt: manifest.StartedAt, FinishedAt: finished,
 		ElapsedMS: end.Sub(manifest.StartedAt).Milliseconds(), HeadSHA: manifest.Target.HeadSHA,
-		ParentRunID: manifest.ParentRunID, RepositoryIdentity: manifest.RepositoryIdentity, RecordPath: run.Path,
+		ParentRunID: manifest.ParentRunID, AutoFixLoopID: manifest.AutoFixLoopID, AutoFixIteration: manifest.AutoFixIteration,
+		RepositoryIdentity: manifest.RepositoryIdentity, RecordPath: run.Path,
 	}
 	if decision, decisionErr := record.LoadDecision(run); decisionErr == nil {
 		summary.State = decision.State
@@ -720,6 +830,9 @@ func newShowCommand(opts *options) *cobra.Command {
 			printDecision(decision)
 			fmt.Printf("Started:    %s\n", manifest.StartedAt.Local().Format(time.RFC3339))
 			fmt.Printf("Finished:   %s\n", manifest.FinishedAt.Local().Format(time.RFC3339))
+			if manifest.AutoFixLoopID != "" {
+				fmt.Printf("Auto-fix:   %s iteration %d\n", manifest.AutoFixLoopID, manifest.AutoFixIteration)
+			}
 			printConsolidatedDetails(command.OutOrStdout(), decision)
 			allReviewers := append(append([]model.ReviewerResult(nil), manifest.Reviewers...), manifest.CrossExaminations...)
 			for _, reviewer := range allReviewers {
@@ -1037,7 +1150,7 @@ func usageEmpty(usage model.Usage) bool {
 }
 
 func formatUsage(usage model.Usage) string {
-	return fmt.Sprintf("turns=%s thinking=%s api-equivalent=%s", formatTurns(usage), formatThinking(usage), formatCost(usage))
+	return fmt.Sprintf("provider-turns=%s thinking=%s api-equivalent=%s", formatTurns(usage), formatThinking(usage), formatCost(usage))
 }
 
 func formatTurns(usage model.Usage) string {
