@@ -71,7 +71,11 @@ cora review --base upstream/main --adjudicate
 # Treat minor findings as blocking and require at least one validation check.
 cora review --base upstream/main --strict --profile auto --allow-unsafe-checks
 
-# Run built-in Go validation in a disposable worktree. Host execution still
+# Opt into a bounded coding-agent loop. Re-review the full working-tree diff
+# until both reviewers approve with no minor-or-higher findings.
+cora review --base upstream/main --auto-fix --until minor --max-iterations 5
+
+# Run built-in Go validation in a disposable clone. Host execution still
 # requires an explicit trust decision.
 cora review --base upstream/main --profile auto --allow-unsafe-checks
 
@@ -86,10 +90,10 @@ cora show latest --json
 cora verify --head HEAD
 ```
 
-For a commit or range whose head is not currently checked out, CORA creates a
-temporary detached Git worktree at that exact head. Reviewers and local checks
-therefore see the requested source tree, and the worktree is removed when the
-run finishes.
+Each reviewer and local-check phase receives an independent local clone at the
+exact target. Cora removes every remote before execution and discards the clone
+afterward, so generated files and disposable Git changes cannot affect the
+user's checkout or repository refs.
 
 ## Pre-PR loop
 
@@ -111,6 +115,41 @@ gh pr create --repo OWNER/UPSTREAM --base main --head YOUR_FORK:YOUR_BRANCH
 Every iteration gets a new immutable-by-convention run directory; earlier
 feedback remains available. Coding agents can use `--json` plus the documented
 exit codes as their control interface.
+
+## Auto-fix loop
+
+`--auto-fix` is opt-in and operates only on a clean, checked-out feature branch.
+After each review, Cora sends consolidated findings at or above `--until` to a
+separately configured Codex coding agent running in `workspace-write` mode. The
+agent may edit the current working tree, but Cora instructs it not to commit,
+change branches or Git refs, use the network, push, or open a pull request. Cora
+also verifies that `HEAD` did not move before continuing.
+
+Every subsequent review and validation pass uses an exact snapshot of the
+complete working tree against the original merge base, including the branch's
+committed changes, agent edits, and untracked files. Checks still run in a
+disposable materialized clone. Approval requires the ordinary Cora policy,
+all configured reviewers to return `approve`, every required check to pass, and
+no open finding at or above the selected threshold. An adjudicated disagreement
+is therefore insufficient for auto-fix approval.
+
+The loop stops fail-closed on incomplete reviews, abstentions, failed checks,
+agent failures, repeated equivalent findings, unchanged patches, Git-state
+changes, or any configured limit. `--until` accepts `blocker`, `major`, or
+`minor`; it controls which findings the agent attempts and never weakens the
+normal blocking policy. CLI flags can override the trusted-base `[auto_fix]`
+defaults with `--max-iterations`, `--max-duration`, `--max-turns`,
+`--max-cost-usd`, and `--agent-timeout`.
+
+Cora never commits or reverts the agent's edits. Successful and partial edits
+remain in the feature-branch working tree for inspection, correction, and an
+explicit user-created commit.
+
+Review and coding-agent turns plus API-equivalent cost are accumulated across
+the whole loop. Provider CLIs expose final usage only after a process exits, so
+a single in-flight step can cross a turn or cost ceiling; Cora records that step
+and refuses to continue or approve. If the provider does not expose the usage
+needed to enforce a configured ceiling, the loop stops incomplete.
 
 Exit codes are part of the CLI contract:
 
@@ -171,11 +210,26 @@ max_concurrency = 1
 enabled = true
 model = "fable"
 effort = "high"
+# Omit either override to inherit it from [reviewers.claude].
+# max_turns = 40
+# max_budget_usd = 6
 adjudicate_disagreements = false
 security_path_markers = [
   "/.github/workflows/", "/auth/", "/security/", "/crypto/",
   "/iam/", "/permissions/", "/secrets/", "/credentials/", "oauth", "jwt",
 ]
+
+[auto_fix]
+command = "codex"
+model = "gpt-5.6-sol"
+effort = "high"
+until = "major"
+agent_timeout = "20m"
+max_duration = "1h"
+max_iterations = 5
+max_turns = 250
+max_cost_usd = 50
+max_concurrency = 1
 
 [[checks]]
 name = "unit"
@@ -200,7 +254,7 @@ Configured checks execute code from the reviewed tree. Until sandboxed check
 execution is available, CORA refuses to run them unless
 `--allow-unsafe-checks` is passed or `allow_unsafe_host_checks = true` is set.
 Allowed host checks receive a minimal environment with an ephemeral home and
-temporary directory and execute in a disposable detached worktree that is
+temporary directory and execute in a disposable remote-free clone that is
 removed afterward. Add only explicitly required variable names to a check's
 `env_allowlist`; this protects the user's checkout and reduces credential
 exposure, but it is not a filesystem or network sandbox.
@@ -214,10 +268,11 @@ selection is also available. Trusted base configuration can define additional
 `--allow-unsafe-checks` requirement.
 
 When trusted host checks are enabled but no profile was selected, CORA performs
-the same auto-detection automatically. Without permission to execute reviewed
-code, CORA remains read-only and records `validation_status = "not_run"` plus a
-residual risk instead of implying that tests ran. Strict policy fails closed as
-`incomplete` when no validation profile or configured check is available.
+the same auto-detection automatically. Without a configured validation check,
+CORA records `validation_status = "not_run"` plus a residual risk instead of
+implying that reviewer-selected tests provide deterministic validation. Strict
+policy fails closed as `incomplete` when no validation profile or configured
+check is available.
 
 `minimum_approvals = 2` makes the default policy true two-agent consensus. All
 enabled reviewers must complete with full context; a corroborated blocking
@@ -234,6 +289,11 @@ cost ceiling.
 
 Changes to reviewer/control files or paths matching
 `escalation.security_path_markers` use Fable at high effort instead.
+Optional `escalation.max_turns` and `escalation.max_budget_usd` values override
+the corresponding Claude reviewer ceilings for security-sensitive,
+adjudication, and cross-examination passes. Omit an override to inherit the
+ordinary Claude value; set `max_budget_usd = 0` explicitly to remove an
+inherited cost ceiling.
 `--security-sensitive` forces the same behavior when path matching is not
 sufficient. Independently, `cross_examine_blocking_findings = true` sends each
 uncorroborated blocker or major through a targeted Fable/high adversarial pass
@@ -268,32 +328,45 @@ explicit `request_changes` verdicts without a corresponding adjudicable finding
 win; otherwise an abstention requires human adjudication.
 
 For deterministic, subscription-first execution, the Codex adapter requires a
-ChatGPT login, ignores user CLI configuration, and forces a read-only sandbox.
+ChatGPT login, ignores user CLI configuration, and forces a network-disabled
+workspace-write sandbox around its disposable clone.
 On macOS, CORA also discovers the Codex CLI bundled with ChatGPT when `codex`
 is not otherwise available on `PATH`.
 The Claude adapter requires first-party Claude.ai subscription authentication
-and runs in safe plan mode with read-only tools. Common API-key environment
-variables are removed unless `--allow-api-billing` is explicitly passed.
+and runs with safe mode plus Claude's strict Bash sandbox: network access and
+unsandboxed command fallback are denied, source-editing tools are unavailable,
+and sandbox startup failure is terminal. Both reviewers may run focused local
+tests; each gets a private temporary/cache directory for tools such as Go and
+Vitest. Common API-key environment variables are removed unless
+`--allow-api-billing` is explicitly passed.
 
 Provider concurrency uses a user-global FIFO queue across Cora processes and
 repositories. `cora status --active` reports each reviewer's position, number
-ahead, and a best-effort ETA derived from recent executions. Queue wait is
-recorded separately from execution time and does not consume reviewer or
-overall execution timeouts; `queue_timeout` bounds the wait itself. Claude
-defaults to one concurrent request and Codex to two; adjust
+ahead, and a best-effort ETA derived from recent executions. The first estimate
+is stored as an absolute deadline, so subsequent heartbeats count down instead
+of moving the ETA forward. Queue wait is recorded separately from execution
+time and does not consume reviewer or overall execution timeouts;
+`queue_timeout` bounds the wait itself. Claude defaults to one concurrent
+request and Codex to two; adjust
 `max_concurrency` per reviewer when the subscription permits it. Quota failures
-are marked retryable and their reset time is saved when the CLI reports one.
+are marked retryable and their reset time is saved when the CLI reports one. A
+future reset is also shared through the global provider queue, so concurrent
+waiters and later runs return a resumable quota result without invoking the
+provider again before that time.
+
 `cora retry` creates a child run, reuses completed base reviewers and checks,
 and queues only the selected provider. It also recovers reset timestamps from
 older saved Claude errors that predate the structured retry field. `--no-wait`
 returns immediately when a saved reset time is still in the future.
 
 After every reviewer and at the end of a run, CORA prints the effective model,
-effort, turns, thinking tokens, and API-equivalent cost. The normalized values
-are also saved per reviewer and in aggregate in `manifest.json` and
-`decision.json`. Retry records distinguish incremental usage for that attempt
-from cumulative usage across their parent lineage; the compatibility `usage`
-field is cumulative. Claude cost comes from the CLI result envelope; Codex cost is
+effort, provider-reported turns, thinking tokens, and API-equivalent cost. An
+incomplete reviewer line also includes the provider's normalized failure
+immediately. The normalized values are saved per reviewer and checkpointed in
+`manifest.json` as each reviewer finishes, then aggregated in `decision.json`.
+Retry records distinguish incremental usage for that attempt from cumulative
+usage across their parent lineage; the compatibility `usage` field is
+cumulative. Claude cost comes from the CLI result envelope; Codex cost is
 calculated from its reported tokens and the pricing table named by
 `cost_source`. A metric is shown as `n/a` when the installed provider CLI does
 not expose enough telemetry, and mixed-availability totals are labeled
@@ -319,16 +392,22 @@ Run records are stored beneath the repository's Git common directory:
 
 ```text
 .git/cora/runs/<run-id>/
+.git/cora/auto-fix/<loop-id>/
 ```
 
 This keeps local records shared by Git worktrees without adding review output
 to the source tree. Each record includes the canonical patch, exact prompt and
 schema, raw tool logs, normalized reviewer reports, check logs, manifest, event
-stream, and deterministic decision. Publishing signed records to a dedicated
+stream, and deterministic decision. Each auto-fix parent manifest links its
+child review runs and stores every coding-agent prompt, pre/post patch, raw log,
+usage record, limit, and stop reason. Publishing signed records to a dedicated
 Git ref is planned as a separate command.
 
-Each active run updates `heartbeat.json` every 30 seconds and prints elapsed
-time for both the run and running reviewers to stderr. `cora status --active`
+Each active review run and auto-fix parent updates `heartbeat.json` every 30
+seconds. Auto-fix heartbeats include the current iteration, phase, elapsed time,
+and cumulative usage; the invoking terminal prints the same lifecycle progress.
+Ordinary review heartbeats print elapsed time for both the run and running
+reviewers to stderr. `cora status --active`
 shows concurrent runs in one table with reviewer elapsed time and fixed-deadline
 queue ETA countdowns, and `cora list` supports
 state and head-SHA filters. `latest` is resolved by run start time instead of
