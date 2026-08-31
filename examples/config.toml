@@ -33,9 +33,9 @@ finalization_turns = 2
 max_budget_usd = 0
 max_concurrency = 1
 
-# Security-sensitive changes and targeted cross-examination use this Claude
-# model. Set broad adjudication to true only when its additional provider usage
-# is intentional.
+# Security-sensitive changes add a focused pass with this Claude model while
+# retaining the ordinary Opus review. Targeted cross-examination and optional
+# disagreement adjudication also use this model.
 [escalation]
 enabled = true
 model = "fable"
@@ -51,6 +51,13 @@ security_path_markers = [
   "/crypto/", "/cryptography/", "/iam/", "/permissions/",
   "/secrets/", "/credentials/", "oauth", "jwt",
 ]
+
+# Targeted cross-examination has its own smaller Fable budget so it cannot
+# consume the ordinary or focused security-review allowance.
+[cross_examination]
+timeout = "10m"
+max_turns = 20
+max_budget_usd = 5
 
 # Auto-fix remains disabled unless `cora review --auto-fix` is passed. These
 # values configure the write-enabled Codex agent and its cumulative loop limits.

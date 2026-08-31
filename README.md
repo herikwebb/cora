@@ -60,8 +60,8 @@ cora review --range abc123..def456
 # final approval attestation.
 cora review --uncommitted
 
-# Force the security-sensitive escalation policy when paths do not make the
-# risk obvious.
+# Add a targeted Fable/high security pass when paths do not make the risk
+# obvious. The ordinary Opus/high review still runs.
 cora review --base upstream/main --security-sensitive
 
 # Opt into an additional Fable adjudication when the ordinary reviewers
@@ -71,9 +71,12 @@ cora review --base upstream/main --adjudicate
 # Treat minor findings as blocking and require at least one validation check.
 cora review --base upstream/main --strict --profile auto --allow-unsafe-checks
 
-# Opt into a bounded coding-agent loop. Re-review the full working-tree diff
-# until both reviewers approve with no minor-or-higher findings.
+# Opt into a bounded coding-agent loop. Cora reuses only a policy-compatible
+# exact approval, reviews each fix delta, then requires a final full review.
 cora review --base upstream/main --auto-fix --until minor --max-iterations 5
+
+# Continue the same parent loop after a retryable provider quota reset.
+cora review --auto-fix --resume <loop-id>
 
 # Run built-in Go validation in a disposable clone. Host execution still
 # requires an explicit trust decision.
@@ -125,13 +128,19 @@ agent may edit the current working tree, but Cora instructs it not to commit,
 change branches or Git refs, use the network, push, or open a pull request. Cora
 also verifies that `HEAD` did not move before continuing.
 
-Every subsequent review and validation pass uses an exact snapshot of the
-complete working tree against the original merge base, including the branch's
-committed changes, agent edits, and untracked files. Checks still run in a
-disposable materialized clone. Approval requires the ordinary Cora policy,
-all configured reviewers to return `approve`, every required check to pass, and
-no open finding at or above the selected threshold. An adjudicated disagreement
-is therefore insufficient for auto-fix approval.
+When the initial exact diff already has an approval produced under the same
+effective review policy, Cora keeps that approval as an immutable baseline and
+reviews the cumulative coding-agent delta instead of paying to rediscover the
+unchanged code. Baseline compatibility includes strictness, reviewer quorum and
+settings, required security review, and the exact validation checks. A weaker
+or differently configured approval is never reused. Every review uses an exact
+snapshot, and after the delta is approved Cora always performs a fresh full
+review of the complete working tree against the original merge base. That final
+review includes the branch's committed changes, agent edits, and untracked
+files. Checks run in disposable materialized clones. Approval requires the
+ordinary Cora policy, all configured reviewers to return `approve`, every
+required check to pass, and no open finding at or above the selected threshold.
+An adjudicated disagreement is therefore insufficient for auto-fix approval.
 
 The loop stops fail-closed on incomplete reviews, abstentions, failed checks,
 agent failures, repeated equivalent findings, unchanged patches, Git-state
@@ -140,6 +149,15 @@ changes, or any configured limit. `--until` accepts `blocker`, `major`, or
 normal blocking policy. CLI flags can override the trusted-base `[auto_fix]`
 defaults with `--max-iterations`, `--max-duration`, `--max-turns`,
 `--max-cost-usd`, and `--agent-timeout`.
+
+A provider quota failure with a known retry time pauses the parent loop instead
+of discarding it. Cora preserves completed ordinary, security, adjudication,
+cross-examination, and check results by exact-diff lineage and exits with code
+6. Resume it with `cora review --auto-fix --resume <loop-id>` after the reported
+reset. The original effective policy, checks, security classification, reviewer
+settings, and loop limits are recorded with the parent and restored on resume;
+they cannot silently weaken because configuration changed while the loop was
+paused. Paused loops remain visible in `cora status --active`.
 
 Cora never commits or reverts the agent's edits. Successful and partial edits
 remain in the feature-branch working tree for inspection, correction, and an
@@ -160,6 +178,7 @@ Exit codes are part of the CLI contract:
 | 3 | Human decision required |
 | 4 | Review incomplete |
 | 5 | Approval is stale |
+| 6 | Auto-fix paused for a retryable quota reset |
 | 10 | Configuration, Git, or tool failure |
 
 ## Configuration
@@ -218,6 +237,12 @@ security_path_markers = [
   "/.github/workflows/", "/auth/", "/security/", "/crypto/",
   "/iam/", "/permissions/", "/secrets/", "/credentials/", "oauth", "jwt",
 ]
+
+[cross_examination]
+timeout = "10m"
+max_turns = 20
+# Optional hard ceiling passed to Claude Code; 0 disables it.
+max_budget_usd = 5
 
 [auto_fix]
 command = "codex"
@@ -282,27 +307,58 @@ Set `strict = true` or pass `--strict` to add `minor` to the blocking severities
 and require at least one validation check. Notes remain non-blocking.
 
 Claude defaults to Opus at high effort. It reserves its final two turns for a
-structured response; if it nevertheless reaches the turn ceiling, CORA saves
-a partial abstaining report with incomplete context and omitted paths rather
-than discarding all work. `max_budget_usd` can impose an additional Claude Code
-cost ceiling.
+structured response. Both reviewers receive a low-overhead recovery contract:
+after confirming a finding, they checkpoint only when the confirmed evidence
+changes. If a reviewer times out, or Claude reaches its turn ceiling, CORA
+retains any valid provider output or checkpoint as a partial abstaining report
+with incomplete context. Partial evidence remains visible but can never approve
+the run. Recovery files use a randomized private directory separate from the
+temporary and cache directory inherited by repository test processes, and a
+partial-only finding is not promoted into later carried findings.
+`max_budget_usd` can impose an additional Claude Code cost ceiling.
 
 Changes to reviewer/control files or paths matching
-`escalation.security_path_markers` use Fable at high effort instead.
+`escalation.security_path_markers` add a targeted Fable/high security pass;
+they do not replace the ordinary full-diff Opus/high review. The focused pass
+reviews each sensitive path plus only the transitive callers, callees, trust
+boundaries, configuration, and deployment flow needed to establish concrete
+security reachability. Its result, effective model/effort, usage, prompt hash,
+and prompt are recorded separately under `security_reviews` and
+`security-review.prompt.md`.
 Optional `escalation.max_turns` and `escalation.max_budget_usd` values override
-the corresponding Claude reviewer ceilings for security-sensitive,
-adjudication, and cross-examination passes. Omit an override to inherit the
-ordinary Claude value; set `max_budget_usd = 0` explicitly to remove an
-inherited cost ceiling.
+the corresponding Claude reviewer ceilings for targeted security and broad
+adjudication passes. Omit an override to inherit the ordinary Claude
+value; set `max_budget_usd = 0` explicitly to remove an inherited cost ceiling.
 `--security-sensitive` forces the same behavior when path matching is not
-sufficient. Independently, `cross_examine_blocking_findings = true` sends each
+sufficient. This extra pass is required and fails closed on incomplete context,
+abstention, or a blocking finding, but its scoped approval does not count toward
+the ordinary `minimum_approvals` quorum. A finding from this already-targeted
+Fable pass blocks directly and does not trigger a redundant Fable
+cross-examination merely because it has one source. Cora defers a Fable pass
+when an independent completed result already fixes the outcome and the pass
+cannot change it; a potentially disprovable uncorroborated major still receives
+the targeted reachability adjudication it needs.
+
+Independently, `cross_examine_blocking_findings = true` sends each otherwise
 uncorroborated blocker or major through a targeted Fable/high adversarial pass
-when every ordinary reviewer and check completed and the result can still
+when every required reviewer and check completed and the result can still
 change. The cross-examiner must trace the concrete trigger-to-impact path and
 may confirm, demote, or disprove the candidate. Confirmed findings remain open;
 demoted findings retain their effective non-blocking severity; disproved
 findings remain in the audit record but no longer block approval. An incomplete
-cross-examination fails closed.
+cross-examination fails closed. The independent `[cross_examination]` timeout,
+turn ceiling, and cost ceiling keep this targeted phase bounded separately from
+ordinary and security-sensitive Claude reviews.
+
+Findings whose complete provenance is backed by completed reviewers are carried
+forward whenever the base, head, and exact diff hash are unchanged. Later
+reviewers receive those findings as historical evidence, and simple omission
+does not erase them; an explicit cross-examination rejection retires a carried
+finding. Partial-only or mixed partial recovery evidence remains visible in its
+original run but requires fresh confirmation before it can become authoritative.
+Source run IDs are preserved in the normalized finding and manifest;
+`decision.json` records the completed-reviewer-backed continuity set separately
+as `carry_forward_findings`.
 
 Broad disagreement adjudication remains opt-in because it adds the cost of a
 complete third review. Pass `--adjudicate` or set
@@ -352,12 +408,18 @@ request and Codex to two; adjust
 are marked retryable and their reset time is saved when the CLI reports one. A
 future reset is also shared through the global provider queue, so concurrent
 waiters and later runs return a resumable quota result without invoking the
-provider again before that time.
+provider again before that time. Runs waiting for that reset remain visible in
+`cora status --active` as quota-queued work.
 
-`cora retry` creates a child run, reuses completed base reviewers and checks,
-and queues only the selected provider. It also recovers reset timestamps from
-older saved Claude errors that predate the structured retry field. `--no-wait`
-returns immediately when a saved reset time is still in the future.
+`cora retry` creates a child run, walks its exact-diff parent lineage, reuses
+the newest completed result for every unselected reviewer, and queues only the
+selected provider. Targeted `claude-security` results remain distinct from the
+ordinary Claude review and retain their audited model and effort when retried.
+Completed Fable adjudication and cross-examination work is also retained when
+its exact candidate set is unchanged, avoiding another expensive targeted pass.
+It also recovers reset timestamps from older saved Claude errors that predate
+the structured retry field, including hour-only messages such as `resets 4am`.
+`--no-wait` returns immediately when a saved reset time is still in the future.
 
 After every reviewer and at the end of a run, CORA prints the effective model,
 effort, provider-reported turns, thinking tokens, and API-equivalent cost. An
@@ -380,8 +442,10 @@ unsupported model or similar failure.
 Durations in JSON use integer `duration_ms` and `elapsed_ms` fields instead of
 Go's nanosecond representation.
 
-Equivalent findings are consolidated by location and claim similarity for the
-decision and human summary while each original reviewer report remains intact.
+Equivalent findings are consolidated before cross-examination using location,
+claim, evidence, suggested-fix, and reachability similarity, while each
+original reviewer report remains intact. This prevents a severity disagreement
+about the same defect from triggering a redundant Fable pass.
 `cora show` includes consolidated confidence, evidence, suggested fixes, and
 residual risks by default. `cora show --verbose` additionally expands each
 original reviewer report, including omitted paths.
@@ -406,10 +470,14 @@ Git ref is planned as a separate command.
 Each active review run and auto-fix parent updates `heartbeat.json` every 30
 seconds. Auto-fix heartbeats include the current iteration, phase, elapsed time,
 and cumulative usage; the invoking terminal prints the same lifecycle progress.
-Ordinary review heartbeats print elapsed time for both the run and running
-reviewers to stderr. `cora status --active`
+Ordinary reviews record wall elapsed time separately from approximate active
+execution time. Active time is sampled only while work is running, excludes
+provider queues, and discounts long sampling gaps caused by machine sleep;
+records label this basis explicitly. Running-reviewer durations remain labeled
+as wall time. `cora status --active`
 shows concurrent runs in one table with reviewer elapsed time and fixed-deadline
-queue ETA countdowns, and `cora list` supports
+queue ETA countdowns. A passed estimate is displayed as `estimate-exceeded`
+instead of an inaccurate zero. `cora list` supports
 state and head-SHA filters. `latest` is resolved by run start time instead of
 completion order, so concurrent reviews cannot overwrite its meaning.
 
