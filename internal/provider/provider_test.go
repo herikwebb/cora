@@ -42,6 +42,50 @@ func TestCodexReviewArgsUseGenericExecForAuditedPrompt(t *testing.T) {
 	}
 }
 
+func TestPrepareReviewerPromptAddsPrivateLowOverheadCheckpoint(t *testing.T) {
+	runtimeDir := t.TempDir()
+	recoveryDir := t.TempDir()
+	runDir := t.TempDir()
+	prompt, checkpointPath, err := prepareReviewerPrompt(Request{RuntimeDir: runtimeDir, RecoveryDir: recoveryDir}, "claude", "review this")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Only after you confirm at least one finding",
+		"Do not write checkpoints for suspicions or when there are no confirmed findings",
+		checkpointPath,
+		`verdict "abstain" and context_complete false`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("checkpoint prompt does not contain %q:\n%s", want, prompt)
+		}
+	}
+	if info, statErr := os.Stat(checkpointPath); statErr != nil {
+		t.Fatal(statErr)
+	} else if info.Mode().Perm() != 0o600 {
+		t.Fatalf("checkpoint permissions = %#o", info.Mode().Perm())
+	}
+	if filepath.Dir(checkpointPath) != recoveryDir || strings.HasPrefix(checkpointPath, runtimeDir+string(filepath.Separator)) {
+		t.Fatalf("checkpoint %q was not isolated from reviewer runtime %q", checkpointPath, runtimeDir)
+	}
+	if err := persistReviewerPrompt(runDir, "claude", prompt); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(runDir, "claude.effective-prompt.md")
+	contents, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != prompt {
+		t.Fatalf("effective prompt record differs from executed prompt")
+	}
+	if info, err := os.Stat(recordPath); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o600 {
+		t.Fatalf("effective prompt permissions = %#o", info.Mode().Perm())
+	}
+}
+
 func TestClaudeReviewerSettingsRequireStrictSandbox(t *testing.T) {
 	var settings struct {
 		Sandbox struct {
@@ -58,13 +102,13 @@ func TestClaudeReviewerSettingsRequireStrictSandbox(t *testing.T) {
 			} `json:"network"`
 		} `json:"sandbox"`
 	}
-	if err := json.Unmarshal([]byte(claudeReviewerSandboxSettings("/tmp/cora-runtime")), &settings); err != nil {
+	if err := json.Unmarshal([]byte(claudeReviewerSandboxSettings("/tmp/cora-runtime", "/tmp/cora-recovery")), &settings); err != nil {
 		t.Fatal(err)
 	}
 	if !settings.Sandbox.Enabled || !settings.Sandbox.FailIfUnavailable || !settings.Sandbox.AutoAllowBashIfSandboxed || settings.Sandbox.AllowUnsandboxedCommands {
 		t.Fatalf("Claude sandbox settings = %#v", settings.Sandbox)
 	}
-	if !reflect.DeepEqual(settings.Sandbox.Filesystem.AllowWrite, []string{"/tmp/cora-runtime"}) || !reflect.DeepEqual(settings.Sandbox.Network.DeniedDomains, []string{"*"}) || !settings.Sandbox.Network.StrictAllowlist {
+	if !reflect.DeepEqual(settings.Sandbox.Filesystem.AllowWrite, []string{"/tmp/cora-runtime", "/tmp/cora-recovery"}) || !reflect.DeepEqual(settings.Sandbox.Network.DeniedDomains, []string{"*"}) || !settings.Sandbox.Network.StrictAllowlist {
 		t.Fatalf("Claude sandbox boundaries = %#v", settings.Sandbox)
 	}
 }
@@ -180,7 +224,7 @@ func TestAttachPartialClaudeReportPersistsFailClosedEvidence(t *testing.T) {
 		RunDir: directory, Target: model.Target{BaseSHA: "base", HeadSHA: "head"},
 		ChangedPaths: []string{"app.go", "auth.go"},
 	}
-	attachPartialClaudeReport(&result, request)
+	attachPartialReviewerReport(&result, request, nil, "Claude reached its turn ceiling before producing a complete report.")
 	if result.Status != "partial" || result.Report == nil || result.Report.ContextComplete || result.Report.Verdict != "abstain" {
 		t.Fatalf("partial result = %#v", result)
 	}
@@ -195,6 +239,125 @@ func TestAttachPartialClaudeReportPersistsFailClosedEvidence(t *testing.T) {
 	}
 }
 
+func TestAttachPartialReviewerReportRetainsFindingsAndFailsClosed(t *testing.T) {
+	directory := t.TempDir()
+	result := model.ReviewerResult{Reviewer: "codex", Status: "incomplete", Error: "Codex review failed: timed out: context deadline exceeded"}
+	candidate := model.ReviewReport{
+		SchemaVersion: model.SchemaVersion, Verdict: "request_changes", ContextComplete: true,
+		Summary: "One issue was confirmed before interruption.",
+		Findings: []model.Finding{{
+			ID: "resource-leak", Severity: "minor", Confidence: 0.91, File: "app.go", Line: 12,
+			Claim: "The file remains open on the error path.", Evidence: "app.go:12 returns without closing f.", SuggestedFix: "Defer f.Close after opening it.",
+		}},
+		ReviewedPaths: []string{"app.go"}, OmittedPaths: []string{}, ResidualRisks: []string{"The success path was not traced."},
+	}
+	request := Request{
+		RunDir: directory, Target: model.Target{BaseSHA: "base", HeadSHA: "head"},
+		ChangedPaths: []string{"app.go", "auth.go"},
+	}
+	attachPartialReviewerReport(&result, request, &candidate, "Codex review timed out before producing a complete report.")
+	if result.Status != "partial" || result.Report == nil || result.Report.Verdict != "abstain" || result.Report.ContextComplete {
+		t.Fatalf("partial result = %#v", result)
+	}
+	if len(result.Report.Findings) != 1 || result.Report.Findings[0].ID != "resource-leak" {
+		t.Fatalf("partial findings were not retained: %#v", result.Report.Findings)
+	}
+	if !reflect.DeepEqual(result.Report.OmittedPaths, []string{"auth.go"}) {
+		t.Fatalf("partial omitted paths = %v", result.Report.OmittedPaths)
+	}
+	if !containsString(result.Report.ResidualRisks, result.Error) {
+		t.Fatalf("timeout was not recorded as residual risk: %v", result.Report.ResidualRisks)
+	}
+	path := filepath.Join(directory, "codex.partial.json")
+	if info, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o600 {
+		t.Fatalf("partial report permissions = %#o", info.Mode().Perm())
+	}
+}
+
+func TestValidateReportRejectsInvalidNullableFindingEnums(t *testing.T) {
+	report := model.ReviewReport{
+		SchemaVersion: model.SchemaVersion, Verdict: "approve", ContextComplete: true,
+		Findings: []model.Finding{{
+			ID: "minor", Severity: "minor", Confidence: 0.8, File: "app.go", Line: 12,
+			Claim: "resource leak", Evidence: "the error return skips Close", SuggestedFix: "defer Close",
+			Disposition: "invented",
+		}},
+	}
+	if err := validateReport(report); err == nil || !strings.Contains(err.Error(), "invalid disposition") {
+		t.Fatalf("invalid disposition validation error = %v", err)
+	}
+	report.Findings[0].Disposition = ""
+	report.Findings[0].Reachability = &model.Reachability{Status: "invented"}
+	if err := validateReport(report); err == nil || !strings.Contains(err.Error(), "invalid reachability status") {
+		t.Fatalf("invalid reachability validation error = %v", err)
+	}
+}
+
+func TestReadCodexPartialReportUsesLatestStructuredAgentMessage(t *testing.T) {
+	directory := t.TempDir()
+	rawPath := filepath.Join(directory, "codex.raw.json")
+	if err := os.WriteFile(rawPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eventsPath := filepath.Join(directory, "codex.events.jsonl")
+	contents := `{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":\"1\",\"verdict\":\"abstain\",\"context_complete\":false,\"summary\":\"inspection started\",\"findings\":[],\"reviewed_paths\":[],\"omitted_paths\":[\"app.go\"],\"residual_risks\":[]}"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":\"1\",\"verdict\":\"request_changes\",\"context_complete\":false,\"summary\":\"confirmed one issue\",\"findings\":[{\"id\":\"leak\",\"severity\":\"minor\",\"confidence\":0.9,\"file\":\"app.go\",\"line\":12,\"claim\":\"file leak\",\"evidence\":\"error return bypasses close\",\"suggested_fix\":\"defer close\"}],\"reviewed_paths\":[\"app.go\"],\"omitted_paths\":[],\"residual_risks\":[]}"}}
+`
+	if err := os.WriteFile(eventsPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, found := readCodexPartialReport("", rawPath, eventsPath)
+	if !found || report.Summary != "confirmed one issue" || len(report.Findings) != 1 || report.Findings[0].ID != "leak" {
+		t.Fatalf("recovered report = %#v, found=%v", report, found)
+	}
+}
+
+func TestReadCodexPartialReportUsesConfirmedFindingCheckpoint(t *testing.T) {
+	directory := t.TempDir()
+	checkpointPath := filepath.Join(directory, "checkpoint.json")
+	checkpoint := `{
+  "schema_version":"1",
+  "verdict":"abstain",
+  "context_complete":false,
+  "summary":"confirmed one issue",
+  "findings":[{"id":"leak","severity":"minor","confidence":0.9,"file":"app.go","line":12,"claim":"file leak","evidence":"error return bypasses close","suggested_fix":"defer close"}],
+  "reviewed_paths":["app.go"],
+  "omitted_paths":["auth.go"],
+  "residual_risks":[]
+}`
+	if err := os.WriteFile(checkpointPath, []byte(checkpoint), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rawPath := filepath.Join(directory, "raw.json")
+	if err := os.WriteFile(rawPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eventsPath := filepath.Join(directory, "events.jsonl")
+	events := `{"type":"item.completed","item":{"type":"agent_message","text":"{\"schema_version\":\"1\",\"verdict\":\"abstain\",\"context_complete\":false,\"summary\":\"inspection started\",\"findings\":[],\"reviewed_paths\":[],\"omitted_paths\":[\"app.go\",\"auth.go\"],\"residual_risks\":[]}"}}
+`
+	if err := os.WriteFile(eventsPath, []byte(events), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, found := readCodexPartialReport(checkpointPath, rawPath, eventsPath)
+	if !found || len(report.Findings) != 1 || report.Findings[0].ID != "leak" {
+		t.Fatalf("checkpoint report = %#v, found=%v", report, found)
+	}
+}
+
+func TestPartialReportCandidateFallsBackToValidatedCheckpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoint.json")
+	contents := `{"schema_version":"1","verdict":"abstain","context_complete":false,"summary":"confirmed issue","findings":[{"id":"leak","severity":"minor","confidence":0.9,"file":"app.go","line":12,"claim":"file leak","evidence":"return bypasses close","suggested_fix":"defer close"}],"reviewed_paths":["app.go"],"omitted_paths":[],"residual_risks":[]}`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report := partialReportCandidate(model.ReviewReport{}, path)
+	if report == nil || len(report.Findings) != 1 || report.Findings[0].ID != "leak" {
+		t.Fatalf("checkpoint candidate = %#v", report)
+	}
+}
+
 func TestQuotaRetryAtUsesProviderTimezone(t *testing.T) {
 	now := time.Date(2026, 8, 25, 15, 22, 0, 0, time.UTC)
 	retryAt, quota := QuotaRetryAt("You've hit your session limit · resets 11:50am (America/New_York)", now)
@@ -204,6 +367,43 @@ func TestQuotaRetryAtUsesProviderTimezone(t *testing.T) {
 	want := time.Date(2026, 8, 25, 15, 50, 0, 0, time.UTC)
 	if !retryAt.Equal(want) {
 		t.Fatalf("retry at = %s, want %s", retryAt, want)
+	}
+}
+
+func TestQuotaRetryAtParsesHourOnlyReset(t *testing.T) {
+	eastern, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 25, 23, 30, 0, 0, eastern)
+	retryAt, quota := QuotaRetryAt("You've hit your session limit; resets 4am", now)
+	if !quota {
+		t.Fatal("quota failure was not recognized")
+	}
+	want := time.Date(2026, 8, 26, 4, 0, 0, 0, eastern)
+	if !retryAt.Equal(want) {
+		t.Fatalf("retry at = %s, want %s", retryAt, want)
+	}
+}
+
+func TestQuotaRetryAtKeepsLocalHourAcrossDSTBoundary(t *testing.T) {
+	eastern, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 31, 23, 30, 0, 0, eastern)
+	retryAt, quota := QuotaRetryAt("You've hit your session limit; resets 4am", now)
+	want := time.Date(2026, 11, 1, 4, 0, 0, 0, eastern)
+	if !quota || !retryAt.Equal(want) || retryAt.Hour() != 4 {
+		t.Fatalf("DST reset = %s quota=%v, want %s", retryAt, quota, want)
+	}
+}
+
+func TestQuotaRetryAtRejectsInvalidHourOnlyResetTime(t *testing.T) {
+	now := time.Date(2026, 8, 25, 10, 30, 0, 0, time.UTC)
+	retryAt, quota := QuotaRetryAt("You've hit your session limit; resets 25am", now)
+	if !quota || !retryAt.IsZero() {
+		t.Fatalf("invalid reset classification = retryAt %s quota %v", retryAt, quota)
 	}
 }
 
@@ -508,5 +708,44 @@ func TestReadClaudeErrorEnvelopeIncludesProviderError(t *testing.T) {
 	_, err := readClaudeReport(path)
 	if err == nil || err.Error() != "Reached maximum number of turns (20)" {
 		t.Fatalf("unexpected Claude error: %v", err)
+	}
+}
+
+func TestReadClaudeErrorEnvelopeRetainsStructuredReport(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude.json")
+	contents := `{
+  "type": "result",
+  "is_error": true,
+  "terminal_reason": "timeout",
+  "errors": ["review timed out"],
+  "structured_output": {
+    "schema_version": "1",
+    "verdict": "request_changes",
+    "context_complete": false,
+    "summary": "Confirmed one issue before timeout",
+    "findings": [{
+      "id": "leak",
+      "severity": "minor",
+      "confidence": 0.9,
+      "file": "app.go",
+      "line": 12,
+      "claim": "The file remains open on an error path.",
+      "evidence": "The return at app.go:12 bypasses Close.",
+      "suggested_fix": "Defer Close after Open."
+    }],
+    "reviewed_paths": ["app.go"],
+    "omitted_paths": ["auth.go"],
+    "residual_risks": ["auth.go was not inspected"]
+  }
+}`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := readClaudeOutput(path, "opus")
+	if err == nil || err.Error() != "review timed out" {
+		t.Fatalf("unexpected Claude error: %v", err)
+	}
+	if len(output.Report.Findings) != 1 || output.Report.Findings[0].ID != "leak" {
+		t.Fatalf("structured partial report was discarded: %#v", output.Report)
 	}
 }

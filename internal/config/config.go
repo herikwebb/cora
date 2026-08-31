@@ -68,6 +68,12 @@ type Escalation struct {
 	AdjudicateDisagreements bool     `toml:"adjudicate_disagreements"`
 }
 
+type CrossExamination struct {
+	Timeout      Duration `toml:"timeout"`
+	MaxTurns     int      `toml:"max_turns"`
+	MaxBudgetUSD float64  `toml:"max_budget_usd"`
+}
+
 type AutoFix struct {
 	Command        string   `toml:"command"`
 	Model          string   `toml:"model"`
@@ -96,6 +102,7 @@ type Config struct {
 	PromptFile                   string              `toml:"prompt_file"`
 	Reviewers                    Reviewers           `toml:"reviewers"`
 	Escalation                   Escalation          `toml:"escalation"`
+	CrossExamination             CrossExamination    `toml:"cross_examination"`
 	AutoFix                      AutoFix             `toml:"auto_fix"`
 	Checks                       []Check             `toml:"checks"`
 	ValidationProfiles           []ValidationProfile `toml:"validation_profiles"`
@@ -143,6 +150,9 @@ func Defaults() Config {
 				"/crypto/", "/cryptography/", "/iam/", "/permissions/",
 				"/secrets/", "/credentials/", "oauth", "jwt",
 			},
+		},
+		CrossExamination: CrossExamination{
+			Timeout: Duration{Duration: 10 * time.Minute}, MaxTurns: 20, MaxBudgetUSD: 5,
 		},
 		AutoFix: AutoFix{
 			Command: "codex", Model: "gpt-5.6-sol", Effort: "high", Threshold: "major",
@@ -322,6 +332,15 @@ func (c Config) Validate() error {
 		if c.Escalation.MaxBudgetUSD != nil && *c.Escalation.MaxBudgetUSD < 0 {
 			return errors.New("escalation.max_budget_usd cannot be negative")
 		}
+	}
+	if c.CrossExamination.Timeout.Duration <= 0 {
+		return errors.New("cross_examination.timeout must be positive")
+	}
+	if c.CrossExamination.MaxTurns <= c.Reviewers.Claude.FinalizationTurns {
+		return errors.New("cross_examination.max_turns must be greater than reviewers.claude.finalization_turns")
+	}
+	if c.CrossExamination.MaxBudgetUSD < 0 {
+		return errors.New("cross_examination.max_budget_usd cannot be negative")
 	}
 	if strings.TrimSpace(c.AutoFix.Command) == "" {
 		return errors.New("auto_fix.command cannot be empty")

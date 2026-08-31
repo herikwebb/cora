@@ -24,6 +24,7 @@ type Request struct {
 	RepoRoot        string
 	WorkDir         string
 	RuntimeDir      string
+	RecoveryDir     string
 	Target          model.Target
 	RunDir          string
 	SchemaPath      string
@@ -151,6 +152,17 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
+	effectivePrompt, checkpointPath, err := prepareReviewerPrompt(request, result.Reviewer, request.Prompt)
+	if err != nil {
+		result.Error = "prepare Codex recovery checkpoint: " + err.Error()
+		result.Duration = model.NewDuration(time.Since(started))
+		return result
+	}
+	if err := persistReviewerPrompt(request.RunDir, result.Reviewer, effectivePrompt); err != nil {
+		result.Error = "persist effective Codex prompt: " + err.Error()
+		result.Duration = model.NewDuration(time.Since(started))
+		return result
+	}
 	args := codexReviewArgs(c.Config, request, rawPath)
 	stderrPath := filepath.Join(request.RunDir, "codex.stderr.log")
 
@@ -160,7 +172,7 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 		Command:    path,
 		Args:       args,
 		Dir:        request.WorkDir,
-		Stdin:      []byte(request.Prompt),
+		Stdin:      []byte(effectivePrompt),
 		Env:        env,
 		StdoutPath: eventsPath,
 		StderrPath: stderrPath,
@@ -174,6 +186,15 @@ func (c Codex) Review(parent context.Context, request Request) model.ReviewerRes
 	if processResult.Err != nil {
 		result.Error = "Codex review failed: " + codexFailure(eventsPath, stderrPath, processResult.Err)
 		classifyFailure(&result, time.Now())
+		if errors.Is(processResult.Err, context.DeadlineExceeded) {
+			result.FailureKind = "timeout"
+			partial, found := readCodexPartialReport(checkpointPath, rawPath, eventsPath)
+			if found {
+				attachPartialReviewerReport(&result, request, &partial, "Codex review timed out before producing a complete report.")
+			} else {
+				attachPartialReviewerReport(&result, request, nil, "Codex review timed out before producing a complete report.")
+			}
+		}
 		return result
 	}
 	report, err := readReport(rawPath)
@@ -208,6 +229,9 @@ func codexReviewArgs(cfg config.Reviewer, request Request, rawPath string) []str
 	if request.RuntimeDir != "" {
 		args = append(args, "--add-dir", request.RuntimeDir)
 	}
+	if request.RecoveryDir != "" {
+		args = append(args, "--add-dir", request.RecoveryDir)
+	}
 	if cfg.Model != "" {
 		args = append(args, "--model", cfg.Model)
 	}
@@ -221,6 +245,46 @@ func codexReviewArgs(cfg config.Reviewer, request Request, rawPath string) []str
 		"-",
 	)
 	return args
+}
+
+func prepareReviewerPrompt(request Request, reviewer, prompt string) (string, string, error) {
+	if strings.TrimSpace(request.RecoveryDir) == "" {
+		return prompt, "", nil
+	}
+	checkpoint, err := os.CreateTemp(request.RecoveryDir, fileStem(reviewer)+"-*.partial-checkpoint.json")
+	if err != nil {
+		return "", "", err
+	}
+	checkpointPath := checkpoint.Name()
+	if err := checkpoint.Chmod(0o600); err != nil {
+		_ = checkpoint.Close()
+		_ = os.Remove(checkpointPath)
+		return "", "", err
+	}
+	if err := checkpoint.Close(); err != nil {
+		_ = os.Remove(checkpointPath)
+		return "", "", err
+	}
+	contract := fmt.Sprintf(`
+
+CORA interruption-recovery checkpoint contract:
+- Only after you confirm at least one finding, overwrite %s with a best-effort report using the exact supplied JSON schema.
+- A checkpoint must use verdict "abstain" and context_complete false. Include every confirmed finding so far, plus the reviewed_paths, omitted_paths, and residual_risks known at that point.
+- Update the checkpoint only when the set or substance of confirmed findings changes. Do not write checkpoints for suspicions or when there are no confirmed findings.
+- The checkpoint is recovery-only. Continue the review and return a fresh, complete structured report normally.
+`, strconv.Quote(checkpointPath))
+	return prompt + contract, checkpointPath, nil
+}
+
+func persistReviewerPrompt(runDir, reviewer, prompt string) error {
+	if strings.TrimSpace(runDir) == "" {
+		return nil
+	}
+	path := filepath.Join(runDir, fileStem(reviewer)+".effective-prompt.md")
+	if err := preparePrivateFile(path); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(prompt), 0o600)
 }
 
 func RunCodexFix(parent context.Context, cfg config.AutoFix, request FixRequest) model.AutoFixAttempt {
@@ -317,10 +381,17 @@ type Claude struct {
 	EscalationCause string
 }
 
-func claudeReviewerSandboxSettings(runtimeDir string) string {
+func claudeReviewerSandboxSettings(runtimeDir, recoveryDir string) string {
 	filesystem := map[string]any{}
+	var writable []string
 	if runtimeDir != "" {
-		filesystem["allowWrite"] = []string{runtimeDir}
+		writable = append(writable, runtimeDir)
+	}
+	if recoveryDir != "" {
+		writable = append(writable, recoveryDir)
+	}
+	if len(writable) > 0 {
+		filesystem["allowWrite"] = writable
 	}
 	settings := map[string]any{
 		"sandbox": map[string]any{
@@ -401,12 +472,24 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
+	effectivePrompt, checkpointPath, err := prepareReviewerPrompt(request, result.Reviewer, request.Prompt)
+	if err != nil {
+		result.Error = "prepare Claude recovery checkpoint: " + err.Error()
+		result.Duration = model.NewDuration(time.Since(started))
+		return result
+	}
+	effectivePrompt = claudePrompt(effectivePrompt, c.Config)
+	if err := persistReviewerPrompt(request.RunDir, result.Reviewer, effectivePrompt); err != nil {
+		result.Error = "persist effective Claude prompt: " + err.Error()
+		result.Duration = model.NewDuration(time.Since(started))
+		return result
+	}
 	args := []string{
 		"-p",
 		"--safe-mode",
 		"--permission-mode", "dontAsk",
 		"--tools", "Read,Glob,Grep,Bash",
-		"--settings", claudeReviewerSandboxSettings(request.RuntimeDir),
+		"--settings", claudeReviewerSandboxSettings(request.RuntimeDir, request.RecoveryDir),
 		"--append-system-prompt", request.Policy,
 		"--max-turns", strconv.Itoa(c.Config.MaxTurns),
 		"--no-session-persistence",
@@ -422,7 +505,7 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	if c.Config.Effort != "" {
 		args = append(args, "--effort", c.Config.Effort)
 	}
-	args = append(args, claudePrompt(request.Prompt, c.Config))
+	args = append(args, effectivePrompt)
 
 	rawPath := filepath.Join(request.RunDir, fileStem(c.Name())+".raw.json")
 	stderrPath := filepath.Join(request.RunDir, fileStem(c.Name())+".stderr.log")
@@ -443,8 +526,11 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	if processResult.Err != nil {
 		result.Error = "Claude review failed: " + claudeFailure(rawPath, stderrPath, processResult.Err)
 		classifyFailure(&result, time.Now())
-		if claudeReachedMaxTurns(rawPath, result.Error) {
-			attachPartialClaudeReport(&result, request)
+		if errors.Is(processResult.Err, context.DeadlineExceeded) {
+			result.FailureKind = "timeout"
+			attachPartialReviewerReport(&result, request, partialReportCandidate(parsed.Report, checkpointPath), "Claude review timed out before producing a complete report.")
+		} else if claudeReachedMaxTurns(rawPath, result.Error) {
+			attachPartialReviewerReport(&result, request, partialReportCandidate(parsed.Report, checkpointPath), "Claude reached its turn ceiling before producing a complete report.")
 		}
 		return result
 	}
@@ -452,7 +538,7 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 		result.Error = "parse Claude report: " + parseErr.Error()
 		classifyFailure(&result, time.Now())
 		if claudeReachedMaxTurns(rawPath, result.Error) {
-			attachPartialClaudeReport(&result, request)
+			attachPartialReviewerReport(&result, request, partialReportCandidate(parsed.Report, checkpointPath), "Claude reached its turn ceiling before producing a complete report.")
 		}
 		return result
 	}
@@ -499,19 +585,66 @@ func claudeReachedMaxTurns(path, message string) bool {
 	return strings.Contains(terminal, "max_turns") || strings.Contains(terminal, "max turns")
 }
 
-func attachPartialClaudeReport(result *model.ReviewerResult, request Request) {
+func usablePartialReport(report model.ReviewReport) *model.ReviewReport {
+	if validateReport(report) != nil {
+		return nil
+	}
+	return &report
+}
+
+func partialReportCandidate(providerReport model.ReviewReport, checkpointPath string) *model.ReviewReport {
+	if report := usablePartialReport(providerReport); report != nil {
+		return report
+	}
+	if report, found := readValidatedReport(checkpointPath); found {
+		return &report
+	}
+	return nil
+}
+
+// attachPartialReviewerReport preserves any valid structured evidence emitted
+// before a reviewer was interrupted, while forcing the result to remain
+// fail-closed. A partial report can inform the user, but can never contribute
+// an approval or claim complete coverage.
+func attachPartialReviewerReport(result *model.ReviewerResult, request Request, candidate *model.ReviewReport, reason string) {
 	report := model.ReviewReport{
-		SchemaVersion:   model.SchemaVersion,
-		Reviewer:        result.Reviewer,
-		BaseSHA:         request.Target.BaseSHA,
-		HeadSHA:         request.Target.HeadSHA,
-		Verdict:         "abstain",
-		ContextComplete: false,
-		Summary:         "Claude reached its turn ceiling before producing a complete structured review.",
-		Findings:        []model.Finding{},
-		ReviewedPaths:   []string{},
-		OmittedPaths:    append([]string(nil), request.ChangedPaths...),
-		ResidualRisks:   []string{result.Error},
+		SchemaVersion: model.SchemaVersion,
+		Findings:      []model.Finding{},
+		ReviewedPaths: []string{},
+		OmittedPaths:  []string{},
+		ResidualRisks: []string{},
+	}
+	if candidate != nil && validateReport(*candidate) == nil {
+		report = *candidate
+		report.Findings = append([]model.Finding(nil), candidate.Findings...)
+		report.ReviewedPaths = append([]string(nil), candidate.ReviewedPaths...)
+		report.OmittedPaths = append([]string(nil), candidate.OmittedPaths...)
+		report.ResidualRisks = append([]string(nil), candidate.ResidualRisks...)
+	}
+	attachTarget(&report, result.Reviewer, request.Target)
+	report.Verdict = "abstain"
+	report.ContextComplete = false
+	if strings.TrimSpace(report.Summary) == "" {
+		report.Summary = reason
+	} else {
+		report.Summary = strings.TrimSpace(report.Summary) + " (Partial report; review did not complete.)"
+	}
+	reviewed := make(map[string]bool, len(report.ReviewedPaths))
+	for _, path := range report.ReviewedPaths {
+		reviewed[path] = true
+	}
+	omitted := make(map[string]bool, len(report.OmittedPaths)+len(request.ChangedPaths))
+	for _, path := range report.OmittedPaths {
+		omitted[path] = true
+	}
+	for _, path := range request.ChangedPaths {
+		if !reviewed[path] && !omitted[path] {
+			report.OmittedPaths = append(report.OmittedPaths, path)
+			omitted[path] = true
+		}
+	}
+	if strings.TrimSpace(result.Error) != "" && !containsString(report.ResidualRisks, result.Error) {
+		report.ResidualRisks = append(report.ResidualRisks, result.Error)
 	}
 	result.Status = "partial"
 	result.Report = &report
@@ -525,8 +658,17 @@ func attachPartialClaudeReport(result *model.ReviewerResult, request Request) {
 	}
 }
 
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 var (
-	quotaResetPattern    = regexp.MustCompile(`(?i)reset(?:s)?(?:\s+at)?\s+(\d{1,2}):(\d{2})\s*(am|pm)`)
+	quotaResetPattern    = regexp.MustCompile(`(?i)\breset(?:s)?(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b`)
 	quotaTimezonePattern = regexp.MustCompile(`\(([A-Za-z][A-Za-z0-9_+\-/]+(?:/[A-Za-z0-9_+\-]+)+)\)`)
 	easternTimePattern   = regexp.MustCompile(`(?i)\bET\b`)
 )
@@ -547,6 +689,74 @@ func classifyFailure(result *model.ReviewerResult, now time.Time) {
 	if !retryAt.IsZero() {
 		result.RetryAt = &retryAt
 	}
+}
+
+// readCodexPartialReport returns the latest valid structured report Codex
+// emitted before termination. Codex mirrors agent messages to its JSONL event
+// stream before output-last-message is finalized, so the event stream is an
+// important recovery source when a timeout interrupts CLI shutdown.
+func readCodexPartialReport(checkpointPath, rawPath, eventsPath string) (model.ReviewReport, bool) {
+	var latest model.ReviewReport
+	found := false
+	file, err := os.Open(eventsPath)
+	if err == nil {
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+			var event struct {
+				Type string `json:"type"`
+				Item struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"item"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &event) != nil || event.Type != "item.completed" || event.Item.Type != "agent_message" {
+				continue
+			}
+			report, parseErr := parseStructuredReportText(event.Item.Text)
+			if parseErr == nil && validateReport(report) == nil {
+				latest, found = report, true
+			}
+		}
+	}
+	// The private recovery checkpoint is written after a finding changes, so it is newer
+	// than any earlier progress message and survives until the provider returns.
+	if report, checkpointFound := readValidatedReport(checkpointPath); checkpointFound {
+		latest, found = report, true
+	}
+	// A finalized output file is newer and more authoritative than a mirrored
+	// event message or checkpoint when it survived termination.
+	if report, rawFound := readValidatedReport(rawPath); rawFound {
+		latest, found = report, true
+	}
+	return latest, found
+}
+
+func readValidatedReport(path string) (model.ReviewReport, bool) {
+	if strings.TrimSpace(path) == "" {
+		return model.ReviewReport{}, false
+	}
+	report, err := readReport(path)
+	if err != nil || validateReport(report) != nil {
+		return model.ReviewReport{}, false
+	}
+	return report, true
+}
+
+func parseStructuredReportText(value string) (model.ReviewReport, error) {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "```") && strings.HasSuffix(value, "```") {
+		lines := strings.Split(value, "\n")
+		if len(lines) >= 3 {
+			value = strings.TrimSpace(strings.Join(lines[1:len(lines)-1], "\n"))
+		}
+	}
+	var report model.ReviewReport
+	if err := json.Unmarshal([]byte(value), &report); err != nil {
+		return model.ReviewReport{}, err
+	}
+	return report, nil
 }
 
 func codexFailure(eventsPath, stderrPath string, processErr error) string {
@@ -606,7 +816,13 @@ func QuotaRetryAt(message string, observedAt time.Time) (time.Time, bool) {
 		return time.Time{}, true
 	}
 	hour, _ := strconv.Atoi(match[1])
-	minute, _ := strconv.Atoi(match[2])
+	minute := 0
+	if match[2] != "" {
+		minute, _ = strconv.Atoi(match[2])
+	}
+	if hour < 1 || hour > 12 || minute < 0 || minute > 59 {
+		return time.Time{}, true
+	}
 	if strings.EqualFold(match[3], "pm") && hour != 12 {
 		hour += 12
 	}
@@ -626,7 +842,9 @@ func QuotaRetryAt(message string, observedAt time.Time) (time.Time, bool) {
 	localObservedAt := observedAt.In(location)
 	retryAt := time.Date(localObservedAt.Year(), localObservedAt.Month(), localObservedAt.Day(), hour, minute, 0, 0, location)
 	if !retryAt.After(observedAt) {
-		retryAt = retryAt.Add(24 * time.Hour)
+		// Preserve the provider's displayed local wall-clock time across a DST
+		// transition; adding 24 hours can turn a promised 4am reset into 3am/5am.
+		retryAt = retryAt.AddDate(0, 0, 1)
 	}
 	return retryAt, true
 }
@@ -733,21 +951,24 @@ func readClaudeOutput(path, fallbackModel string) (claudeOutput, error) {
 	}
 	telemetry := claudeTelemetry(contents, fallbackModel)
 	if err := json.Unmarshal(contents, &envelope); err == nil && (envelope.Type != "" || envelope.IsError || len(envelope.StructuredOutput) > 0 || envelope.Result != "") {
-		if envelope.IsError {
-			return claudeOutput{Telemetry: telemetry}, errors.New(firstNonEmpty(strings.Join(envelope.Errors, "; "), envelope.Result, envelope.TerminalReason, envelope.Subtype, "Claude returned an error result"))
-		}
-		if len(envelope.StructuredOutput) > 0 && string(envelope.StructuredOutput) != "null" {
-			var report model.ReviewReport
-			if err := json.Unmarshal(envelope.StructuredOutput, &report); err != nil {
-				return claudeOutput{Telemetry: telemetry}, err
-			}
-			return claudeOutput{Report: report, Telemetry: telemetry}, nil
-		}
 		var report model.ReviewReport
-		if err := json.Unmarshal([]byte(envelope.Result), &report); err != nil {
-			return claudeOutput{Telemetry: telemetry}, err
+		var reportErr error
+		if len(envelope.StructuredOutput) > 0 && string(envelope.StructuredOutput) != "null" {
+			reportErr = json.Unmarshal(envelope.StructuredOutput, &report)
+		} else if strings.TrimSpace(envelope.Result) != "" {
+			reportErr = json.Unmarshal([]byte(envelope.Result), &report)
 		}
-		return claudeOutput{Report: report, Telemetry: telemetry}, nil
+		output := claudeOutput{Report: report, Telemetry: telemetry}
+		if envelope.IsError {
+			return output, errors.New(firstNonEmpty(strings.Join(envelope.Errors, "; "), envelope.Result, envelope.TerminalReason, envelope.Subtype, "Claude returned an error result"))
+		}
+		if reportErr != nil {
+			return output, reportErr
+		}
+		if len(envelope.StructuredOutput) == 0 && strings.TrimSpace(envelope.Result) == "" {
+			return output, errors.New("Claude result did not contain a structured report")
+		}
+		return output, nil
 	}
 	var report model.ReviewReport
 	if err := json.Unmarshal(contents, &report); err != nil {
@@ -1160,6 +1381,18 @@ func validateReport(report model.ReviewReport) error {
 		}
 		if strings.TrimSpace(finding.ID) == "" || strings.TrimSpace(finding.Claim) == "" || strings.TrimSpace(finding.Evidence) == "" {
 			return fmt.Errorf("finding %d is missing required evidence", i)
+		}
+		switch finding.Disposition {
+		case "", "confirmed", "demoted", "disproved", "uncertain":
+		default:
+			return fmt.Errorf("finding %d has invalid disposition %q", i, finding.Disposition)
+		}
+		if finding.Reachability != nil {
+			switch finding.Reachability.Status {
+			case "demonstrated", "not_demonstrated", "uncertain":
+			default:
+				return fmt.Errorf("finding %d has invalid reachability status %q", i, finding.Reachability.Status)
+			}
 		}
 		if finding.Severity == "blocker" || finding.Severity == "major" {
 			if finding.Reachability == nil || finding.Reachability.Status != "demonstrated" || strings.TrimSpace(finding.Reachability.Trigger) == "" || len(finding.Reachability.Path) == 0 || strings.TrimSpace(finding.Reachability.Impact) == "" {

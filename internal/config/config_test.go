@@ -3,10 +3,35 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestApplyReviewPolicyRoundTripsEffectiveConfiguration(t *testing.T) {
+	cfg := Defaults()
+	cfg.StrictPolicy = true
+	cfg.AllowUnsafeChecks = true
+	cfg.Escalation.ForceSecuritySensitive = true
+	cfg.Escalation.AdjudicateDisagreements = true
+	cfg.Checks = []Check{{
+		Name: "go-test", Command: []string{"go", "test", "./..."}, Timeout: Duration{Duration: 7 * time.Minute},
+		EnvAllowlist: []string{"GONOSUMDB"}, Profile: "go",
+	}}
+	policy := SnapshotReviewPolicy(cfg)
+
+	restored, err := ApplyReviewPolicy(Defaults(), policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := SnapshotReviewPolicy(restored); !reflect.DeepEqual(got, policy) {
+		t.Fatalf("restored policy = %#v, want %#v", got, policy)
+	}
+	if restored.ValidationProfiles != nil {
+		t.Fatalf("restored policy retained unexpanded profiles: %#v", restored.ValidationProfiles)
+	}
+}
 
 func TestLoadLayersDefaultsUserAndRepository(t *testing.T) {
 	home := t.TempDir()
@@ -63,7 +88,7 @@ command = ["go", "test", "./..."]
 	}
 }
 
-func TestDefaultsUseHighEffortClaudeOpusAndFableEscalation(t *testing.T) {
+func TestDefaultsUseHighEffortClaudeOpusAndTargetedFable(t *testing.T) {
 	cfg := Defaults()
 	if cfg.Reviewers.Codex.Model != "gpt-5.6-sol" || cfg.Reviewers.Codex.Effort != "high" {
 		t.Fatalf("Codex defaults = model %q effort %q", cfg.Reviewers.Codex.Model, cfg.Reviewers.Codex.Effort)
@@ -88,6 +113,9 @@ func TestDefaultsUseHighEffortClaudeOpusAndFableEscalation(t *testing.T) {
 	}
 	if !cfg.CrossExamineBlockingFindings {
 		t.Fatal("targeted blocking-finding cross-examination should default on")
+	}
+	if cfg.CrossExamination.MaxTurns != 20 || cfg.CrossExamination.MaxBudgetUSD != 5 || cfg.CrossExamination.Timeout.Duration != 10*time.Minute {
+		t.Fatalf("cross-examination defaults = %#v", cfg.CrossExamination)
 	}
 	if cfg.AutoFix.Command != "codex" || cfg.AutoFix.Model != "gpt-5.6-sol" || cfg.AutoFix.Effort != "high" || cfg.AutoFix.Threshold != "major" {
 		t.Fatalf("auto-fix defaults = %#v", cfg.AutoFix)
@@ -143,6 +171,39 @@ func TestValidateEscalationLimitOverrides(t *testing.T) {
 	maxTurns = 0
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "escalation.max_turns must be positive") {
 		t.Fatalf("cross-examination must validate escalation limits even when broad escalation is disabled: %v", err)
+	}
+}
+
+func TestApplyRepositoryDecodesIndependentCrossExaminationBudget(t *testing.T) {
+	cfg, err := ApplyRepository(Defaults(), ".cora/config.toml", []byte(`
+[cross_examination]
+timeout = "8m"
+max_turns = 16
+max_budget_usd = 3.5
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CrossExamination.Timeout.Duration != 8*time.Minute || cfg.CrossExamination.MaxTurns != 16 || cfg.CrossExamination.MaxBudgetUSD != 3.5 {
+		t.Fatalf("cross-examination budget = %#v", cfg.CrossExamination)
+	}
+}
+
+func TestValidateRejectsInvalidCrossExaminationBudget(t *testing.T) {
+	cfg := Defaults()
+	cfg.CrossExamination.MaxTurns = cfg.Reviewers.Claude.FinalizationTurns
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cross_examination.max_turns") {
+		t.Fatalf("cross-examination turn limit error = %v", err)
+	}
+	cfg = Defaults()
+	cfg.CrossExamination.MaxBudgetUSD = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cross_examination.max_budget_usd") {
+		t.Fatalf("cross-examination budget error = %v", err)
+	}
+	cfg = Defaults()
+	cfg.CrossExamination.Timeout.Duration = 0
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cross_examination.timeout") {
+		t.Fatalf("cross-examination timeout error = %v", err)
 	}
 }
 

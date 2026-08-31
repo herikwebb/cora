@@ -3,6 +3,8 @@ package record
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +26,26 @@ type Store struct {
 type Run struct {
 	ID   string
 	Path string
+}
+
+// ReviewerLineage is the reusable reviewer state recovered from an exact-diff
+// retry chain. Security reviews are kept separate because the orchestrator
+// executes them as a targeted pass rather than as ordinary consensus input.
+type ReviewerLineage struct {
+	Reviewers             []model.ReviewerResult
+	SecurityReviews       []model.ReviewerResult
+	LatestReviewers       []model.ReviewerResult
+	LatestSecurityReviews []model.ReviewerResult
+}
+
+// ApprovedBaseline is a completed full-diff approval that can anchor a
+// narrower auto-fix delta review. Its decision and canonical patch remain
+// bound to the immutable exact target recorded by the original run.
+type ApprovedBaseline struct {
+	Run      Run
+	Decision model.Decision
+	Manifest model.Manifest
+	Patch    []byte
 }
 
 type Lock struct {
@@ -198,6 +220,27 @@ func (s Store) Resolve(id string) (Run, error) {
 	}
 	if !info.IsDir() {
 		return Run{}, fmt.Errorf("run record is not a directory: %s", id)
+	}
+	return Run{ID: id, Path: path}, nil
+}
+
+// ResolveAutoFix resolves a parent loop record without falling back to the
+// ordinary review collection. It is the entry point used by an explicit
+// resume command after a retryable quota pause.
+func (s Store) ResolveAutoFix(id string) (Run, error) {
+	if id == "" || filepath.Base(id) != id {
+		return Run{}, errors.New("invalid auto-fix loop ID")
+	}
+	path := filepath.Join(s.Root, "auto-fix", id)
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Run{}, fmt.Errorf("auto-fix loop not found: %s", id)
+		}
+		return Run{}, err
+	}
+	if !info.IsDir() {
+		return Run{}, fmt.Errorf("auto-fix loop record is not a directory: %s", id)
 	}
 	return Run{ID: id, Path: path}, nil
 }
@@ -499,13 +542,15 @@ func providerQueueETA(historyPath string, position, limit int) time.Duration {
 	if len(durations) == 0 {
 		return 0
 	}
-	var total time.Duration
-	for _, duration := range durations {
-		total += duration
+	// The median keeps a single machine sleep or unusually slow provider call
+	// from making every subsequent queue estimate look hours long.
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	median := durations[len(durations)/2]
+	if len(durations)%2 == 0 {
+		median = (durations[len(durations)/2-1] + median) / 2
 	}
-	average := total / time.Duration(len(durations))
 	waves := (max(position, 1) + limit - 1) / limit
-	return time.Duration(waves) * average
+	return time.Duration(waves) * median
 }
 
 func (l ProviderLease) Release() error {
@@ -558,7 +603,18 @@ func safeComponent(value string) string {
 }
 
 func (s Store) Runs() ([]Run, error) {
-	entries, err := os.ReadDir(filepath.Join(s.Root, "runs"))
+	return s.records("runs")
+}
+
+// AutoFixLoops returns parent loop records newest first. Review child runs are
+// kept in Runs; callers can combine the two views without relying on `latest`.
+func (s Store) AutoFixLoops() ([]Run, error) {
+	return s.records("auto-fix")
+}
+
+func (s Store) records(collection string) ([]Run, error) {
+	root := filepath.Join(s.Root, collection)
+	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -568,11 +624,328 @@ func (s Store) Runs() ([]Run, error) {
 	runs := make([]Run, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
-			runs = append(runs, Run{ID: entry.Name(), Path: filepath.Join(s.Root, "runs", entry.Name())})
+			runs = append(runs, Run{ID: entry.Name(), Path: filepath.Join(root, entry.Name())})
 		}
 	}
 	sort.Slice(runs, func(i, j int) bool { return runs[i].ID > runs[j].ID })
 	return runs, nil
+}
+
+// LatestExactApproval returns the newest unanimous full-scope approval for
+// exactly target. Delta approvals are deliberately ineligible: they can only
+// be composed with the full approval they reference and must never become a
+// replacement full-diff baseline by themselves.
+func (s Store) LatestExactApproval(target model.Target) (ApprovedBaseline, bool, error) {
+	runs, err := s.Runs()
+	if err != nil {
+		return ApprovedBaseline{}, false, err
+	}
+	for _, run := range runs {
+		decision, decisionErr := LoadDecision(run)
+		if errors.Is(decisionErr, os.ErrNotExist) {
+			continue
+		}
+		if decisionErr != nil {
+			return ApprovedBaseline{}, false, fmt.Errorf("load approval candidate %s: %w", run.ID, decisionErr)
+		}
+		if decision.State != model.StateApproved || decision.BaseSHA != target.BaseSHA || decision.HeadSHA != target.HeadSHA || decision.DiffHash != target.DiffHash {
+			continue
+		}
+		baseline, loadErr := LoadApprovedBaseline(run)
+		if loadErr != nil {
+			if errors.Is(loadErr, os.ErrNotExist) || errors.Is(loadErr, ErrNotApprovedBaseline) {
+				continue
+			}
+			return ApprovedBaseline{}, false, fmt.Errorf("load approval baseline %s: %w", run.ID, loadErr)
+		}
+		if sameExactTarget(baseline.Manifest.Target, target) &&
+			baseline.Decision.BaseSHA == target.BaseSHA && baseline.Decision.HeadSHA == target.HeadSHA && baseline.Decision.DiffHash == target.DiffHash {
+			return baseline, true, nil
+		}
+	}
+	return ApprovedBaseline{}, false, nil
+}
+
+var ErrNotApprovedBaseline = errors.New("run is not an eligible approved baseline")
+
+// LoadApprovedBaseline validates the record rather than trusting its decision
+// label. The canonical patch, manifest target, completed reviewer consensus,
+// and checks must all agree before auto-fix may preserve the approval.
+func LoadApprovedBaseline(run Run) (ApprovedBaseline, error) {
+	decision, err := LoadDecision(run)
+	if err != nil {
+		return ApprovedBaseline{}, err
+	}
+	if decision.State != model.StateApproved {
+		return ApprovedBaseline{}, ErrNotApprovedBaseline
+	}
+	manifest, err := LoadManifest(run)
+	if err != nil {
+		return ApprovedBaseline{}, err
+	}
+	if manifest.ReviewScope == "approved-baseline-delta" ||
+		!sameExactTarget(manifest.Target, model.Target{BaseSHA: decision.BaseSHA, HeadSHA: decision.HeadSHA, DiffHash: decision.DiffHash}) ||
+		!unanimousCompletedApproval(decision, append(append([]model.ReviewerResult(nil), manifest.Reviewers...), manifest.SecurityReviews...)) || !allChecksPassed(manifest.Checks) {
+		return ApprovedBaseline{}, ErrNotApprovedBaseline
+	}
+	patch, err := os.ReadFile(filepath.Join(run.Path, "target.diff"))
+	if err != nil {
+		return ApprovedBaseline{}, err
+	}
+	sum := sha256.Sum256(patch)
+	if hex.EncodeToString(sum[:]) != decision.DiffHash {
+		return ApprovedBaseline{}, fmt.Errorf("%w: canonical patch hash does not match decision", ErrNotApprovedBaseline)
+	}
+	return ApprovedBaseline{Run: run, Decision: decision, Manifest: manifest, Patch: patch}, nil
+}
+
+func sameExactTarget(left, right model.Target) bool {
+	return left.BaseSHA == right.BaseSHA && left.HeadSHA == right.HeadSHA && left.DiffHash == right.DiffHash
+}
+
+func unanimousCompletedApproval(decision model.Decision, results []model.ReviewerResult) bool {
+	if len(decision.Reviewers) == 0 {
+		return false
+	}
+	completed := make(map[string]bool, len(results))
+	for _, result := range results {
+		if result.Status == "completed" && result.Report != nil && result.Report.ContextComplete && result.Report.Verdict == "approve" {
+			completed[result.Reviewer] = true
+		}
+	}
+	for reviewer, result := range decision.Reviewers {
+		if result != "approve" || !completed[reviewer] {
+			return false
+		}
+	}
+	return true
+}
+
+func allChecksPassed(checks []model.CheckResult) bool {
+	for _, check := range checks {
+		if check.Status != "passed" {
+			return false
+		}
+	}
+	return true
+}
+
+// ExactDiffReviewerLineage walks a retry's parent chain and returns the newest
+// completed result for every reviewer. A newer failed retry does not erase an
+// earlier completed review of the identical immutable diff. When a reviewer
+// has never completed, its newest attempt is retained so quota and retry
+// metadata remain available. Any target mismatch or cycle makes the lineage
+// unusable rather than allowing approval evidence to cross diff boundaries.
+func (s Store) ExactDiffReviewerLineage(run Run, target model.Target, repositoryIdentity string) (ReviewerLineage, error) {
+	seenRuns := make(map[string]bool)
+	ordinary := newReviewerLineageAccumulator()
+	security := newReviewerLineageAccumulator()
+	for run.ID != "" {
+		if seenRuns[run.ID] {
+			return ReviewerLineage{}, fmt.Errorf("retry lineage contains a cycle at run %s", run.ID)
+		}
+		seenRuns[run.ID] = true
+		manifest, err := LoadManifest(run)
+		if err != nil {
+			return ReviewerLineage{}, fmt.Errorf("load retry lineage manifest %s: %w", run.ID, err)
+		}
+		if !sameExactTarget(manifest.Target, target) {
+			return ReviewerLineage{}, fmt.Errorf("retry lineage run %s targets a different diff", run.ID)
+		}
+		if repositoryIdentity != "" && manifest.RepositoryIdentity != repositoryIdentity {
+			return ReviewerLineage{}, fmt.Errorf("retry lineage run %s belongs to a different repository identity", run.ID)
+		}
+		ordinary.add(manifest.Reviewers, run.ID)
+		security.add(manifest.SecurityReviews, run.ID)
+		if manifest.ParentRunID == "" {
+			break
+		}
+		run, err = s.Resolve(manifest.ParentRunID)
+		if err != nil {
+			return ReviewerLineage{}, fmt.Errorf("resolve retry lineage parent %s: %w", manifest.ParentRunID, err)
+		}
+	}
+	return ReviewerLineage{
+		Reviewers: ordinary.results(), SecurityReviews: security.results(),
+		LatestReviewers: ordinary.latestResults(), LatestSecurityReviews: security.latestResults(),
+	}, nil
+}
+
+type reviewerLineageAccumulator struct {
+	latest    map[string]model.ReviewerResult
+	completed map[string]model.ReviewerResult
+}
+
+func newReviewerLineageAccumulator() *reviewerLineageAccumulator {
+	return &reviewerLineageAccumulator{
+		latest: make(map[string]model.ReviewerResult), completed: make(map[string]model.ReviewerResult),
+	}
+}
+
+func (a *reviewerLineageAccumulator) add(results []model.ReviewerResult, runID string) {
+	for _, result := range results {
+		name := strings.TrimSpace(result.Reviewer)
+		if name == "" {
+			continue
+		}
+		if _, found := a.latest[name]; !found {
+			if result.ReusedFromRunID == "" {
+				result.ReusedFromRunID = runID
+			}
+			a.latest[name] = result
+		}
+		if _, found := a.completed[name]; !found && result.Status == "completed" && result.Report != nil {
+			if result.ReusedFromRunID == "" {
+				result.ReusedFromRunID = runID
+			}
+			a.completed[name] = result
+		}
+	}
+}
+
+func (a *reviewerLineageAccumulator) results() []model.ReviewerResult {
+	names := make([]string, 0, len(a.latest))
+	for name := range a.latest {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	results := make([]model.ReviewerResult, 0, len(names))
+	for _, name := range names {
+		result, found := a.completed[name]
+		if !found {
+			result = a.latest[name]
+		}
+		results = append(results, result)
+	}
+	return results
+}
+
+func (a *reviewerLineageAccumulator) latestResults() []model.ReviewerResult {
+	names := make([]string, 0, len(a.latest))
+	for name := range a.latest {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	results := make([]model.ReviewerResult, 0, len(names))
+	for _, name := range names {
+		results = append(results, a.latest[name])
+	}
+	return results
+}
+
+// UnresolvedFindings returns the latest known disposition of findings from
+// completed reviewer results for the same exact target. A finding remains
+// carried when a newer run omits it; only an explicit rejected-finding record
+// backed by a completed reviewer retires it. Partial-only recovery evidence
+// remains in its original audit record but is never promoted to durable truth.
+func (s Store) UnresolvedFindings(target model.Target) ([]model.ConsolidatedFinding, error) {
+	runs, err := s.Runs()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var findings []model.ConsolidatedFinding
+	for _, run := range runs {
+		decision, loadErr := LoadDecision(run)
+		if errors.Is(loadErr, os.ErrNotExist) {
+			continue
+		}
+		if loadErr != nil {
+			return nil, fmt.Errorf("load prior decision %s: %w", run.ID, loadErr)
+		}
+		if decision.DiffHash != target.DiffHash || decision.BaseSHA != target.BaseSHA || decision.HeadSHA != target.HeadSHA {
+			continue
+		}
+		for _, rejected := range decision.RejectedFindings {
+			if !findingBackedByCompletedReviewers(decision, rejected) {
+				continue
+			}
+			for _, key := range findingRecordKeys(rejected) {
+				seen[key] = true
+			}
+		}
+		carryForward := decision.CarryForwardFindings
+		legacyCarryPolicy := carryForward == nil
+		if legacyCarryPolicy {
+			carryForward = decision.Findings
+		}
+		for _, finding := range carryForward {
+			if legacyCarryPolicy && !findingBackedByCompletedReviewers(decision, finding) {
+				continue
+			}
+			keys := findingRecordKeys(finding)
+			alreadySeen := false
+			for _, key := range keys {
+				if seen[key] {
+					alreadySeen = true
+					break
+				}
+			}
+			for _, key := range keys {
+				seen[key] = true
+			}
+			if alreadySeen {
+				continue
+			}
+			finding.CarriedFromRunIDs = appendUnique(finding.CarriedFromRunIDs, run.ID)
+			findings = append(findings, finding)
+		}
+	}
+	sort.Slice(findings, func(i, j int) bool {
+		if findings[i].File != findings[j].File {
+			return findings[i].File < findings[j].File
+		}
+		if findings[i].Line != findings[j].Line {
+			return findings[i].Line < findings[j].Line
+		}
+		return findings[i].ID < findings[j].ID
+	})
+	return findings, nil
+}
+
+func findingBackedByCompletedReviewers(decision model.Decision, finding model.ConsolidatedFinding) bool {
+	if len(finding.Reviewers) == 0 {
+		return len(decision.Reviewers) == 0 && (decision.State == model.StateApproved || decision.State == model.StateChangesRequested)
+	}
+	for _, reviewer := range finding.Reviewers {
+		switch decision.Reviewers[reviewer] {
+		case "approve", "request_changes":
+			continue
+		}
+		completedCrossExamination := false
+		for _, examination := range decision.CrossExaminations {
+			if examination.Reviewer == reviewer && examination.Status == "completed" {
+				completedCrossExamination = true
+				break
+			}
+		}
+		if !completedCrossExamination {
+			return false
+		}
+	}
+	return true
+}
+
+func findingRecordKeys(finding model.ConsolidatedFinding) []string {
+	keys := make([]string, 0, len(finding.HistoricalFindingIDs)+1)
+	if strings.TrimSpace(finding.ID) != "" {
+		keys = append(keys, finding.ID)
+	}
+	for _, historicalID := range finding.HistoricalFindingIDs {
+		if strings.TrimSpace(historicalID) != "" {
+			keys = appendUnique(keys, historicalID)
+		}
+	}
+	return keys
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func WriteJSON(path string, value any) error {
@@ -627,6 +1000,12 @@ func LoadDecision(run Run) (model.Decision, error) {
 	var decision model.Decision
 	err := ReadJSON(filepath.Join(run.Path, "decision.json"), &decision)
 	return decision, err
+}
+
+func LoadAutoFixLoop(run Run) (model.AutoFixLoop, error) {
+	var loop model.AutoFixLoop
+	err := ReadJSON(filepath.Join(run.Path, "manifest.json"), &loop)
+	return loop, err
 }
 
 func atomicWrite(path string, contents []byte, mode os.FileMode) error {

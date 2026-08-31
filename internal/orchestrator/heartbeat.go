@@ -16,22 +16,27 @@ import (
 const heartbeatInterval = 30 * time.Second
 
 type runHeartbeat struct {
-	mu       sync.Mutex
-	writeMu  sync.Mutex
-	run      record.Run
-	progress io.Writer
-	value    model.Heartbeat
-	stop     chan struct{}
-	done     chan struct{}
-	once     sync.Once
+	mu            sync.Mutex
+	writeMu       sync.Mutex
+	run           record.Run
+	progress      io.Writer
+	value         model.Heartbeat
+	activeElapsed func() time.Duration
+	stop          chan struct{}
+	done          chan struct{}
+	once          sync.Once
 }
 
-func newRunHeartbeat(run record.Run, started time.Time, progress io.Writer) *runHeartbeat {
+func newRunHeartbeat(run record.Run, started time.Time, progress io.Writer, activeElapsed ...func() time.Duration) *runHeartbeat {
+	var elapsed func() time.Duration
+	if len(activeElapsed) > 0 {
+		elapsed = activeElapsed[0]
+	}
 	return &runHeartbeat{
-		run: run, progress: progress, stop: make(chan struct{}), done: make(chan struct{}),
+		run: run, progress: progress, activeElapsed: elapsed, stop: make(chan struct{}), done: make(chan struct{}),
 		value: model.Heartbeat{
 			RunID: run.ID, State: "active", Phase: "reviewers", StartedAt: started,
-			UpdatedAt: time.Now().UTC(), PID: os.Getpid(), Reviewers: map[string]string{}, ReviewerStartedAt: map[string]time.Time{}, Checks: map[string]string{}, Queues: map[string]model.ProviderQueueStatus{},
+			UpdatedAt: time.Now().UTC(), ActiveTimingBasis: activeTimingBasis, PID: os.Getpid(), Reviewers: map[string]string{}, ReviewerStartedAt: map[string]time.Time{}, Checks: map[string]string{}, Queues: map[string]model.ProviderQueueStatus{},
 		},
 	}
 }
@@ -64,7 +69,7 @@ func (h *runHeartbeat) Start() {
 				h.write()
 				snapshot := h.snapshot()
 				if h.progress != nil {
-					fmt.Fprintf(h.progress, "cora: run %s active for %s (%s)\n", h.run.ID, formatDuration(time.Since(snapshot.StartedAt)), heartbeatDetail(snapshot))
+					fmt.Fprintf(h.progress, "cora: run %s wall=%s active-execution=%s (%s)\n", h.run.ID, formatDuration(snapshot.WallElapsed.Duration), formatDuration(snapshot.ActiveExecution.Duration), heartbeatDetail(snapshot))
 				}
 			case <-h.stop:
 				return
@@ -121,7 +126,12 @@ func (h *runHeartbeat) write() {
 	h.writeMu.Lock()
 	defer h.writeMu.Unlock()
 	h.mu.Lock()
-	h.value.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	h.value.UpdatedAt = now
+	h.value.WallElapsed = model.NewDuration(wallElapsed(h.value.StartedAt, now))
+	if h.activeElapsed != nil {
+		h.value.ActiveExecution = model.NewDuration(h.activeElapsed())
+	}
 	h.mu.Unlock()
 	_ = record.WriteHeartbeat(h.run, h.snapshot())
 }
@@ -172,7 +182,7 @@ func heartbeatDetail(heartbeat model.Heartbeat) string {
 		for _, name := range names {
 			detail := name + "=" + states[name]
 			if states[name] == "running" && !heartbeat.ReviewerStartedAt[name].IsZero() {
-				detail += "(" + formatDuration(time.Since(heartbeat.ReviewerStartedAt[name])) + ")"
+				detail += "(wall=" + formatDuration(wallElapsed(heartbeat.ReviewerStartedAt[name], time.Now())) + ")"
 			}
 			parts = append(parts, detail)
 		}
@@ -186,7 +196,7 @@ func heartbeatDetail(heartbeat model.Heartbeat) string {
 		queue := heartbeat.Queues[name]
 		detail := fmt.Sprintf("%s=queue:%d", name, queue.Position)
 		if queue.ETAAt != nil {
-			detail += "~" + formatDuration(nonNegativeDuration(time.Until(*queue.ETAAt)))
+			detail += "~" + formatQueueETA(*queue.ETAAt, time.Now())
 		}
 		parts = append(parts, detail)
 	}
@@ -198,4 +208,20 @@ func nonNegativeDuration(duration time.Duration) time.Duration {
 		return 0
 	}
 	return duration
+}
+
+func formatQueueETA(etaAt, now time.Time) string {
+	remaining := etaAt.Sub(now)
+	if remaining <= 0 {
+		return "estimate-exceeded"
+	}
+	if remaining < time.Second {
+		return "<1s"
+	}
+	return remaining.Round(time.Second).String()
+}
+
+func wallElapsed(started, ended time.Time) time.Duration {
+	duration := ended.UTC().Sub(started.UTC())
+	return nonNegativeDuration(duration)
 }

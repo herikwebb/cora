@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +25,8 @@ import (
 var Version = "0.1.0-dev"
 var SourceSHA = "unknown"
 var BuildTime = "unknown"
+
+const stateDeltaApproved = "delta_approved"
 
 type options struct {
 	repo string
@@ -111,6 +114,7 @@ func newReviewCommand(opts *options) *cobra.Command {
 	var strict bool
 	var profiles []string
 	var autoFix bool
+	var resumeAutoFix string
 	var until string
 	var maxIterations int
 	var maxDuration time.Duration
@@ -124,6 +128,9 @@ func newReviewCommand(opts *options) *cobra.Command {
 		RunE: func(command *cobra.Command, _ []string) error {
 			ctx := command.Context()
 			autoOnlyFlags := []string{"until", "max-iterations", "max-duration", "max-turns", "max-cost-usd", "agent-timeout"}
+			if resumeAutoFix != "" && !autoFix {
+				return errors.New("--resume requires --auto-fix")
+			}
 			if !autoFix {
 				for _, name := range autoOnlyFlags {
 					if command.Flags().Changed(name) {
@@ -133,6 +140,21 @@ func newReviewCommand(opts *options) *cobra.Command {
 			}
 			if autoFix && (commit != "" || revisionRange != "" || uncommitted || parent != 0) {
 				return errors.New("--auto-fix supports only the checked-out branch target; do not combine it with --commit, --range, --uncommitted, or --parent")
+			}
+			if resumeAutoFix != "" {
+				if base != "" {
+					return errors.New("--resume uses the recorded base; do not combine it with --base")
+				}
+				for _, name := range autoOnlyFlags {
+					if command.Flags().Changed(name) {
+						return fmt.Errorf("--%s cannot change an existing auto-fix loop during --resume", name)
+					}
+				}
+				for _, name := range []string{"allow-api-billing", "allow-unsafe-checks", "security-sensitive", "adjudicate", "strict", "profile"} {
+					if command.Flags().Changed(name) {
+						return fmt.Errorf("--%s cannot change the recorded review policy during --resume", name)
+					}
+				}
 			}
 			if command.Flags().Changed("max-iterations") && maxIterations < 1 {
 				return errors.New("--max-iterations must be positive")
@@ -152,6 +174,40 @@ func newReviewCommand(opts *options) *cobra.Command {
 			repo, err := gitx.Discover(ctx, opts.repo)
 			if err != nil {
 				return err
+			}
+			if resumeAutoFix != "" {
+				plan, err := autofix.PrepareResume(ctx, repo, resumeAutoFix)
+				if err != nil {
+					return err
+				}
+				personal, err := config.LoadPersonal()
+				if err != nil {
+					return err
+				}
+				trustedTarget := plan.CurrentTarget
+				trustedTarget.BaseSHA = plan.Loop.BaseSHA
+				cfg, err := loadTrustedConfig(ctx, repo, personal, trustedTarget)
+				if err != nil {
+					return err
+				}
+				loop, err := (autofix.Runner{
+					Reviewer: runner(command), Progress: command.ErrOrStderr(),
+					Version: Version, SourceSHA: SourceSHA, BuildTime: BuildTime,
+				}).Resume(ctx, repo, resumeAutoFix, cfg)
+				if err != nil {
+					return err
+				}
+				if opts.json {
+					if err := printJSON(loop); err != nil {
+						return err
+					}
+				} else {
+					printAutoFixLoop(command.OutOrStdout(), loop)
+				}
+				if loop.State != model.StateApproved {
+					return stateError{state: loop.State}
+				}
+				return nil
 			}
 			personalConfig, err := config.LoadPersonal()
 			if err != nil {
@@ -300,6 +356,7 @@ func newReviewCommand(opts *options) *cobra.Command {
 	command.Flags().BoolVar(&strict, "strict", false, "treat minor findings as blocking and require validation checks")
 	command.Flags().StringSliceVar(&profiles, "profile", nil, "validation profile to run (repeatable; auto detects a built-in profile)")
 	command.Flags().BoolVar(&autoFix, "auto-fix", false, "iteratively launch a coding agent and re-review qualifying findings")
+	command.Flags().StringVar(&resumeAutoFix, "resume", "", "resume a quota-paused auto-fix loop by ID")
 	command.Flags().StringVar(&until, "until", "", "auto-fix severity threshold: blocker, major, or minor")
 	command.Flags().IntVar(&maxIterations, "max-iterations", 0, "maximum auto-fix review iterations (defaults to configuration)")
 	command.Flags().DurationVar(&maxDuration, "max-duration", 0, "maximum total auto-fix duration (defaults to configuration)")
@@ -317,6 +374,12 @@ func printAutoFixLoop(writer io.Writer, loop model.AutoFixLoop) {
 	fmt.Fprintf(writer, "Final diff: %s\n", shortSHA(loop.FinalDiffHash))
 	fmt.Fprintf(writer, "Elapsed: %s\n", formatMilliseconds(loop.Elapsed.Milliseconds()))
 	fmt.Fprintf(writer, "Usage: %s\n", formatUsage(loop.Usage))
+	if loop.State == model.StatePaused {
+		if loop.RetryAt != nil {
+			fmt.Fprintf(writer, "Retry after: %s\n", loop.RetryAt.Local().Format(time.RFC3339))
+		}
+		fmt.Fprintf(writer, "Resume: cora review --auto-fix --resume %s\n", loop.LoopID)
+	}
 	for _, iteration := range loop.Iterations {
 		fmt.Fprintf(writer, "  iteration %d: review=%s findings=%d run=%s", iteration.Number, iteration.ReviewState, len(iteration.QualifyingFindingIDs), iteration.ReviewRunID)
 		if iteration.Fix != nil {
@@ -362,8 +425,18 @@ func newRetryCommand(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if parentManifest.ReviewScope == "approved-baseline-delta" {
+				return fmt.Errorf("run %s approved only an auto-fix delta; resume parent loop %s to perform the required final full review", parentRun.ID, parentManifest.AutoFixLoopID)
+			}
 			if parentManifest.FinishedAt.IsZero() {
 				return fmt.Errorf("run %s is still active or did not finish", parentRun.ID)
+			}
+			repositoryIdentity, err := repo.StableIdentity(ctx)
+			if err != nil {
+				return err
+			}
+			if parentManifest.RepositoryIdentity == "" || parentManifest.RepositoryIdentity != repositoryIdentity {
+				return fmt.Errorf("run %s belongs to a different repository identity", parentRun.ID)
 			}
 			valid, err := repo.VerifyTarget(ctx, parentManifest.Target)
 			if err != nil {
@@ -372,11 +445,19 @@ func newRetryCommand(opts *options) *cobra.Command {
 			if !valid {
 				return fmt.Errorf("run %s no longer matches its recorded Git target", parentRun.ID)
 			}
-			selected, err := selectRetryReviewers(parentManifest.Reviewers, reviewers)
+			lineage, err := store.ExactDiffReviewerLineage(parentRun, parentManifest.Target, repositoryIdentity)
 			if err != nil {
 				return err
 			}
-			notBefore := quotaNotBefore(parentManifest.Reviewers, selected, parentManifest.FinishedAt, time.Now())
+			latestResults := append(append([]model.ReviewerResult(nil), lineage.LatestReviewers...), lineage.LatestSecurityReviews...)
+			latestResults = append(latestResults, parentManifest.CrossExaminations...)
+			selected, err := selectRetryReviewers(latestResults, reviewers)
+			if err != nil {
+				return err
+			}
+			// Legacy provider errors without an explicit zone describe the reset
+			// in the provider CLI's local time, while manifests are stored in UTC.
+			notBefore := quotaNotBefore(latestResults, selected, parentManifest.FinishedAt.In(time.Local), time.Now())
 			if noWait {
 				for _, retryAt := range notBefore {
 					if retryAt.After(time.Now()) {
@@ -389,9 +470,20 @@ func newRetryCommand(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := loadTrustedConfig(ctx, repo, personal, parentManifest.Target)
+			reviewContext, trustedConfigTarget, err := retryAutoFixReviewContext(store, parentManifest)
 			if err != nil {
 				return err
+			}
+			cfg, err := loadTrustedConfig(ctx, repo, personal, trustedConfigTarget)
+			if err != nil {
+				return err
+			}
+			if parentManifest.ReviewPolicy == nil {
+				return errors.New("saved run lacks an effective review-policy snapshot; start a fresh review instead of reusing unverifiable policy evidence")
+			}
+			cfg, err = config.ApplyReviewPolicy(cfg, *parentManifest.ReviewPolicy)
+			if err != nil {
+				return fmt.Errorf("restore saved review policy: %w", err)
 			}
 			if allowAPIBilling {
 				cfg.AllowAPIBilling = true
@@ -402,22 +494,26 @@ func newRetryCommand(opts *options) *cobra.Command {
 			if strict {
 				cfg.StrictPolicy = true
 			}
-			if (selected["codex"] && !cfg.Reviewers.Codex.Enabled) || (selected["claude"] && !cfg.Reviewers.Claude.Enabled) {
+			preserveRetryReviewerSettings(&cfg, parentManifest, lineage, selected)
+			if (selected["codex"] && !cfg.Reviewers.Codex.Enabled) || (selectedAny(selected, "claude", "claude-security", "claude-escalation", "claude-cross-examination") && !cfg.Reviewers.Claude.Enabled) {
 				return errors.New("selected reviewer is disabled by the trusted configuration")
 			}
-			previous := make([]model.ReviewerResult, len(parentManifest.Reviewers))
-			copy(previous, parentManifest.Reviewers)
-			for index := range previous {
-				if selected[previous[index].Reviewer] {
-					previous[index].Status = "incomplete"
-					previous[index].Report = nil
-					previous[index].ReusedFromRunID = ""
-				}
+			previous := prepareRetryResults(lineage.Reviewers, lineage.LatestReviewers, selected)
+			previousSecurity := prepareRetryResults(lineage.SecurityReviews, lineage.LatestSecurityReviews, selected)
+			previousCross := prepareRetryResults(parentManifest.CrossExaminations, parentManifest.CrossExaminations, selected)
+			runOptions := orchestrator.RunOptions{
+				ParentRunID: parentRun.ID, RetryReviewers: selected, ReuseReviewers: previous, ReuseSecurityReviews: previousSecurity,
+				ReuseCrossExaminations: previousCross,
+				ReuseChecks:            true, Checks: parentManifest.Checks, NotBefore: notBefore,
+				AutoFixLoopID: parentManifest.AutoFixLoopID, AutoFixIteration: parentManifest.AutoFixIteration,
 			}
-			decision, err := runner(command).RunWithOptions(ctx, repo, parentManifest.Target, cfg, orchestrator.RunOptions{
-				ParentRunID: parentRun.ID, RetryReviewers: selected, ReuseReviewers: previous,
-				ReuseChecks: true, Checks: parentManifest.Checks, NotBefore: notBefore,
-			})
+			reviewRunner := runner(command)
+			var decision model.Decision
+			if reviewContext.ReviewScope != "" {
+				decision, err = reviewRunner.RunAutoFixReview(ctx, repo, parentManifest.Target, cfg, runOptions, reviewContext)
+			} else {
+				decision, err = reviewRunner.RunWithOptions(ctx, repo, parentManifest.Target, cfg, runOptions)
+			}
 			if err != nil {
 				return err
 			}
@@ -434,7 +530,7 @@ func newRetryCommand(opts *options) *cobra.Command {
 			return nil
 		},
 	}
-	command.Flags().StringSliceVar(&reviewers, "reviewer", nil, "reviewer to retry: codex or claude (repeatable)")
+	command.Flags().StringSliceVar(&reviewers, "reviewer", nil, "reviewer to retry: codex, claude, claude-security, claude-escalation, or claude-cross-examination (repeatable)")
 	command.Flags().BoolVar(&noWait, "no-wait", false, "return instead of waiting for a recorded provider quota reset")
 	command.Flags().BoolVar(&allowAPIBilling, "allow-api-billing", false, "allow API-key or other separately billed authentication")
 	command.Flags().BoolVar(&adjudicate, "adjudicate", false, "run a Fable adjudicator when reviewers disagree")
@@ -446,10 +542,47 @@ func runner(command *cobra.Command) orchestrator.Runner {
 	return orchestrator.Runner{Version: Version, SourceSHA: SourceSHA, BuildTime: BuildTime, Progress: command.ErrOrStderr()}
 }
 
+func retryAutoFixReviewContext(store record.Store, manifest model.Manifest) (model.AutoFixReviewContext, model.Target, error) {
+	trustedConfigTarget := manifest.Target
+	if manifest.ReviewScope == "" || manifest.ReviewScope == "full" && manifest.AutoFixLoopID == "" {
+		return model.AutoFixReviewContext{}, trustedConfigTarget, nil
+	}
+	if manifest.AutoFixLoopID == "" {
+		return model.AutoFixReviewContext{}, model.Target{}, errors.New("scoped review record is missing its auto-fix lineage")
+	}
+	if manifest.FullTarget == nil {
+		return model.AutoFixReviewContext{}, model.Target{}, errors.New("scoped auto-fix review record is missing its complete target")
+	}
+	reviewContext := model.AutoFixReviewContext{
+		ReviewScope: manifest.ReviewScope, ApprovalBaselineRunID: manifest.ApprovalBaselineRunID,
+		ApprovalBaselineHash: manifest.ApprovalBaselineHash, FullTarget: *manifest.FullTarget,
+		TrustedBaseSHA: manifest.Target.BaseSHA,
+	}
+	if manifest.ApprovalBaselineRunID != "" {
+		baselineRun, err := store.Resolve(manifest.ApprovalBaselineRunID)
+		if err != nil {
+			return model.AutoFixReviewContext{}, model.Target{}, fmt.Errorf("resolve approved retry baseline: %w", err)
+		}
+		baseline, err := record.LoadApprovedBaseline(baselineRun)
+		if err != nil {
+			return model.AutoFixReviewContext{}, model.Target{}, fmt.Errorf("validate approved retry baseline: %w", err)
+		}
+		if baseline.Decision.DiffHash != manifest.ApprovalBaselineHash {
+			return model.AutoFixReviewContext{}, model.Target{}, errors.New("saved retry baseline hash does not match its approved run")
+		}
+		reviewContext.TrustedBaseSHA = baseline.Decision.BaseSHA
+		reviewContext.BaselineFindings = append([]model.ConsolidatedFinding(nil), baseline.Decision.Findings...)
+	} else if manifest.ReviewScope == "approved-baseline-delta" {
+		return model.AutoFixReviewContext{}, model.Target{}, errors.New("delta review record is missing its approved baseline")
+	}
+	trustedConfigTarget.BaseSHA = reviewContext.TrustedBaseSHA
+	return reviewContext, trustedConfigTarget, nil
+}
+
 func selectRetryReviewers(results []model.ReviewerResult, requested []string) (map[string]bool, error) {
 	available := make(map[string]model.ReviewerResult)
 	for _, result := range results {
-		if result.Reviewer == "codex" || result.Reviewer == "claude" {
+		if result.Reviewer == "codex" || result.Reviewer == "claude" || result.Reviewer == "claude-security" || result.Reviewer == "claude-escalation" || result.Reviewer == "claude-cross-examination" {
 			available[result.Reviewer] = result
 		}
 	}
@@ -461,7 +594,7 @@ func selectRetryReviewers(results []model.ReviewerResult, requested []string) (m
 			}
 		}
 		if len(selected) == 0 {
-			return nil, errors.New("all base reviewers completed; pass --reviewer to rerun one explicitly")
+			return nil, errors.New("all required reviewers completed; pass --reviewer to rerun one explicitly")
 		}
 		return selected, nil
 	}
@@ -473,6 +606,35 @@ func selectRetryReviewers(results []model.ReviewerResult, requested []string) (m
 		selected[name] = true
 	}
 	return selected, nil
+}
+
+func prepareRetryResults(preserved, latest []model.ReviewerResult, selected map[string]bool) []model.ReviewerResult {
+	latestByName := make(map[string]model.ReviewerResult, len(latest))
+	for _, result := range latest {
+		latestByName[result.Reviewer] = result
+	}
+	results := append([]model.ReviewerResult(nil), preserved...)
+	for index := range results {
+		if !selected[results[index].Reviewer] {
+			continue
+		}
+		if latestResult, found := latestByName[results[index].Reviewer]; found {
+			results[index] = latestResult
+		}
+		results[index].Status = "incomplete"
+		results[index].Report = nil
+		results[index].ReusedFromRunID = ""
+	}
+	return results
+}
+
+func selectedAny(selected map[string]bool, reviewers ...string) bool {
+	for _, reviewer := range reviewers {
+		if selected[reviewer] {
+			return true
+		}
+	}
+	return false
 }
 
 func quotaNotBefore(results []model.ReviewerResult, selected map[string]bool, observedAt, now time.Time) map[string]time.Time {
@@ -492,6 +654,123 @@ func quotaNotBefore(results []model.ReviewerResult, selected map[string]bool, ob
 		}
 	}
 	return notBefore
+}
+
+// preserveRetryReviewerSettings keeps each selected role on the same effective
+// model and effort as its audited attempt. Specialized Fable phases also retain
+// their independent saved limits when the parent recorded an effective policy.
+func preserveRetryReviewerSettings(cfg *config.Config, manifest model.Manifest, lineage record.ReviewerLineage, selected map[string]bool) {
+	if cfg == nil {
+		return
+	}
+	if selected["codex"] {
+		if previous, found := effectiveRetryResult("codex", lineage.Reviewers, lineage.LatestReviewers); found {
+			cfg.Reviewers.Codex.Enabled = true
+			applySavedModelEffort(&cfg.Reviewers.Codex.Model, &cfg.Reviewers.Codex.Effort, previous)
+		}
+	}
+	if selected["claude"] {
+		if previous, found := effectiveRetryResult("claude", lineage.Reviewers, lineage.LatestReviewers); found {
+			cfg.Reviewers.Claude.Enabled = true
+			applySavedModelEffort(&cfg.Reviewers.Claude.Model, &cfg.Reviewers.Claude.Effort, previous)
+		}
+	}
+
+	targeted := []struct {
+		name      string
+		preserved []model.ReviewerResult
+		latest    []model.ReviewerResult
+	}{
+		{name: "claude-security", preserved: lineage.SecurityReviews, latest: lineage.LatestSecurityReviews},
+		{name: "claude-escalation", preserved: lineage.Reviewers, latest: lineage.LatestReviewers},
+		{name: "claude-cross-examination", preserved: manifest.CrossExaminations, latest: manifest.CrossExaminations},
+	}
+	for _, role := range targeted {
+		if !selected[role.name] {
+			continue
+		}
+		previous, found := effectiveRetryResult(role.name, role.preserved, role.latest)
+		if !found {
+			continue
+		}
+		cfg.Reviewers.Claude.Enabled = true
+		cfg.Escalation.Enabled = true
+		applySavedModelEffort(&cfg.Escalation.Model, &cfg.Escalation.Effort, previous)
+		switch role.name {
+		case "claude-security":
+			cfg.Escalation.ForceSecuritySensitive = true
+		case "claude-escalation":
+			cfg.Escalation.AdjudicateDisagreements = true
+		case "claude-cross-examination":
+			cfg.CrossExamineBlockingFindings = true
+		}
+	}
+	if manifest.ReviewPolicy != nil && selectedAny(selected, "claude-security", "claude-escalation", "claude-cross-examination") {
+		policy := manifest.ReviewPolicy
+		cfg.Escalation.MaxTurns = cloneIntPointer(policy.Escalation.MaxTurns)
+		cfg.Escalation.MaxBudgetUSD = cloneFloatPointer(policy.Escalation.MaxBudgetUSD)
+		if selected["claude-cross-examination"] {
+			cfg.CrossExamination.Timeout = config.Duration{Duration: policy.CrossExamination.Timeout.Duration}
+			cfg.CrossExamination.MaxTurns = policy.CrossExamination.MaxTurns
+			cfg.CrossExamination.MaxBudgetUSD = policy.CrossExamination.MaxBudgetUSD
+		}
+	}
+}
+
+func applySavedModelEffort(modelName, effort *string, result model.ReviewerResult) {
+	if result.Model != "" {
+		*modelName = result.Model
+	}
+	if result.Effort != "" {
+		*effort = result.Effort
+	}
+}
+
+func cloneIntPointer(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneFloatPointer(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func effectiveRetryResult(name string, preserved, latest []model.ReviewerResult) (model.ReviewerResult, bool) {
+	var result model.ReviewerResult
+	found := false
+	for _, candidate := range preserved {
+		if candidate.Reviewer == name {
+			result, found = candidate, true
+			break
+		}
+	}
+	for _, candidate := range latest {
+		if candidate.Reviewer != name {
+			continue
+		}
+		if !found {
+			result, found = candidate, true
+			break
+		}
+		if candidate.Model != "" {
+			result.Model = candidate.Model
+		}
+		if candidate.Effort != "" {
+			result.Effort = candidate.Effort
+		}
+		if candidate.EscalationCause != "" {
+			result.EscalationCause = candidate.EscalationCause
+		}
+		break
+	}
+	return result, found
 }
 
 func expandAutoProfiles(ctx context.Context, repo gitx.Repo, target model.Target, names []string) ([]string, error) {
@@ -550,12 +829,18 @@ func newStatusCommand(opts *options) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				autoFixSummaries, err := loadAutoFixSummaries(store)
+				if err != nil {
+					return err
+				}
+				summaries = append(summaries, autoFixSummaries...)
 				activeRuns := make([]model.RunSummary, 0)
 				for _, summary := range summaries {
-					if summary.State == "active" {
+					if showInActiveStatus(summary) {
 						activeRuns = append(activeRuns, summary)
 					}
 				}
+				sort.Slice(activeRuns, func(i, j int) bool { return activeRuns[i].StartedAt.After(activeRuns[j].StartedAt) })
 				if opts.json {
 					return printJSON(activeRuns)
 				}
@@ -582,15 +867,35 @@ func newStatusCommand(opts *options) *cobra.Command {
 				printRunSummary(summary)
 				return nil
 			}
-			if opts.json {
-				return printJSON(decision)
+			manifest, manifestErr := record.LoadManifest(run)
+			if manifestErr != nil {
+				return manifestErr
 			}
-			printDecision(decision)
+			displayDecision := decisionForDisplay(decision, manifest.ReviewScope)
+			if opts.json {
+				return printJSON(displayDecision)
+			}
+			printDecision(displayDecision)
 			return nil
 		},
 	}
 	command.Flags().BoolVar(&active, "active", false, "show all currently active runs")
 	return command
+}
+
+func showInActiveStatus(summary model.RunSummary) bool {
+	switch summary.State {
+	case "active", "quota-queued", model.StatePaused:
+		return true
+	}
+	if summary.State == "interrupted" {
+		for _, state := range summary.Reviewers {
+			if state == "quota-queued" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func newListCommand(opts *options) *cobra.Command {
@@ -630,7 +935,7 @@ func newListCommand(opts *options) *cobra.Command {
 				fmt.Fprintln(command.OutOrStdout(), "No CORA runs found.")
 				return nil
 			}
-			fmt.Fprintln(command.OutOrStdout(), "RUN                                      STATE               HEAD      ELAPSED   PARENT")
+			fmt.Fprintln(command.OutOrStdout(), "RUN                                      STATE               HEAD      WALL      ACTIVE    PARENT")
 			for _, summary := range filtered {
 				parent := summary.ParentRunID
 				if parent == "" && summary.AutoFixLoopID != "" {
@@ -639,7 +944,7 @@ func newListCommand(opts *options) *cobra.Command {
 				if parent == "" {
 					parent = "-"
 				}
-				fmt.Fprintf(command.OutOrStdout(), "%-40s %-19s %-9s %-9s %s\n", summary.RunID, summary.State, shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), parent)
+				fmt.Fprintf(command.OutOrStdout(), "%-40s %-19s %-9s %-9s %-9s %s\n", summary.RunID, summary.State, shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), formatActiveExecution(summary), parent)
 			}
 			return nil
 		},
@@ -668,6 +973,63 @@ func loadRunSummaries(store record.Store, limit int) ([]model.RunSummary, error)
 	return summaries, nil
 }
 
+type autoFixHeartbeat struct {
+	State     string    `json:"state"`
+	Phase     string    `json:"phase"`
+	Iteration int       `json:"iteration"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func loadAutoFixSummaries(store record.Store) ([]model.RunSummary, error) {
+	loops, err := store.AutoFixLoops()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	summaries := make([]model.RunSummary, 0, len(loops))
+	for _, run := range loops {
+		loop, loadErr := record.LoadAutoFixLoop(run)
+		if loadErr != nil || loop.State != "active" && loop.State != model.StatePaused {
+			continue
+		}
+		wallElapsed := nonNegativeMilliseconds(now.Sub(loop.StartedAt))
+		activeElapsed := now.Sub(loop.StartedAt) - loop.PausedDuration.Duration
+		if loop.PausedAt != nil {
+			activeElapsed -= now.Sub(loop.PausedAt.UTC())
+		}
+		if activeElapsed < 0 {
+			activeElapsed = 0
+		}
+		summary := model.RunSummary{
+			RunID: run.ID, State: loop.State, StartedAt: loop.StartedAt, ElapsedMS: wallElapsed,
+			ActiveExecutionMS: activeElapsed.Milliseconds(), ActiveTimingBasis: "auto-fix-active-excludes-paused-quota",
+			HeadSHA: loop.InitialHeadSHA, AutoFixLoopID: loop.LoopID, RepositoryIdentity: loop.RepositoryIdentity,
+			Reviewers: make(map[string]string), Queues: make(map[string]model.ProviderQueueStatus), RecordPath: run.Path,
+		}
+		var heartbeat autoFixHeartbeat
+		if record.ReadJSON(filepath.Join(run.Path, "heartbeat.json"), &heartbeat) == nil {
+			summary.Phase = heartbeat.Phase
+			if loop.State == "active" && now.Sub(heartbeat.UpdatedAt) > 2*heartbeatFreshnessWindow() {
+				summary.State = "interrupted"
+			}
+		}
+		if loop.State == model.StatePaused {
+			summary.Phase = "paused-" + loop.ResumePhase
+			for _, reviewer := range loop.ResumeReviewers {
+				summary.Reviewers[reviewer] = "quota-queued"
+				if loop.RetryAt != nil {
+					retryAt := *loop.RetryAt
+					summary.Queues[reviewer] = model.ProviderQueueStatus{Provider: reviewer, ETAAt: &retryAt}
+				}
+			}
+		} else if summary.Phase != "" {
+			summary.Reviewers["auto-fix"] = summary.Phase
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries, nil
+}
+
 func loadRunSummary(run record.Run) (model.RunSummary, error) {
 	manifest, err := record.LoadManifest(run)
 	if err != nil {
@@ -682,11 +1044,15 @@ func loadRunSummary(run record.Run) (model.RunSummary, error) {
 	summary := model.RunSummary{
 		RunID: run.ID, State: "incomplete", StartedAt: manifest.StartedAt, FinishedAt: finished,
 		ElapsedMS: end.Sub(manifest.StartedAt).Milliseconds(), HeadSHA: manifest.Target.HeadSHA,
+		ActiveExecutionMS: manifest.ActiveExecution.Milliseconds(), ActiveTimingBasis: manifest.ActiveTimingBasis,
 		ParentRunID: manifest.ParentRunID, AutoFixLoopID: manifest.AutoFixLoopID, AutoFixIteration: manifest.AutoFixIteration,
 		RepositoryIdentity: manifest.RepositoryIdentity, RecordPath: run.Path,
 	}
 	if decision, decisionErr := record.LoadDecision(run); decisionErr == nil {
-		summary.State = decision.State
+		summary.State = decisionForDisplay(decision, manifest.ReviewScope).State
+		if manifest.ReviewScope == "approved-baseline-delta" {
+			summary.Phase = "final-full-review-required"
+		}
 		summary.Reviewers = decision.Reviewers
 		summary.Checks = decision.Checks
 		return summary, nil
@@ -697,11 +1063,16 @@ func loadRunSummary(run record.Run) (model.RunSummary, error) {
 		summary.Reviewers = heartbeat.Reviewers
 		summary.Checks = heartbeat.Checks
 		summary.Queues = heartbeat.Queues
+		if heartbeat.WallElapsed.Duration > 0 || heartbeat.State == "active" {
+			summary.ElapsedMS = heartbeat.WallElapsed.Milliseconds()
+		}
+		summary.ActiveExecutionMS = heartbeat.ActiveExecution.Milliseconds()
+		summary.ActiveTimingBasis = heartbeat.ActiveTimingBasis
 		summary.ReviewerElapsedMS = make(map[string]int64)
 		for name, state := range heartbeat.Reviewers {
 			started := heartbeat.ReviewerStartedAt[name]
 			if state == "running" && !started.IsZero() {
-				summary.ReviewerElapsedMS[name] = nonNegativeMilliseconds(now.Sub(started))
+				summary.ReviewerElapsedMS[name] = nonNegativeMilliseconds(now.UTC().Sub(started.UTC()))
 			}
 		}
 		if heartbeat.State == "active" && now.Sub(heartbeat.UpdatedAt) > 2*heartbeatFreshnessWindow() {
@@ -721,11 +1092,11 @@ func printRunSummary(summary model.RunSummary) {
 	if summary.Phase != "" {
 		fmt.Printf("Phase: %s\n", summary.Phase)
 	}
-	fmt.Printf("Head: %s\nElapsed: %s\nRecord: %s\n", shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), summary.RecordPath)
+	fmt.Printf("Head: %s\nWall elapsed: %s\nActive execution: %s\nRecord: %s\n", shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), formatActiveExecution(summary), summary.RecordPath)
 	for _, name := range sortedStateNames(summary.Reviewers) {
 		state := summary.Reviewers[name]
 		if elapsed := summary.ReviewerElapsedMS[name]; state == "running" && elapsed > 0 {
-			state += " for " + formatMilliseconds(elapsed)
+			state += " for " + formatMilliseconds(elapsed) + " wall"
 		}
 		fmt.Printf("%-18s %s\n", name+":", state)
 	}
@@ -741,16 +1112,16 @@ func printRunSummary(summary model.RunSummary) {
 		queue := summary.Queues[name]
 		eta := "unknown"
 		if queue.ETAAt != nil {
-			eta = formatMilliseconds(nonNegativeMilliseconds(time.Until(*queue.ETAAt)))
+			eta = formatQueueETA(*queue.ETAAt, time.Now())
 		}
 		fmt.Printf("%-18s position=%d ahead=%d active=%d/%d eta_in=%s\n", "queue "+name+":", queue.Position, queue.Ahead, queue.Active, queue.Limit, eta)
 	}
 }
 
 func printActiveRuns(writer io.Writer, summaries []model.RunSummary) {
-	fmt.Fprintln(writer, "RUN                                      HEAD      ELAPSED   PHASE       REVIEWERS")
+	fmt.Fprintln(writer, "RUN                                      STATE          HEAD      WALL      ACTIVE    PHASE       REVIEWERS")
 	for _, summary := range summaries {
-		fmt.Fprintf(writer, "%-40s %-9s %-9s %-11s %s\n", summary.RunID, shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), summary.Phase, activeReviewerSummary(summary))
+		fmt.Fprintf(writer, "%-40s %-14s %-9s %-9s %-9s %-11s %s\n", summary.RunID, summary.State, shortSHA(summary.HeadSHA), formatMilliseconds(summary.ElapsedMS), formatActiveExecution(summary), summary.Phase, activeReviewerSummary(summary))
 	}
 }
 
@@ -759,12 +1130,12 @@ func activeReviewerSummary(summary model.RunSummary) string {
 	for _, name := range sortedStateNames(summary.Reviewers) {
 		state := summary.Reviewers[name]
 		if elapsed := summary.ReviewerElapsedMS[name]; state == "running" && elapsed > 0 {
-			state += "(" + formatMilliseconds(elapsed) + ")"
+			state += "(wall=" + formatMilliseconds(elapsed) + ")"
 		}
 		if queue, found := summary.Queues[name]; found {
 			state = fmt.Sprintf("queued#%d", queue.Position)
 			if queue.ETAAt != nil {
-				state += "~" + formatMilliseconds(nonNegativeMilliseconds(time.Until(*queue.ETAAt)))
+				state += "~" + formatQueueETA(*queue.ETAAt, time.Now())
 			}
 		}
 		parts = append(parts, name+"="+state)
@@ -790,6 +1161,24 @@ func nonNegativeMilliseconds(duration time.Duration) int64 {
 		return 0
 	}
 	return duration.Milliseconds()
+}
+
+func formatActiveExecution(summary model.RunSummary) string {
+	if summary.ActiveTimingBasis == "" {
+		return "unknown"
+	}
+	return "~" + formatMilliseconds(summary.ActiveExecutionMS)
+}
+
+func formatQueueETA(etaAt, now time.Time) string {
+	remaining := etaAt.Sub(now)
+	if remaining <= 0 {
+		return "estimate-exceeded"
+	}
+	if remaining < time.Second {
+		return "<1s"
+	}
+	return remaining.Round(time.Second).String()
 }
 
 func newShowCommand(opts *options) *cobra.Command {
@@ -820,21 +1209,25 @@ func newShowCommand(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			displayDecision := decisionForDisplay(decision, manifest.ReviewScope)
 			view := struct {
 				Manifest model.Manifest `json:"manifest"`
 				Decision model.Decision `json:"decision"`
-			}{Manifest: manifest, Decision: decision}
+			}{Manifest: manifest, Decision: displayDecision}
 			if opts.json {
 				return printJSON(view)
 			}
-			printDecision(decision)
+			printDecision(displayDecision)
 			fmt.Printf("Started:    %s\n", manifest.StartedAt.Local().Format(time.RFC3339))
 			fmt.Printf("Finished:   %s\n", manifest.FinishedAt.Local().Format(time.RFC3339))
+			if manifest.ActiveTimingBasis != "" {
+				fmt.Printf("Timing:     wall=%s active-execution=~%s (%s)\n", formatMilliseconds(manifest.WallElapsed.Milliseconds()), formatMilliseconds(manifest.ActiveExecution.Milliseconds()), manifest.ActiveTimingBasis)
+			}
 			if manifest.AutoFixLoopID != "" {
-				fmt.Printf("Auto-fix:   %s iteration %d\n", manifest.AutoFixLoopID, manifest.AutoFixIteration)
+				fmt.Printf("Auto-fix:   %s iteration %d (scope=%s)\n", manifest.AutoFixLoopID, manifest.AutoFixIteration, manifest.ReviewScope)
 			}
 			printConsolidatedDetails(command.OutOrStdout(), decision)
-			allReviewers := append(append([]model.ReviewerResult(nil), manifest.Reviewers...), manifest.CrossExaminations...)
+			allReviewers := manifestReviewerResults(manifest)
 			for _, reviewer := range allReviewers {
 				modelName := reviewer.Model
 				if modelName == "" {
@@ -869,7 +1262,7 @@ func newShowCommand(opts *options) *cobra.Command {
 				if reviewer.EscalationCause != "" {
 					fmt.Printf("Escalation: %s\n", reviewer.EscalationCause)
 				}
-				fmt.Printf("Duration: execution=%s queue=%s total=%s\n", formatMilliseconds(reviewer.ExecutionDuration.Milliseconds()), formatMilliseconds(reviewer.QueueDuration.Milliseconds()), formatMilliseconds(reviewer.Duration.Milliseconds()))
+				fmt.Printf("Duration: wall-total=%s queue-wall=%s active-execution=~%s\n", formatMilliseconds(reviewer.Duration.Milliseconds()), formatMilliseconds(reviewer.QueueDuration.Milliseconds()), formatMilliseconds(reviewer.ExecutionDuration.Milliseconds()))
 				fmt.Printf("Usage: %s\n", formatUsage(reviewer.Usage))
 			}
 			if len(manifest.Checks) > 0 {
@@ -889,6 +1282,13 @@ func newShowCommand(opts *options) *cobra.Command {
 	return command
 }
 
+func manifestReviewerResults(manifest model.Manifest) []model.ReviewerResult {
+	results := append([]model.ReviewerResult(nil), manifest.Reviewers...)
+	results = append(results, manifest.SecurityReviews...)
+	results = append(results, manifest.CrossExaminations...)
+	return results
+}
+
 func printConsolidatedDetails(writer io.Writer, decision model.Decision) {
 	crossByFinding := make(map[string]model.CrossExamination, len(decision.CrossExaminations))
 	for _, examination := range decision.CrossExaminations {
@@ -899,6 +1299,9 @@ func printConsolidatedDetails(writer io.Writer, decision model.Decision) {
 		for _, finding := range decision.Findings {
 			fmt.Fprintf(writer, "  [%s] %s:%d %s (%s)\n", finding.Severity, finding.File, finding.Line, finding.Claim, strings.Join(finding.Reviewers, ", "))
 			fmt.Fprintf(writer, "    Confidence: %.0f%%\n", finding.Confidence*100)
+			if len(finding.CarriedFromRunIDs) > 0 {
+				fmt.Fprintf(writer, "    Carried from runs: %s\n", strings.Join(finding.CarriedFromRunIDs, ", "))
+			}
 			for _, evidence := range finding.Evidence {
 				fmt.Fprintf(writer, "    Evidence: %s\n", evidence)
 			}
@@ -917,6 +1320,9 @@ func printConsolidatedDetails(writer io.Writer, decision model.Decision) {
 		for _, finding := range decision.RejectedFindings {
 			fmt.Fprintf(writer, "  [%s] %s:%d %s\n", finding.OriginalSeverity, finding.File, finding.Line, finding.Claim)
 			fmt.Fprintf(writer, "    Confidence: %.0f%%\n", finding.Confidence*100)
+			if len(finding.CarriedFromRunIDs) > 0 {
+				fmt.Fprintf(writer, "    Carried from runs: %s\n", strings.Join(finding.CarriedFromRunIDs, ", "))
+			}
 			for _, evidence := range finding.Evidence {
 				fmt.Fprintf(writer, "    Original evidence: %s\n", evidence)
 			}
@@ -1071,7 +1477,8 @@ func findApproval(store record.Store, runID, headSHA string) (record.Run, model.
 			continue
 		}
 		manifest, err := record.LoadManifest(run)
-		if err != nil {
+		if err != nil || manifest.ReviewScope == "approved-baseline-delta" ||
+			manifest.Target.BaseSHA != decision.BaseSHA || manifest.Target.HeadSHA != decision.HeadSHA || manifest.Target.DiffHash != decision.DiffHash || !manifestChecksPassed(manifest.Checks) {
 			continue
 		}
 		return run, decision, manifest, nil
@@ -1079,9 +1486,20 @@ func findApproval(store record.Store, runID, headSHA string) (record.Run, model.
 	return record.Run{}, model.Decision{}, model.Manifest{}, errors.New("no approved CORA run matches the requested head")
 }
 
+func manifestChecksPassed(checks []model.CheckResult) bool {
+	for _, check := range checks {
+		if check.Status != "passed" {
+			return false
+		}
+	}
+	return true
+}
+
 func printDecision(decision model.Decision) {
 	stateLabel := strings.ToUpper(decision.State)
-	if decision.State == model.StateApproved && decision.OutcomeQualifier == "non_blocking_findings" {
+	if decision.State == stateDeltaApproved {
+		stateLabel = "DELTA APPROVED — FINAL FULL REVIEW REQUIRED"
+	} else if decision.State == model.StateApproved && decision.OutcomeQualifier == "non_blocking_findings" {
 		stateLabel = "APPROVED WITH NON-BLOCKING FINDINGS"
 	} else if decision.State == model.StateApproved && decision.OutcomeQualifier == "cross_examined" {
 		stateLabel = "APPROVED AFTER CROSS-EXAMINATION"
@@ -1143,6 +1561,19 @@ func printDecision(decision model.Decision) {
 	}
 }
 
+func decisionForDisplay(decision model.Decision, reviewScope string) model.Decision {
+	if reviewScope != "approved-baseline-delta" || decision.State != model.StateApproved {
+		return decision
+	}
+	decision.State = stateDeltaApproved
+	decision.OutcomeQualifier = "final_full_review_required"
+	if strings.TrimSpace(decision.Reason) != "" {
+		decision.Reason += "; "
+	}
+	decision.Reason += "auto-fix delta consensus is non-final until the complete updated diff passes a fresh full review"
+	return decision
+}
+
 func usageEmpty(usage model.Usage) bool {
 	return usage.Turns == 0 && usage.InputTokens == 0 && usage.CachedInputTokens == 0 && usage.OutputTokens == 0 &&
 		usage.ThinkingTokens == 0 && usage.APIEquivalentCostUSD == 0 && !usage.TurnsKnown && !usage.TurnsPartial &&
@@ -1195,7 +1626,7 @@ func loadReviewerErrors(decision model.Decision) map[string]string {
 	if err != nil {
 		return errorsByReviewer
 	}
-	for _, reviewer := range manifest.Reviewers {
+	for _, reviewer := range manifestReviewerResults(manifest) {
 		if reviewer.Error != "" {
 			errorsByReviewer[reviewer.Reviewer] = reviewer.Error
 		}
@@ -1228,6 +1659,8 @@ func exitCodeForState(state string) int {
 		return 4
 	case model.StateStale:
 		return 5
+	case model.StatePaused:
+		return 6
 	default:
 		return 10
 	}

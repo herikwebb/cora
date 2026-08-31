@@ -107,7 +107,7 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	if decision.State != model.StateApproved {
 		t.Fatalf("decision = %#v", decision)
 	}
-	if decision.Reviewers["codex"] != "approve" || decision.Reviewers["claude"] != "approve" {
+	if decision.Reviewers["codex"] != "approve" || decision.Reviewers["claude"] != "approve" || decision.Reviewers["claude-security"] != "approve" {
 		t.Fatalf("reviewer decisions = %#v", decision.Reviewers)
 	}
 	if decision.Checks["diff-check"] != "passed" || decision.Checks["mutation-check"] != "passed" {
@@ -123,10 +123,14 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 		"cora: run ",
 		"reviewer codex started",
 		"reviewer claude started",
+		"reviewer claude-security started",
 		"reviewer codex completed",
 		"reviewer claude completed",
+		"reviewer claude-security completed",
+		"adding targeted fable/high security review while retaining ordinary Claude",
+		"model=claude-opus-4-6 effort=high",
 		"model=claude-fable-5 effort=high",
-		"provider-turns=3 thinking=200 api-equivalent=$0.0293",
+		"provider-turns=5 thinking=280 api-equivalent=$0.0493",
 		"check diff-check started",
 		"check diff-check passed",
 		"finished: approved",
@@ -144,8 +148,28 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.PromptHash == "" || manifest.PolicyHash == "" || manifest.SchemaHash == "" || len(manifest.Reviewers) != 2 {
+	if manifest.PromptHash == "" || manifest.SecurityPromptHash == "" || manifest.PolicyHash == "" || manifest.SchemaHash == "" || len(manifest.Reviewers) != 2 || len(manifest.SecurityReviews) != 1 {
 		t.Fatalf("manifest is incomplete: %#v", manifest)
+	}
+	wantReviewPolicy := config.SnapshotReviewPolicy(cfg)
+	if manifest.ReviewPolicy == nil || !reflect.DeepEqual(*manifest.ReviewPolicy, wantReviewPolicy) {
+		t.Fatalf("manifest review policy = %#v, want exact effective policy %#v", manifest.ReviewPolicy, wantReviewPolicy)
+	}
+	securityPromptContents, err := os.ReadFile(filepath.Join(latest.Path, "security-review.prompt.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SecurityPromptHash != hashBytes(securityPromptContents) {
+		t.Fatalf("security prompt hash = %q, want %q", manifest.SecurityPromptHash, hashBytes(securityPromptContents))
+	}
+	events, err := os.ReadFile(filepath.Join(latest.Path, "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, eventType := range []string{"review.security_scheduled", "review.security_started", "review.security_finished"} {
+		if !strings.Contains(string(events), `"type":"`+eventType+`"`) {
+			t.Fatalf("security event %q missing from audit log:\n%s", eventType, events)
+		}
 	}
 	if manifest.CoraSourceSHA != "source-sha" || manifest.CoraBuildTime != "2026-08-25T12:00:00Z" || manifest.RepositoryIdentity == "" {
 		t.Fatalf("build/repository identity = %#v", manifest)
@@ -168,16 +192,22 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	for _, reviewer := range manifest.Reviewers {
 		reviewers[reviewer.Reviewer] = reviewer
 	}
+	for _, reviewer := range manifest.SecurityReviews {
+		reviewers[reviewer.Reviewer] = reviewer
+	}
 	if reviewers["codex"].Model != "gpt-5.6-sol" || reviewers["codex"].Effort != "high" {
 		t.Fatalf("Codex effective settings = %#v", reviewers["codex"])
 	}
-	if reviewers["claude"].Model != "claude-fable-5" || reviewers["claude"].Effort != "high" || reviewers["claude"].EscalationCause != "security_sensitive" {
-		t.Fatalf("Claude effective settings = %#v", reviewers["claude"])
+	if reviewers["claude"].Model != "claude-opus-4-6" || reviewers["claude"].Effort != "high" || reviewers["claude"].EscalationCause != "" {
+		t.Fatalf("ordinary Claude effective settings = %#v", reviewers["claude"])
 	}
-	if !manifest.Usage.TurnsKnown || manifest.Usage.Turns != 3 || !manifest.Usage.ThinkingTokensKnown || manifest.Usage.ThinkingTokens != 200 {
+	if reviewers["claude-security"].Model != "claude-fable-5" || reviewers["claude-security"].Effort != "high" || reviewers["claude-security"].EscalationCause != "security_sensitive" {
+		t.Fatalf("targeted security settings = %#v", reviewers["claude-security"])
+	}
+	if !manifest.Usage.TurnsKnown || manifest.Usage.Turns != 5 || !manifest.Usage.ThinkingTokensKnown || manifest.Usage.ThinkingTokens != 280 {
 		t.Fatalf("aggregate usage = %#v", manifest.Usage)
 	}
-	for _, name := range []string{"codex.json", "claude.json", "decision.json", "events.jsonl", "policy.md", "prompt.md", "review.schema.json", "target.diff"} {
+	for _, name := range []string{"codex.json", "claude.json", "claude-security.json", "decision.json", "events.jsonl", "policy.md", "prompt.md", "security-review.prompt.md", "review.schema.json", "target.diff"} {
 		info, err := os.Stat(filepath.Join(latest.Path, name))
 		if err != nil {
 			t.Errorf("missing record %s: %v", name, err)
@@ -200,6 +230,7 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 
 	previous := make([]model.ReviewerResult, len(manifest.Reviewers))
 	copy(previous, manifest.Reviewers)
+	previousSecurity := append([]model.ReviewerResult(nil), manifest.SecurityReviews...)
 	for index := range previous {
 		if previous[index].Reviewer == "claude" {
 			previous[index].Status = "incomplete"
@@ -208,7 +239,8 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	}
 	retryDecision, err := runner.RunWithOptions(context.Background(), repo, target, cfg, RunOptions{
 		ParentRunID: latest.ID, RetryReviewers: map[string]bool{"claude": true}, ReuseReviewers: previous,
-		ReuseChecks: true, Checks: manifest.Checks, AutoFixLoopID: "loop-1", AutoFixIteration: 2,
+		ReuseSecurityReviews: previousSecurity,
+		ReuseChecks:          true, Checks: manifest.Checks, AutoFixLoopID: "loop-1", AutoFixIteration: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -224,7 +256,7 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retryManifest.ParentRunID != latest.ID || retryManifest.AutoFixLoopID != "loop-1" || retryManifest.AutoFixIteration != 2 || len(retryManifest.Reviewers) != 2 {
+	if retryManifest.ParentRunID != latest.ID || retryManifest.AutoFixLoopID != "loop-1" || retryManifest.AutoFixIteration != 2 || len(retryManifest.Reviewers) != 2 || len(retryManifest.SecurityReviews) != 1 {
 		t.Fatalf("retry manifest = %#v", retryManifest)
 	}
 	if retryManifest.CumulativeUsage.APIEquivalentCostUSD <= retryManifest.IncrementalUsage.APIEquivalentCostUSD {
@@ -246,6 +278,9 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 			}
 		}
 	}
+	if retryManifest.SecurityReviews[0].Reviewer != "claude-security" || retryManifest.SecurityReviews[0].ReusedFromRunID != latest.ID {
+		t.Fatalf("targeted security review was not reused: %#v", retryManifest.SecurityReviews)
+	}
 }
 
 func TestReviewerFinishedProgressIncludesProviderFailure(t *testing.T) {
@@ -262,6 +297,53 @@ func TestReviewerFinishedProgressIncludesProviderFailure(t *testing.T) {
 	}
 	if strings.Contains(progress, "\n") {
 		t.Fatalf("provider failure was not normalized to one live progress line: %q", progress)
+	}
+}
+
+func TestTargetedSecurityReviewFailsClosedWhenClaudeIsDisabled(t *testing.T) {
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
+	repoRoot := orchestratorTestRepo(t)
+	gitRun(t, repoRoot, "switch", "-c", "security-change")
+	if err := os.WriteFile(filepath.Join(repoRoot, "AGENTS.md"), []byte("changed control policy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repoRoot, "add", "AGENTS.md")
+	gitRun(t, repoRoot, "commit", "-m", "test: change control policy")
+
+	repo, err := gitx.Discover(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := repo.ResolveTarget(context.Background(), gitx.TargetOptions{Base: "main", RequireClean: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	writeExecutable(t, codexPath, fakeCodexScript)
+	cfg := config.Defaults()
+	cfg.Reviewers.Codex.Command = codexPath
+	cfg.Reviewers.Claude.Enabled = false
+	cfg.MinimumApprovals = 1
+	cfg.CrossExamineBlockingFindings = false
+	cfg.OverallTimeout.Duration = 10 * time.Second
+
+	decision, err := (Runner{Version: "test"}).Run(context.Background(), repo, target, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.State != model.StateIncomplete || decision.Reviewers["claude-security"] != "incomplete" || !strings.Contains(decision.ReviewerErrors["claude-security"], "Claude is disabled") {
+		t.Fatalf("disabled required security review did not fail closed: %#v", decision)
+	}
+	run, err := record.New(repo.CommonDir).Resolve("latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := record.LoadManifest(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Reviewers) != 1 || len(manifest.SecurityReviews) != 1 || manifest.SecurityReviews[0].Status != "incomplete" {
+		t.Fatalf("security review audit metadata = %#v", manifest)
 	}
 }
 
@@ -392,7 +474,24 @@ func TestEffectiveEscalationReviewerInheritsAndOverridesLimits(t *testing.T) {
 	}
 }
 
-func TestReuseReviewerResultsPreservesUnselectedIncompleteReviewer(t *testing.T) {
+func TestEffectiveCrossExaminationReviewerUsesIndependentLimits(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Reviewers.Claude.MaxTurns = 50
+	cfg.Reviewers.Claude.MaxBudgetUSD = 9
+	escalationTurns := 35
+	escalationBudget := 7.0
+	cfg.Escalation.MaxTurns = &escalationTurns
+	cfg.Escalation.MaxBudgetUSD = &escalationBudget
+	cfg.CrossExamination.MaxTurns = 14
+	cfg.CrossExamination.MaxBudgetUSD = 2.5
+
+	reviewer := effectiveCrossExaminationReviewer(cfg)
+	if reviewer.Model != "fable" || reviewer.Effort != "high" || reviewer.MaxTurns != 14 || reviewer.MaxBudgetUSD != 2.5 {
+		t.Fatalf("cross-examination reviewer = %#v", reviewer)
+	}
+}
+
+func TestReuseReviewerResultsPreservesUnselectedResultsIncludingEscalation(t *testing.T) {
 	results := []model.ReviewerResult{
 		{Reviewer: "claude", Status: "incomplete", Attempt: 1},
 		{Reviewer: "codex", Status: "incomplete", Attempt: 2},
@@ -400,22 +499,28 @@ func TestReuseReviewerResultsPreservesUnselectedIncompleteReviewer(t *testing.T)
 	}
 
 	reused := reuseReviewerResults(results, "parent-run", map[string]bool{"claude": true})
-	if len(reused) != 1 {
+	if len(reused) != 2 {
 		t.Fatalf("reused reviewers = %#v", reused)
 	}
-	if reused[0].Reviewer != "codex" || reused[0].Status != "incomplete" || reused[0].ReusedFromRunID != "parent-run" {
-		t.Fatalf("unselected incomplete reviewer was not preserved: %#v", reused[0])
+	if reused[0].Reviewer != "claude-escalation" || reused[0].Status != "completed" || reused[0].ReusedFromRunID != "parent-run" {
+		t.Fatalf("completed escalation reviewer was not preserved: %#v", reused[0])
+	}
+	if reused[1].Reviewer != "codex" || reused[1].Status != "incomplete" || reused[1].ReusedFromRunID != "parent-run" {
+		t.Fatalf("unselected incomplete reviewer was not preserved: %#v", reused[1])
 	}
 }
 
-func TestRunnerEscalatesDisputedReviewToFable(t *testing.T) {
+func TestRunnerSkipsAdditionalFableWhenOrdinaryFindingAlreadyBlocks(t *testing.T) {
 	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
 	repoRoot := orchestratorTestRepo(t)
 	gitRun(t, repoRoot, "switch", "-c", "feature")
 	if err := os.WriteFile(filepath.Join(repoRoot, "app.txt"), []byte("base\nfeature\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, repoRoot, "add", "app.txt")
+	if err := os.WriteFile(filepath.Join(repoRoot, "AGENTS.md"), []byte("review control change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repoRoot, "add", "app.txt", "AGENTS.md")
 	gitRun(t, repoRoot, "commit", "-m", "feat(app): add disputed feature")
 
 	repo, err := gitx.Discover(context.Background(), repoRoot)
@@ -447,11 +552,11 @@ func TestRunnerEscalatesDisputedReviewToFable(t *testing.T) {
 	if decision.State != model.StateChangesRequested {
 		t.Fatalf("decision = %#v", decision)
 	}
-	if decision.Reviewers["codex"] != "request_changes" || decision.Reviewers["claude"] != "approve" || decision.Reviewers["claude-escalation"] != "approve" {
+	if decision.Reviewers["codex"] != "request_changes" || decision.Reviewers["claude"] != "approve" || decision.Reviewers["claude-security"] != "deferred" {
 		t.Fatalf("reviewer decisions = %#v", decision.Reviewers)
 	}
-	if !strings.Contains(progress.String(), "reviewers disagree; escalating to fable/high") {
-		t.Fatalf("progress did not show dispute escalation:\n%s", progress.String())
+	if strings.Contains(progress.String(), "reviewers disagree; escalating") || !strings.Contains(progress.String(), "security review deferred") {
+		t.Fatalf("unnecessary Fable work was not deferred:\n%s", progress.String())
 	}
 	latest, err := record.New(repo.CommonDir).Resolve("latest")
 	if err != nil {
@@ -461,23 +566,22 @@ func TestRunnerEscalatesDisputedReviewToFable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(manifest.Reviewers) != 3 || !manifest.Escalation.Triggered || !reflect.DeepEqual(manifest.Escalation.Causes, []string{"disputed"}) {
-		t.Fatalf("dispute escalation manifest = %#v", manifest)
+	if len(manifest.Reviewers) != 2 || len(manifest.SecurityReviews) != 1 || !manifest.Escalation.Triggered || !reflect.DeepEqual(manifest.Escalation.Causes, []string{"security_sensitive"}) {
+		t.Fatalf("deferred escalation manifest = %#v", manifest)
 	}
-	var ordinaryClaude, escalation model.ReviewerResult
+	var ordinaryClaude, security model.ReviewerResult
 	for _, reviewer := range manifest.Reviewers {
 		switch reviewer.Reviewer {
 		case "claude":
 			ordinaryClaude = reviewer
-		case "claude-escalation":
-			escalation = reviewer
 		}
 	}
+	security = manifest.SecurityReviews[0]
 	if ordinaryClaude.Model != "claude-opus-4-6" || ordinaryClaude.Effort != "high" || ordinaryClaude.EscalationCause != "" {
 		t.Fatalf("ordinary Claude result = %#v", ordinaryClaude)
 	}
-	if escalation.Model != "claude-fable-5" || escalation.Effort != "high" || escalation.EscalationCause != "disputed" {
-		t.Fatalf("Fable escalation result = %#v", escalation)
+	if security.Reviewer != "claude-security" || security.Status != "deferred" || security.Model != "fable" || security.Effort != "high" || security.EscalationCause != "security_sensitive" {
+		t.Fatalf("targeted security result = %#v", security)
 	}
 }
 
@@ -548,6 +652,72 @@ func TestRunnerCrossExaminesAndDisprovesSoleMajor(t *testing.T) {
 	}
 }
 
+func TestRunnerCarriesUnresolvedFindingForUnchangedTarget(t *testing.T) {
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", t.TempDir())
+	repoRoot := orchestratorTestRepo(t)
+	gitRun(t, repoRoot, "switch", "-c", "feature")
+	if err := os.WriteFile(filepath.Join(repoRoot, "app.txt"), []byte("base\nfeature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repoRoot, "add", "app.txt")
+	gitRun(t, repoRoot, "commit", "-m", "feat(app): add feature")
+	repo, err := gitx.Discover(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := repo.ResolveTarget(context.Background(), gitx.TargetOptions{Base: "main", RequireClean: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := record.New(repo.CommonDir)
+	prior, err := store.Create(time.Unix(1, 0), target.HeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorFinding := model.ConsolidatedFinding{
+		ID: "prior-race", Severity: "major", Confidence: 0.95, File: "app.txt", Line: 2,
+		Claim: "The recurring execution can overlap a prior run.", Evidence: []string{"The prior state update is not visible."},
+		Reviewers: []string{"codex"}, SourceIDs: []string{"C1"},
+	}
+	if err := record.WriteJSON(filepath.Join(prior.Path, "decision.json"), model.Decision{
+		RunID: prior.ID, State: model.StateChangesRequested, BaseSHA: target.BaseSHA, HeadSHA: target.HeadSHA, DiffHash: target.DiffHash,
+		Reviewers: map[string]string{"codex": "request_changes"},
+		Findings:  []model.ConsolidatedFinding{priorFinding},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	codexPath := filepath.Join(binDir, "codex")
+	claudePath := filepath.Join(binDir, "claude")
+	writeExecutable(t, codexPath, fakeCodexScript)
+	writeExecutable(t, claudePath, fakeDisputeClaudeScript)
+	cfg := config.Defaults()
+	cfg.Reviewers.Codex.Command = codexPath
+	cfg.Reviewers.Claude.Command = claudePath
+	cfg.CrossExamineBlockingFindings = false
+	cfg.ReviewerTimeout.Duration = 5 * time.Second
+	cfg.OverallTimeout.Duration = 10 * time.Second
+	decision, err := (Runner{Version: "test"}).Run(context.Background(), repo, target, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.State != model.StateChangesRequested || len(decision.Findings) != 1 || len(decision.Findings[0].CarriedFromRunIDs) != 1 || decision.Findings[0].CarriedFromRunIDs[0] != prior.ID {
+		t.Fatalf("carried decision = %#v", decision)
+	}
+	latest, err := store.Resolve("latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := record.LoadManifest(latest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.CarriedFindings) != 1 || manifest.CarriedFindings[0].ID != priorFinding.ID {
+		t.Fatalf("carried manifest findings = %#v", manifest.CarriedFindings)
+	}
+}
+
 func TestChangedControlFilesRecognizesNestedAgentConfiguration(t *testing.T) {
 	got := changedControlFiles([]string{
 		"src/app.go",
@@ -596,6 +766,18 @@ func TestBlockingCrossExaminationPromptRequiresSourceToSinkDisproof(t *testing.T
 	}
 }
 
+func TestSecurityReviewPromptScopesFableToSensitivePaths(t *testing.T) {
+	prompt := securityReviewPrompt("base prompt", []string{".github/workflows/release.yml", "internal/auth/session.go"})
+	for _, want := range []string{
+		"focused security phase", "not another broad review", "transitive callers", "concrete attacker",
+		"source-to-sink", ".github/workflows/release.yml", "internal/auth/session.go", "context_complete=false",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("security prompt does not contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestNormalizeCrossExaminationsDemotesExactCandidate(t *testing.T) {
 	candidates := []model.ConsolidatedFinding{{ID: "cora-123", Severity: "major"}}
 	results := []model.ReviewerResult{{
@@ -637,6 +819,57 @@ func TestCrossExaminationSkipsWhenAnotherRequiredReviewCannotComplete(t *testing
 	}
 }
 
+func TestTargetedSecurityReviewDefersWhenOrdinaryOutcomeIsAlreadyFixed(t *testing.T) {
+	approve := model.ReviewerResult{Reviewer: "claude", Status: "completed", Report: &model.ReviewReport{Verdict: "approve", ContextComplete: true}}
+	requestChanges := model.ReviewerResult{Reviewer: "codex", Status: "completed", Report: &model.ReviewReport{
+		Verdict: "request_changes", ContextComplete: true,
+		Findings: []model.Finding{{ID: "major", Severity: "major", File: "app.go", Line: 1, Claim: "reachable defect"}},
+	}}
+	if ordinaryResultsLeaveOutcomeOpen([]model.ReviewerResult{requestChanges, approve}, []string{"blocker", "major"}) {
+		t.Fatal("targeted Fable pass cannot change an already changes-requested outcome")
+	}
+	requestChanges.Report.Verdict = "approve"
+	requestChanges.Report.Findings = nil
+	if !ordinaryResultsLeaveOutcomeOpen([]model.ReviewerResult{requestChanges, approve}, []string{"blocker", "major"}) {
+		t.Fatal("ordinary approvals should permit the required targeted security pass")
+	}
+}
+
+func TestSoleOrdinaryMajorCanStillReachSecurityReviewThroughCrossExamination(t *testing.T) {
+	target := model.Target{BaseSHA: "base", HeadSHA: "head", DiffHash: "diff", Finalizable: true}
+	codex := model.ReviewerResult{Reviewer: "codex", Status: "completed", Report: &model.ReviewReport{
+		Verdict: "request_changes", ContextComplete: true,
+		Findings: []model.Finding{{ID: "ordinary", Severity: "major", File: "a.go", Line: 1, Claim: "sole alleged defect"}},
+	}}
+	claude := model.ReviewerResult{Reviewer: "claude", Status: "completed", Report: &model.ReviewReport{Verdict: "approve", ContextComplete: true}}
+	reviewers := []model.ReviewerResult{codex, claude}
+	candidates := verdict.BlockingCandidates(reviewers)
+	if len(candidates) != 1 || !blockingCrossExaminationCanAffectOutcome(target, reviewers, nil, []string{"blocker", "major"}, 2, candidates, nil) {
+		t.Fatalf("sole major should remain adjudicable before security review: %#v", candidates)
+	}
+}
+
+func TestCrossExaminationSkipsWhenNonCandidateSecurityFindingStillBlocks(t *testing.T) {
+	target := model.Target{BaseSHA: "base", HeadSHA: "head", DiffHash: "diff", Finalizable: true}
+	codex := model.ReviewerResult{Reviewer: "codex", Status: "completed", Report: &model.ReviewReport{
+		Verdict: "request_changes", ContextComplete: true,
+		Findings: []model.Finding{{ID: "ordinary", Severity: "major", File: "a.go", Line: 1, Claim: "ordinary reachable defect"}},
+	}}
+	claude := model.ReviewerResult{Reviewer: "claude", Status: "completed", Report: &model.ReviewReport{Verdict: "approve", ContextComplete: true}}
+	security := model.ReviewerResult{Reviewer: "claude-security", Status: "completed", EscalationCause: "security_sensitive", Report: &model.ReviewReport{
+		Verdict: "request_changes", ContextComplete: true,
+		Findings: []model.Finding{{ID: "security", Severity: "major", File: "auth.go", Line: 5, Claim: "independent security defect"}},
+	}}
+	reviewers := []model.ReviewerResult{codex, claude, security}
+	candidates := verdict.BlockingCandidates(reviewers)
+	if len(candidates) != 1 || !slices.Contains(candidates[0].SourceIDs, "ordinary") {
+		t.Fatalf("cross-examination candidates = %#v", candidates)
+	}
+	if blockingCrossExaminationCanAffectOutcome(target, reviewers, nil, []string{"blocker", "major"}, 2, candidates, nil) {
+		t.Fatal("cross-examining the ordinary finding cannot remove the independent security blocker")
+	}
+}
+
 func TestStrictPolicyBlocksMinorsAndRequiresValidation(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.StrictPolicy = true
@@ -675,12 +908,105 @@ func TestLoadPromptUsesTrustedBaseRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	prompt, err := loadPrompt(ctx, repo, root, config.Defaults(), target, "/tmp/target.diff", []string{".cora/reviewer.md"})
+	trustedBaseSHA := target.BaseSHA
+	// A delta is based at the untrusted feature head, but repository-owned
+	// review instructions must still be loaded from the original trusted base.
+	target.BaseSHA = target.HeadSHA
+	prompt, err := loadPrompt(ctx, repo, root, config.Defaults(), target, trustedBaseSHA, "/tmp/target.diff", []string{".cora/reviewer.md"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(prompt, "trusted base review prompt") || strings.Contains(prompt, "malicious head review prompt") {
 		t.Fatalf("prompt did not come from trusted base:\n%s", prompt)
+	}
+}
+
+func TestValidateAutoFixReviewContextBindsApprovedDeltaLineage(t *testing.T) {
+	store := record.New(t.TempDir())
+	patch := []byte("diff --git a/app.go b/app.go\n")
+	baselineTarget := model.Target{
+		Mode: "branch", BaseSHA: "trusted-base", HeadSHA: "approved-head",
+		DiffHash: hashBytes(patch), Finalizable: true,
+	}
+	run, err := store.Create(time.Unix(1, 0), baselineTarget.HeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := &model.ReviewReport{Verdict: "approve", ContextComplete: true}
+	if err := record.WriteFile(filepath.Join(run.Path, "target.diff"), patch); err != nil {
+		t.Fatal(err)
+	}
+	if err := record.WriteJSON(filepath.Join(run.Path, "manifest.json"), model.Manifest{
+		RunID: run.ID, Target: baselineTarget, ReviewScope: "full",
+		Reviewers: []model.ReviewerResult{
+			{Reviewer: "codex", Status: "completed", Report: report},
+			{Reviewer: "claude", Status: "completed", Report: report},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := record.WriteJSON(filepath.Join(run.Path, "decision.json"), model.Decision{
+		RunID: run.ID, State: model.StateApproved, BaseSHA: baselineTarget.BaseSHA,
+		HeadSHA: baselineTarget.HeadSHA, DiffHash: baselineTarget.DiffHash,
+		Reviewers: map[string]string{"codex": "approve", "claude": "approve"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deltaTarget := model.Target{Mode: "working-tree", BaseSHA: baselineTarget.HeadSHA, HeadSHA: baselineTarget.HeadSHA, DiffHash: "delta", Finalizable: true}
+	fullTarget := model.Target{Mode: "working-tree", BaseSHA: baselineTarget.BaseSHA, HeadSHA: baselineTarget.HeadSHA, DiffHash: "complete", Finalizable: true}
+	context := model.AutoFixReviewContext{
+		ReviewScope: "approved-baseline-delta", ApprovalBaselineRunID: run.ID,
+		ApprovalBaselineHash: baselineTarget.DiffHash, TrustedBaseSHA: baselineTarget.BaseSHA,
+		FullTarget: fullTarget,
+	}
+	trusted, err := validateAutoFixReviewContext(store, deltaTarget, context)
+	if err != nil || trusted != baselineTarget.BaseSHA {
+		t.Fatalf("validated delta lineage = %q, %v", trusted, err)
+	}
+
+	context.ApprovalBaselineHash = "wrong"
+	if _, err := validateAutoFixReviewContext(store, deltaTarget, context); err == nil || !strings.Contains(err.Error(), "baseline hash") {
+		t.Fatalf("mismatched baseline hash error = %v", err)
+	}
+}
+
+func TestValidateAutoFixReviewContextBindsFullScopeToExactLineage(t *testing.T) {
+	target := model.Target{
+		Mode: "working-tree", BaseSHA: "trusted-base", HeadSHA: "feature-head",
+		DiffHash: "complete", Finalizable: true,
+	}
+	reviewContext := model.AutoFixReviewContext{
+		ReviewScope: "full-final", TrustedBaseSHA: target.BaseSHA, FullTarget: target,
+	}
+	trusted, err := validateAutoFixReviewContext(record.New(t.TempDir()), target, reviewContext)
+	if err != nil || trusted != target.BaseSHA {
+		t.Fatalf("validated full-scope lineage = %q, %v", trusted, err)
+	}
+
+	reviewContext.FullTarget.HeadSHA = "different-head"
+	if _, err := validateAutoFixReviewContext(record.New(t.TempDir()), target, reviewContext); err == nil || !strings.Contains(err.Error(), "full-scope") {
+		t.Fatalf("mismatched full target error = %v", err)
+	}
+
+	reviewContext.FullTarget = target
+	reviewContext.TrustedBaseSHA = "different-base"
+	if _, err := validateAutoFixReviewContext(record.New(t.TempDir()), target, reviewContext); err == nil || !strings.Contains(err.Error(), "trusted base") {
+		t.Fatalf("mismatched trusted base error = %v", err)
+	}
+}
+
+func TestAppendAutoFixReviewContextExplainsScopedApproval(t *testing.T) {
+	prompt := appendAutoFixReviewContext("review", model.AutoFixReviewContext{
+		ReviewScope: "approved-baseline-delta", TrustedBaseSHA: "base",
+		ApprovalBaselineRunID: "run", ApprovalBaselineHash: "approved",
+		FullTarget:       model.Target{DiffHash: "complete"},
+		BaselineFindings: []model.ConsolidatedFinding{{ID: "finding", Claim: "confirm the fix"}},
+	})
+	for _, expected := range []string{"approved-baseline-delta", "complete resulting diff", "fresh full-diff consensus", "confirm the fix"} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("auto-fix lineage prompt omitted %q:\n%s", expected, prompt)
+		}
 	}
 }
 
@@ -824,7 +1150,7 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
-if [ "$seen_permissions" != "true" ] || [ "$seen_tools" != "true" ] || [ "$seen_settings_enabled" != "true" ] || [ "$seen_settings_strict" != "true" ] || [ "$seen_settings_network" != "true" ] || [ "$model" != "fable" ] || [ "$effort" != "high" ]; then
+if [ "$seen_permissions" != "true" ] || [ "$seen_tools" != "true" ] || [ "$seen_settings_enabled" != "true" ] || [ "$seen_settings_strict" != "true" ] || [ "$seen_settings_network" != "true" ] || [ "$effort" != "high" ] || { [ "$model" != "opus" ] && [ "$model" != "fable" ]; }; then
   echo "missing strict sandbox mode" >&2
   exit 21
 fi
@@ -833,7 +1159,9 @@ if [ -z "$GOCACHE" ] || [ -z "$TMPDIR" ]; then
   exit 22
 fi
 printf reviewer > reviewer-test-artifact
-printf '%s\n' '{"type":"result","is_error":false,"num_turns":2,"total_cost_usd":0.02,"resolved_model":"claude-fable-5","modelUsage":{"claude-fable-5":{"inputTokens":700,"cacheReadInputTokens":200,"outputTokens":100,"thinkingTokens":80,"costUSD":0.02}},"structured_output":` + validReport + `}'
+resolved="claude-opus-4-6"
+if [ "$model" = "fable" ]; then resolved="claude-fable-5"; fi
+printf '%s\n' '{"type":"result","is_error":false,"num_turns":2,"total_cost_usd":0.02,"resolved_model":"'"$resolved"'","usage":{"input_tokens":700,"output_tokens":100,"thinking_tokens":80},"structured_output":` + validReport + `}'
 `
 
 const disputingReport = `{"schema_version":"1","verdict":"request_changes","context_complete":true,"summary":"changes needed","findings":[{"id":"major-1","severity":"major","confidence":0.95,"file":"app.txt","line":2,"claim":"The feature is disputed","evidence":"The fixture intentionally disagrees","suggested_fix":"Resolve the dispute","reachability":{"status":"demonstrated","trigger":"the feature input is accepted","path":["app.txt:2 applies the feature behavior"],"impact":"the disputed behavior is observable","preconditions":["the feature is enabled"]}}],"reviewed_paths":["app.txt"],"omitted_paths":[],"residual_risks":[]}`
