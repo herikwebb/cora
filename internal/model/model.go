@@ -39,6 +39,34 @@ type Finding struct {
 	Reachability *Reachability `json:"reachability,omitempty"`
 }
 
+// MarshalJSON keeps normalized reports compatible with the provider schema:
+// Codex requires every object property to be present, so optional finding
+// fields are represented as explicit nulls instead of being omitted.
+func (f Finding) MarshalJSON() ([]byte, error) {
+	var disposition *string
+	if f.Disposition != "" {
+		value := f.Disposition
+		disposition = &value
+	}
+	type wireFinding struct {
+		ID           string        `json:"id"`
+		Severity     string        `json:"severity"`
+		Confidence   float64       `json:"confidence"`
+		File         string        `json:"file"`
+		Line         int           `json:"line"`
+		Claim        string        `json:"claim"`
+		Evidence     string        `json:"evidence"`
+		SuggestedFix string        `json:"suggested_fix"`
+		Disposition  *string       `json:"disposition"`
+		Reachability *Reachability `json:"reachability"`
+	}
+	return json.Marshal(wireFinding{
+		ID: f.ID, Severity: f.Severity, Confidence: f.Confidence, File: f.File,
+		Line: f.Line, Claim: f.Claim, Evidence: f.Evidence, SuggestedFix: f.SuggestedFix,
+		Disposition: disposition, Reachability: f.Reachability,
+	})
+}
+
 type Reachability struct {
 	Status        string   `json:"status"`
 	Trigger       string   `json:"trigger"`

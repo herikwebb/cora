@@ -34,7 +34,9 @@
           "line",
           "claim",
           "evidence",
-          "suggested_fix"
+          "suggested_fix",
+          "disposition",
+          "reachability"
         ],
         "properties": {
           "id": { "type": "string" },
@@ -49,11 +51,11 @@
           "evidence": { "type": "string" },
           "suggested_fix": { "type": "string" },
           "disposition": {
-            "type": "string",
-            "enum": ["confirmed", "demoted", "disproved", "uncertain"]
+            "type": ["string", "null"],
+            "enum": ["confirmed", "demoted", "disproved", "uncertain", null]
           },
           "reachability": {
-            "type": "object",
+            "type": ["object", "null"],
             "additionalProperties": false,
             "required": ["status", "trigger", "path", "impact", "preconditions"],
             "properties": {
@@ -64,25 +66,7 @@
               "preconditions": { "type": "array", "items": { "type": "string" } }
             }
           }
-        },
-        "allOf": [
-          {
-            "if": { "properties": { "severity": { "enum": ["blocker", "major"] } } },
-            "then": {
-              "required": ["reachability"],
-              "properties": {
-                "reachability": {
-                  "properties": {
-                    "status": { "const": "demonstrated" },
-                    "trigger": { "minLength": 1 },
-                    "path": { "minItems": 1 },
-                    "impact": { "minLength": 1 }
-                  }
-                }
-              }
-            }
-          }
-        ]
+        }
       }
     },
     "reviewed_paths": {
