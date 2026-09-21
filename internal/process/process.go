@@ -30,8 +30,16 @@ type Result struct {
 	Err      error
 }
 
+// processWaitDelay bounds the time os/exec may spend waiting for inherited
+// stdout or stderr descriptors after the process itself has exited. A child
+// that escapes or outlives its parent must not make cancellation hang forever.
+const processWaitDelay = 2 * time.Second
+
 func Run(ctx context.Context, spec Spec) Result {
 	started := time.Now()
+	if err := ctx.Err(); err != nil {
+		return Result{ExitCode: -1, Duration: time.Since(started), Err: err}
+	}
 	stdout, stdoutClose, err := outputWriter(spec.StdoutPath)
 	if err != nil {
 		return Result{ExitCode: -1, Duration: time.Since(started), Err: err}
@@ -50,6 +58,10 @@ func Run(ctx context.Context, spec Spec) Result {
 	command.Stdout = stdout
 	command.Stderr = stderr
 	configureProcess(command)
+	command.WaitDelay = processWaitDelay
+	if err := ctx.Err(); err != nil {
+		return Result{ExitCode: -1, Duration: time.Since(started), Err: err}
+	}
 
 	if err := command.Start(); err != nil {
 		return Result{ExitCode: -1, Duration: time.Since(started), Err: fmt.Errorf("start %s: %w", spec.Command, err)}
@@ -73,15 +85,31 @@ func Run(ctx context.Context, spec Spec) Result {
 }
 
 func Capture(ctx context.Context, commandName, dir string, env []string, args ...string) ([]byte, []byte, Result) {
+	return CaptureInput(ctx, commandName, dir, env, nil, args...)
+}
+
+// CaptureInput runs a command with captured output and optional stdin. Like
+// Run, cancellation terminates the command's complete process group.
+func CaptureInput(ctx context.Context, commandName, dir string, env []string, stdin []byte, args ...string) ([]byte, []byte, Result) {
 	started := time.Now()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, Result{ExitCode: -1, Duration: time.Since(started), Err: err}
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	command := exec.Command(commandName, args...)
 	command.Dir = dir
 	command.Env = env
+	if stdin != nil {
+		command.Stdin = bytes.NewReader(stdin)
+	}
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	configureProcess(command)
+	command.WaitDelay = processWaitDelay
+	if err := ctx.Err(); err != nil {
+		return nil, nil, Result{ExitCode: -1, Duration: time.Since(started), Err: err}
+	}
 	if err := command.Start(); err != nil {
 		return nil, nil, Result{ExitCode: -1, Duration: time.Since(started), Err: err}
 	}

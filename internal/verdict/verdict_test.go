@@ -68,6 +68,35 @@ func TestEvaluateDeduplicatesEquivalentFindings(t *testing.T) {
 	}
 }
 
+func TestEvaluateCountsApprovedNonBlockingFindings(t *testing.T) {
+	review := completedReview("codex", "approve")
+	review.Report.Findings = []model.Finding{
+		{ID: "M1", Severity: "minor", File: "alpha.go", Line: 1, Claim: "alpha diagnostic lacks context"},
+		{ID: "M2", Severity: "minor", File: "beta.go", Line: 2, Claim: "beta retry is unnecessarily noisy"},
+		{ID: "M3", Severity: "minor", File: "gamma.go", Line: 3, Claim: "gamma error omits the operation"},
+		{ID: "N1", Severity: "note", File: "delta.go", Line: 4, Claim: "delta name could be clearer"},
+		{ID: "N2", Severity: "note", File: "epsilon.go", Line: 5, Claim: "epsilon comment is stale"},
+	}
+	decision := Evaluate("run", finalTarget(), []model.ReviewerResult{review}, nil, []string{"blocker", "major"}, 1, time.Unix(1, 0))
+	if decision.State != model.StateApproved || decision.BlockingFindings != 0 || decision.NonBlockingFindings != 5 {
+		t.Fatalf("decision finding summary = state=%s blocking=%d non-blocking=%d; want approved, 0, 5",
+			decision.State, decision.BlockingFindings, decision.NonBlockingFindings)
+	}
+}
+
+func TestEvaluateFindingCountsHonorConfiguredBlockingSeverities(t *testing.T) {
+	review := completedReview("codex", "approve")
+	review.Report.Findings = []model.Finding{
+		{ID: "M1", Severity: "minor", File: "alpha.go", Line: 1, Claim: "alpha diagnostic lacks context"},
+		{ID: "N1", Severity: "note", File: "beta.go", Line: 2, Claim: "beta name could be clearer"},
+	}
+	decision := Evaluate("run", finalTarget(), []model.ReviewerResult{review}, nil, []string{"blocker", "major", "minor"}, 1, time.Unix(1, 0))
+	if decision.BlockingFindings != 1 || decision.NonBlockingFindings != 1 {
+		t.Fatalf("decision finding counts = blocking=%d non-blocking=%d; want 1, 1",
+			decision.BlockingFindings, decision.NonBlockingFindings)
+	}
+}
+
 func TestEvaluateDeduplicatesSemanticReviewFindings(t *testing.T) {
 	tests := []struct {
 		name, file, left, right string
@@ -469,6 +498,27 @@ func TestCarryForwardFindingsExcludePartialSeverityPromotion(t *testing.T) {
 	}
 	if len(decision.CarryForwardFindings) != 1 || decision.CarryForwardFindings[0].Severity != "minor" || !slices.Equal(decision.CarryForwardFindings[0].Reviewers, []string{"codex"}) {
 		t.Fatalf("partial severity was promoted into durable history: %#v", decision.CarryForwardFindings)
+	}
+}
+
+func TestCarryForwardFindingsExcludeCompletedAbstentionEvidence(t *testing.T) {
+	abstained := model.ReviewerResult{
+		Reviewer: "claude", Status: "completed",
+		Report: &model.ReviewReport{
+			SchemaVersion: model.SchemaVersion, Verdict: "abstain", ContextComplete: false,
+			Findings: []model.Finding{{
+				ID: "checkpoint-only", Severity: "minor", Confidence: 0.9, File: "app.go", Line: 12,
+				Claim: "A recovery checkpoint reported a possible leak.", Evidence: "The checkpoint names the error path.", SuggestedFix: "Close the resource.",
+			}},
+		},
+	}
+
+	decision := Evaluate("run", finalTarget(), []model.ReviewerResult{completedReview("codex", "approve"), abstained}, nil, []string{"blocker", "major"}, 2, time.Unix(1, 0))
+	if decision.State != model.StateIncomplete || len(decision.Findings) != 1 {
+		t.Fatalf("abstention evidence was not retained in the current decision: %#v", decision)
+	}
+	if len(decision.CarryForwardFindings) != 0 {
+		t.Fatalf("abstention evidence became durable review history: %#v", decision.CarryForwardFindings)
 	}
 }
 

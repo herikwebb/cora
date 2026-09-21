@@ -120,7 +120,7 @@ func evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 		}
 		for _, finding := range report.Findings {
 			findings = append(findings, findingWithReviewer{reviewer: reviewer.Reviewer, finding: finding})
-			if reviewer.Status == "completed" {
+			if reviewer.Status == "completed" && report.ContextComplete && (report.Verdict == "approve" || report.Verdict == "request_changes") {
 				carryForwardFindings = append(carryForwardFindings, findingWithReviewer{reviewer: reviewer.Reviewer, finding: finding})
 			}
 		}
@@ -134,7 +134,10 @@ func evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 	for _, finding := range decision.Findings {
 		decision.OpenFindings[finding.Severity]++
 		if blockingSet[finding.Severity] {
+			decision.BlockingFindings++
 			changesRequested = true
+		} else {
+			decision.NonBlockingFindings++
 		}
 	}
 	if crossExaminationApproval(crossExaminations) {
@@ -185,7 +188,7 @@ func evaluate(runID string, target model.Target, reviewers []model.ReviewerResul
 		decision.Reason = "working-tree reviews are advisory and cannot create an approval"
 	default:
 		decision.State = model.StateApproved
-		nonBlocking := decision.OpenFindings["minor"] + decision.OpenFindings["note"]
+		nonBlocking := decision.NonBlockingFindings
 		if crossExaminationApproval(crossExaminations) {
 			decision.OutcomeQualifier = "cross_examined"
 			decision.Reason = "approval quorum met after independent cross-examination resolved disputed blocking findings"

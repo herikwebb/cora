@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -484,73 +485,257 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 		result.Duration = model.NewDuration(time.Since(started))
 		return result
 	}
-	args := []string{
-		"-p",
-		"--safe-mode",
-		"--permission-mode", "dontAsk",
-		"--tools", "Read,Glob,Grep,Bash",
-		"--settings", claudeReviewerSandboxSettings(request.RuntimeDir, request.RecoveryDir),
-		"--append-system-prompt", request.Policy,
-		"--max-turns", strconv.Itoa(c.Config.MaxTurns),
-		"--no-session-persistence",
-		"--output-format", "json",
-		"--json-schema", string(compactSchema),
-	}
-	if c.Config.MaxBudgetUSD > 0 {
-		args = append(args, "--max-budget-usd", strconv.FormatFloat(c.Config.MaxBudgetUSD, 'f', -1, 64))
-	}
-	if c.Config.Model != "" {
-		args = append(args, "--model", c.Config.Model)
-	}
-	if c.Config.Effort != "" {
-		args = append(args, "--effort", c.Config.Effort)
-	}
-	args = append(args, effectivePrompt)
+	inspectionTurns := c.Config.MaxTurns - c.Config.FinalizationTurns
+	args := claudeReviewArgs(c.Config, request, compactSchema, effectivePrompt, inspectionTurns, "Read,Glob,Grep,Bash")
 
 	rawPath := filepath.Join(request.RunDir, fileStem(c.Name())+".raw.json")
 	stderrPath := filepath.Join(request.RunDir, fileStem(c.Name())+".stderr.log")
 	reviewCtx, cancelReview := context.WithTimeout(parent, request.Timeout)
+	defer cancelReview()
 	processResult := processx.Run(reviewCtx, processx.Spec{
 		Command:    path,
 		Args:       args,
 		Dir:        request.WorkDir,
+		Stdin:      []byte(effectivePrompt),
 		Env:        env,
 		StdoutPath: rawPath,
 		StderrPath: stderrPath,
 	})
-	cancelReview()
 	result.Duration = model.NewDuration(time.Since(started))
 	result.ExitCode = processResult.ExitCode
 	parsed, parseErr := readClaudeOutput(rawPath, result.Model)
 	applyTelemetry(&result, parsed.Telemetry)
-	if processResult.Err != nil {
-		result.Error = "Claude review failed: " + claudeFailure(rawPath, stderrPath, processResult.Err)
-		classifyFailure(&result, time.Now())
-		if errors.Is(processResult.Err, context.DeadlineExceeded) {
-			result.FailureKind = "timeout"
-			attachPartialReviewerReport(&result, request, partialReportCandidate(parsed.Report, checkpointPath), "Claude review timed out before producing a complete report.")
-		} else if claudeReachedMaxTurns(rawPath, result.Error) {
-			attachPartialReviewerReport(&result, request, partialReportCandidate(parsed.Report, checkpointPath), "Claude reached its turn ceiling before producing a complete report.")
-		}
+	inspectionError := claudeInspectionError(processResult, parseErr, parsed.Report, result.Reviewer, request.Target, rawPath, stderrPath)
+	if inspectionError == nil {
+		report := parsed.Report
+		attachTarget(&report, result.Reviewer, request.Target)
+		result.Status = "completed"
+		result.Report = &report
 		return result
+	}
+
+	inspectionReachedReserve := claudeReachedMaxTurns(rawPath, inspectionError.Error())
+	canFinalize := inspectionReachedReserve || processResult.Err == nil
+	if canFinalize && reviewCtx.Err() == nil {
+		candidate := partialReportCandidate(parsed.Report, checkpointPath)
+		if candidate == nil {
+			fallback := claudeFinalizationFallback(request, result.Reviewer, inspectionError.Error())
+			candidate = &fallback
+		} else {
+			attachTarget(candidate, result.Reviewer, request.Target)
+		}
+		finalConfig, promptErr := claudeFinalizationConfig(c.Config, parsed.Telemetry.Usage)
+		finalPrompt := ""
+		if promptErr == nil {
+			finalPrompt, promptErr = claudeFinalizationPrompt(*candidate, inspectionError.Error())
+		}
+		if promptErr == nil {
+			promptErr = persistReviewerPrompt(request.RunDir, result.Reviewer+"-finalization", finalPrompt)
+		}
+		if promptErr == nil {
+			promptErr = preserveClaudeInspectionArtifacts(rawPath, stderrPath)
+		}
+		if promptErr == nil {
+			finalArgs := claudeReviewArgs(finalConfig, request, compactSchema, finalPrompt, c.Config.FinalizationTurns, "")
+			finalResult := processx.Run(reviewCtx, processx.Spec{
+				Command: path, Args: finalArgs, Dir: request.WorkDir, Stdin: []byte(finalPrompt), Env: env,
+				StdoutPath: rawPath, StderrPath: stderrPath,
+			})
+			result.Duration = model.NewDuration(time.Since(started))
+			result.ExitCode = finalResult.ExitCode
+			finalOutput, finalParseErr := readClaudeOutput(rawPath, result.Model)
+			applyTelemetry(&result, combineReviewerTelemetry(parsed.Telemetry, finalOutput.Telemetry))
+			if finalResult.Err == nil && finalParseErr == nil {
+				finalReport := finalOutput.Report
+				attachTarget(&finalReport, result.Reviewer, request.Target)
+				if validationErr := validateReport(finalReport); validationErr == nil {
+					if preservationErr := validateClaudeFinalization(*candidate, finalReport); preservationErr == nil {
+						result.Status = "completed"
+						result.Report = &finalReport
+						return result
+					} else {
+						finalParseErr = preservationErr
+					}
+				} else {
+					finalParseErr = validationErr
+				}
+			}
+			if finalResult.Err != nil {
+				result.Error = "Claude finalization failed after the inspection reserve: " + claudeFailure(rawPath, stderrPath, finalResult.Err)
+			} else {
+				result.Error = "parse Claude reserved-turn finalization: " + finalParseErr.Error()
+			}
+			classifyFailure(&result, time.Now())
+			attachPartialReviewerReport(&result, request, candidate, "Claude could not finalize within its reserved turns.")
+			return result
+		}
+		result.Error = "prepare Claude reserved-turn finalization: " + promptErr.Error()
+		attachPartialReviewerReport(&result, request, candidate, "Claude could not start its reserved finalization phase.")
+		return result
+	}
+
+	result.Error = inspectionError.Error()
+	classifyFailure(&result, time.Now())
+	if errors.Is(processResult.Err, context.DeadlineExceeded) {
+		result.FailureKind = "timeout"
+		attachPartialReviewerReport(&result, request, partialReportCandidate(parsed.Report, checkpointPath), "Claude review timed out before producing a complete report.")
+	}
+	return result
+}
+
+func claudeReviewArgs(cfg config.Reviewer, request Request, schema []byte, _ string, maxTurns int, tools string) []string {
+	args := []string{
+		"-p",
+		"--safe-mode",
+		"--permission-mode", "dontAsk",
+		"--tools", tools,
+		"--settings", claudeReviewerSandboxSettings(request.RuntimeDir, request.RecoveryDir),
+		"--append-system-prompt", request.Policy,
+		"--max-turns", strconv.Itoa(maxTurns),
+		"--no-session-persistence",
+		"--output-format", "json",
+		"--json-schema", string(schema),
+	}
+	if cfg.MaxBudgetUSD > 0 {
+		args = append(args, "--max-budget-usd", strconv.FormatFloat(cfg.MaxBudgetUSD, 'f', -1, 64))
+	}
+	if cfg.Model != "" {
+		args = append(args, "--model", cfg.Model)
+	}
+	if cfg.Effort != "" {
+		args = append(args, "--effort", cfg.Effort)
+	}
+	return args
+}
+
+func claudeInspectionError(processResult processx.Result, parseErr error, report model.ReviewReport, reviewer string, target model.Target, rawPath, stderrPath string) error {
+	if processResult.Err != nil {
+		return errors.New("Claude review failed: " + claudeFailure(rawPath, stderrPath, processResult.Err))
 	}
 	if parseErr != nil {
-		result.Error = "parse Claude report: " + parseErr.Error()
-		classifyFailure(&result, time.Now())
-		if claudeReachedMaxTurns(rawPath, result.Error) {
-			attachPartialReviewerReport(&result, request, partialReportCandidate(parsed.Report, checkpointPath), "Claude reached its turn ceiling before producing a complete report.")
-		}
-		return result
+		return fmt.Errorf("parse Claude report: %w", parseErr)
 	}
-	report := parsed.Report
-	attachTarget(&report, result.Reviewer, request.Target)
+	attachTarget(&report, reviewer, target)
 	if err := validateReport(report); err != nil {
-		result.Error = "validate Claude report: " + err.Error()
-		return result
+		return fmt.Errorf("validate Claude report: %w", err)
 	}
-	result.Status = "completed"
-	result.Report = &report
-	return result
+	return nil
+}
+
+func claudeFinalizationFallback(request Request, reviewer, reason string) model.ReviewReport {
+	return model.ReviewReport{
+		SchemaVersion: model.SchemaVersion, Reviewer: reviewer,
+		BaseSHA: request.Target.BaseSHA, HeadSHA: request.Target.HeadSHA,
+		Verdict: "abstain", Summary: "Inspection reached its enforced finalization boundary before a complete report was available.",
+		ContextComplete: false, Findings: []model.Finding{}, ReviewedPaths: []string{},
+		OmittedPaths:  append([]string(nil), request.ChangedPaths...),
+		ResidualRisks: []string{"Inspection stopped before completion: " + strings.TrimSpace(reason)},
+	}
+}
+
+func claudeFinalizationPrompt(candidate model.ReviewReport, reason string) (string, error) {
+	contents, err := json.MarshalIndent(candidate, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(`CORA reserved-turn finalization phase.
+
+Repository tools are mechanically disabled. Do not investigate, speculate, or add findings. Return only the required structured report, using the inspection evidence below.
+
+- Preserve verdict, context_complete, summary, every finding, and all reviewed_paths, omitted_paths, and residual_risks exactly.
+- Finalization cannot upgrade, weaken, or otherwise rewrite the inspection evidence.
+- Normalize the evidence to the supplied schema and finish immediately.
+
+Inspection stop reason: %s
+
+Inspection evidence:
+%s
+`, strings.TrimSpace(reason), contents), nil
+}
+
+// validateClaudeFinalization makes the tools-disabled phase a serializer, not
+// a second reviewer. The reserved turns may only return the exact inspection
+// evidence Cora supplied; changing a verdict, dropping a finding, or narrowing
+// an omitted path would otherwise let finalization strengthen an incomplete or
+// request-changes result into an approval.
+func validateClaudeFinalization(candidate, finalized model.ReviewReport) error {
+	if !reflect.DeepEqual(candidate, finalized) {
+		return errors.New("finalizer changed the preserved inspection report")
+	}
+	return nil
+}
+
+func claudeFinalizationConfig(cfg config.Reviewer, inspection model.Usage) (config.Reviewer, error) {
+	if cfg.MaxBudgetUSD <= 0 {
+		return cfg, nil
+	}
+	if !inspection.APIEquivalentCostKnown || inspection.APIEquivalentCostPartial {
+		return config.Reviewer{}, errors.New("cannot enforce the whole-review max_budget_usd because inspection cost telemetry is incomplete")
+	}
+	remaining := cfg.MaxBudgetUSD - inspection.APIEquivalentCostUSD
+	if remaining <= 0 {
+		return config.Reviewer{}, fmt.Errorf("inspection exhausted the whole-review max_budget_usd ceiling of $%.2f", cfg.MaxBudgetUSD)
+	}
+	cfg.MaxBudgetUSD = remaining
+	return cfg, nil
+}
+
+func preserveClaudeInspectionArtifacts(rawPath, stderrPath string) error {
+	for _, artifact := range []struct {
+		from string
+		to   string
+	}{
+		{from: rawPath, to: strings.TrimSuffix(rawPath, ".raw.json") + ".inspection.raw.json"},
+		{from: stderrPath, to: strings.TrimSuffix(stderrPath, ".stderr.log") + ".inspection.stderr.log"},
+	} {
+		if err := os.Rename(artifact.from, artifact.to); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func combineReviewerTelemetry(inspection, finalization reviewerTelemetry) reviewerTelemetry {
+	combined := inspection
+	if finalization.Model != "" {
+		combined.Model = finalization.Model
+		combined.ModelSource = finalization.ModelSource
+	}
+	combined.Usage = combinePhaseUsage(inspection.Usage, finalization.Usage)
+	return combined
+}
+
+func combinePhaseUsage(inspection, finalization model.Usage) model.Usage {
+	combined := inspection
+	combined.InputTokens += finalization.InputTokens
+	combined.CachedInputTokens += finalization.CachedInputTokens
+	combined.OutputTokens += finalization.OutputTokens
+	combined.ThinkingTokens += finalization.ThinkingTokens
+	combined.Turns += finalization.Turns
+	combined.APIEquivalentCostUSD += finalization.APIEquivalentCostUSD
+	combined.TurnsKnown, combined.TurnsPartial = combinedMetricAvailability(
+		inspection.TurnsKnown, inspection.TurnsPartial, finalization.TurnsKnown, finalization.TurnsPartial,
+	)
+	combined.ThinkingTokensKnown, combined.ThinkingTokensPartial = combinedMetricAvailability(
+		inspection.ThinkingTokensKnown, inspection.ThinkingTokensPartial, finalization.ThinkingTokensKnown, finalization.ThinkingTokensPartial,
+	)
+	combined.APIEquivalentCostKnown, combined.APIEquivalentCostPartial = combinedMetricAvailability(
+		inspection.APIEquivalentCostKnown, inspection.APIEquivalentCostPartial, finalization.APIEquivalentCostKnown, finalization.APIEquivalentCostPartial,
+	)
+	if inspection.CostSource == finalization.CostSource {
+		combined.CostSource = inspection.CostSource
+	} else {
+		combined.CostSource = strings.Trim(strings.Join([]string{inspection.CostSource, finalization.CostSource}, "; "), "; ")
+	}
+	return combined
+}
+
+func combinedMetricAvailability(firstKnown, firstPartial, secondKnown, secondPartial bool) (known, partial bool) {
+	firstAvailable := firstKnown || firstPartial
+	secondAvailable := secondKnown || secondPartial
+	known = firstKnown && !firstPartial && secondKnown && !secondPartial
+	partial = (firstAvailable || secondAvailable) && !known
+	return known, partial
 }
 
 func claudePrompt(prompt string, cfg config.Reviewer) string {
@@ -558,10 +743,10 @@ func claudePrompt(prompt string, cfg config.Reviewer) string {
 	return prompt + fmt.Sprintf(`
 
 CORA turn-budget contract:
-- Stop repository inspection and tool use no later than turn %d.
-- Reserve the final %d turn(s) exclusively for producing the required structured report.
+- This inspection process is mechanically capped at %d turn(s); finish and return the structured report sooner whenever possible.
+- If inspection reaches that cap without a report, CORA starts a separate tools-disabled finalizer capped at the remaining %d reserved turn(s).
 - If inspection is incomplete, return a best-effort report with verdict "abstain", context_complete false, every unreviewed path in omitted_paths, and remaining uncertainty in residual_risks.
-- Never spend the final reserved turns on more investigation.
+- The reserved finalizer cannot use repository tools or promote incomplete evidence into approval.
 `, toolTurns, cfg.FinalizationTurns)
 }
 
@@ -596,7 +781,13 @@ func partialReportCandidate(providerReport model.ReviewReport, checkpointPath st
 	if report := usablePartialReport(providerReport); report != nil {
 		return report
 	}
-	if report, found := readValidatedReport(checkpointPath); found {
+	if report, found := readValidatedCheckpoint(checkpointPath); found {
+		// Checkpoints are writable recovery hints, not finalized provider output.
+		// Enforce the prompt contract before allowing one into finalization so a
+		// modified checkpoint can never become a completed approval.
+		if report.Verdict != "abstain" || report.ContextComplete {
+			return nil
+		}
 		return &report
 	}
 	return nil
@@ -722,7 +913,7 @@ func readCodexPartialReport(checkpointPath, rawPath, eventsPath string) (model.R
 	}
 	// The private recovery checkpoint is written after a finding changes, so it is newer
 	// than any earlier progress message and survives until the provider returns.
-	if report, checkpointFound := readValidatedReport(checkpointPath); checkpointFound {
+	if report, checkpointFound := readValidatedCheckpoint(checkpointPath); checkpointFound {
 		latest, found = report, true
 	}
 	// A finalized output file is newer and more authoritative than a mirrored
@@ -739,6 +930,21 @@ func readValidatedReport(path string) (model.ReviewReport, bool) {
 	}
 	report, err := readReport(path)
 	if err != nil || validateReport(report) != nil {
+		return model.ReviewReport{}, false
+	}
+	return report, true
+}
+
+func readValidatedCheckpoint(path string) (model.ReviewReport, bool) {
+	if strings.TrimSpace(path) == "" {
+		return model.ReviewReport{}, false
+	}
+	contents, err := readRecoveryCheckpoint(path)
+	if err != nil {
+		return model.ReviewReport{}, false
+	}
+	var report model.ReviewReport
+	if json.Unmarshal(contents, &report) != nil || validateReport(report) != nil {
 		return model.ReviewReport{}, false
 	}
 	return report, true
@@ -1388,14 +1594,12 @@ func validateReport(report model.ReviewReport) error {
 			return fmt.Errorf("finding %d has invalid disposition %q", i, finding.Disposition)
 		}
 		if finding.Reachability != nil {
-			switch finding.Reachability.Status {
-			case "demonstrated", "not_demonstrated", "uncertain":
-			default:
+			if !model.ValidReachabilityStatus(finding.Reachability.Status) {
 				return fmt.Errorf("finding %d has invalid reachability status %q", i, finding.Reachability.Status)
 			}
 		}
 		if finding.Severity == "blocker" || finding.Severity == "major" {
-			if finding.Reachability == nil || finding.Reachability.Status != "demonstrated" || strings.TrimSpace(finding.Reachability.Trigger) == "" || len(finding.Reachability.Path) == 0 || strings.TrimSpace(finding.Reachability.Impact) == "" {
+			if finding.Reachability == nil || finding.Reachability.Status != model.ReachabilityDemonstrated || strings.TrimSpace(finding.Reachability.Trigger) == "" || len(finding.Reachability.Path) == 0 || strings.TrimSpace(finding.Reachability.Impact) == "" {
 				return fmt.Errorf("finding %d does not demonstrate trigger-to-impact reachability", i)
 			}
 		}

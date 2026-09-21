@@ -3,8 +3,10 @@
 package record
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -56,6 +58,30 @@ func TestStoreCreatesPrivateRecordsWithPermissiveUmask(t *testing.T) {
 		filepath.Join(store.Root, "latest"),
 	} {
 		assertPermissions(t, path, 0o600)
+	}
+}
+
+func TestStoreAcquireReclaimsDeadPIDLockImmediately(t *testing.T) {
+	store := New(t.TempDir())
+	stale, err := store.Acquire("dead-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(stale.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = []byte(strings.Replace(string(contents), fmt.Sprintf("pid=%d", os.Getpid()), "pid=1073741823", 1))
+	if err := os.WriteFile(stale.path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement, err := store.Acquire("dead-owner")
+	if err != nil {
+		t.Fatalf("reclaim dead-PID lock: %v", err)
+	}
+	if err := replacement.Release(); err != nil {
+		t.Fatal(err)
 	}
 }
 

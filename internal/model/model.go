@@ -76,6 +76,24 @@ type Reachability struct {
 	Preconditions []string `json:"preconditions"`
 }
 
+const (
+	ReachabilityDemonstrated    = "demonstrated"
+	ReachabilityNotDemonstrated = "not_demonstrated"
+	ReachabilityNotApplicable   = "not_applicable"
+	ReachabilityUncertain       = "uncertain"
+)
+
+// ValidReachabilityStatus is the canonical runtime allowlist for the statuses
+// exposed by the structured review schema.
+func ValidReachabilityStatus(status string) bool {
+	switch status {
+	case ReachabilityDemonstrated, ReachabilityNotDemonstrated, ReachabilityNotApplicable, ReachabilityUncertain:
+		return true
+	default:
+		return false
+	}
+}
+
 type ConsolidatedFinding struct {
 	ID                   string        `json:"id"`
 	Severity             string        `json:"severity"`
@@ -137,6 +155,7 @@ type ReviewerResult struct {
 	ModelSource       string        `json:"model_source,omitempty"`
 	Effort            string        `json:"effort,omitempty"`
 	EscalationCause   string        `json:"escalation_cause,omitempty"`
+	WebEvidenceHash   string        `json:"web_evidence_sha256,omitempty"`
 	Attempt           int           `json:"attempt"`
 	ReusedFromRunID   string        `json:"reused_from_run_id,omitempty"`
 	FailureKind       string        `json:"failure_kind,omitempty"`
@@ -185,24 +204,100 @@ type Usage struct {
 }
 
 type ProviderQueueStatus struct {
-	Provider string     `json:"provider"`
-	Position int        `json:"position"`
-	Ahead    int        `json:"ahead"`
-	Active   int        `json:"active"`
-	Limit    int        `json:"limit"`
-	WaitMS   int64      `json:"wait_ms"`
-	ETAAt    *time.Time `json:"eta_at,omitempty"`
+	Provider string                   `json:"provider"`
+	Position int                      `json:"position"`
+	Ahead    int                      `json:"ahead"`
+	Active   int                      `json:"active"`
+	Limit    int                      `json:"limit"`
+	WaitMS   int64                    `json:"wait_ms"`
+	ETAAt    *time.Time               `json:"eta_at,omitempty"`
+	Holders  []ProviderCapacityHolder `json:"capacity_holders,omitempty"`
+}
+
+// ProviderCapacityHolder identifies the work currently consuming a global
+// provider slot. StartedAt and TimeoutAt are published when provider execution
+// actually begins, so queued callers see the holder's real remaining execution
+// window rather than another historical queue estimate.
+type ProviderCapacityHolder struct {
+	RunID     string     `json:"run_id,omitempty"`
+	Reviewer  string     `json:"reviewer,omitempty"`
+	PID       int        `json:"pid,omitempty"`
+	StartedAt time.Time  `json:"started_at,omitempty"`
+	TimeoutAt *time.Time `json:"timeout_at,omitempty"`
 }
 
 type CheckResult struct {
-	Name            string   `json:"name"`
-	Profile         string   `json:"profile,omitempty"`
-	Status          string   `json:"status"`
-	Duration        Duration `json:"duration_ms"`
-	ExitCode        int      `json:"exit_code,omitempty"`
-	Error           string   `json:"error,omitempty"`
-	Isolation       string   `json:"isolation,omitempty"`
-	ReusedFromRunID string   `json:"reused_from_run_id,omitempty"`
+	Name             string                      `json:"name"`
+	Profile          string                      `json:"profile,omitempty"`
+	Status           string                      `json:"status"`
+	Duration         Duration                    `json:"duration_ms"`
+	ExitCode         int                         `json:"exit_code,omitempty"`
+	FailureKind      string                      `json:"failure_kind,omitempty"`
+	Error            string                      `json:"error,omitempty"`
+	Isolation        string                      `json:"isolation,omitempty"`
+	ReusedFromRunID  string                      `json:"reused_from_run_id,omitempty"`
+	ImportedEvidence *ImportedValidationEvidence `json:"imported_evidence,omitempty"`
+}
+
+// ImportedValidationEvidence records an operator-supplied attestation from an
+// independent validation system. CORA binds the attestation to the exact
+// repository and diff and preserves its original bytes, but does not claim to
+// authenticate the named verifier or source.
+type ImportedValidationEvidence struct {
+	SchemaVersion      string    `json:"schema_version"`
+	Name               string    `json:"name"`
+	RepositoryIdentity string    `json:"repository_identity"`
+	BaseSHA            string    `json:"base_sha"`
+	HeadSHA            string    `json:"head_sha"`
+	DiffHash           string    `json:"diff_hash"`
+	Status             string    `json:"status"`
+	VerifiedAt         time.Time `json:"verified_at"`
+	Verifier           string    `json:"verifier"`
+	Source             string    `json:"source"`
+	Command            []string  `json:"command"`
+	Summary            string    `json:"summary"`
+	Trust              string    `json:"trust"`
+	ContentSHA256      string    `json:"content_sha256"`
+	RecordFile         string    `json:"record_file"`
+}
+
+// WebEvidenceSnapshot identifies the immutable, Cora-captured external
+// reference material supplied to every reviewer in a run. The material is
+// untrusted context and never counts as deterministic validation.
+type WebEvidenceSnapshot struct {
+	Mode           string              `json:"mode"`
+	SourceRunID    string              `json:"source_run_id,omitempty"`
+	IndexFile      string              `json:"index_file"`
+	IndexSHA256    string              `json:"index_sha256"`
+	PromptFile     string              `json:"prompt_file"`
+	PromptSHA256   string              `json:"prompt_sha256"`
+	SnapshotSHA256 string              `json:"snapshot_sha256"`
+	Count          int                 `json:"count"`
+	Sources        []WebEvidenceSource `json:"sources"`
+}
+
+// WebEvidenceSource records one bounded HTTPS response and the safe subset of
+// transport metadata needed to audit what reviewers were shown.
+type WebEvidenceSource struct {
+	ID           string                `json:"id"`
+	RequestedURL string                `json:"requested_url"`
+	FinalURL     string                `json:"final_url"`
+	Redirects    []WebEvidenceRedirect `json:"redirects"`
+	FetchedAt    time.Time             `json:"fetched_at"`
+	StatusCode   int                   `json:"status_code"`
+	ContentType  string                `json:"content_type"`
+	ETag         string                `json:"etag,omitempty"`
+	LastModified string                `json:"last_modified,omitempty"`
+	ResolvedIPs  []string              `json:"resolved_ips"`
+	BodyBytes    int64                 `json:"body_bytes"`
+	BodySHA256   string                `json:"body_sha256"`
+	BodyFile     string                `json:"body_file"`
+	Truncated    bool                  `json:"truncated"`
+}
+
+type WebEvidenceRedirect struct {
+	StatusCode int    `json:"status_code"`
+	URL        string `json:"url"`
 }
 
 type SecurityMetadata struct {
@@ -216,6 +311,24 @@ type EscalationMetadata struct {
 	Triggered      bool     `json:"triggered"`
 	Causes         []string `json:"causes,omitempty"`
 	SensitivePaths []string `json:"sensitive_paths,omitempty"`
+}
+
+// ReviewerExecutionLimit is the effective execution budget for one reviewer
+// role. Keeping these limits per role prevents a targeted retry increase from
+// silently broadening a different reviewer in a later retry generation.
+type ReviewerExecutionLimit struct {
+	Timeout  Duration `json:"timeout_ms"`
+	MaxTurns int      `json:"max_turns,omitempty"`
+}
+
+// RetryLimitOverrides records the explicit limit increases requested for a
+// child retry. ReviewerExecutionLimits stores the resulting per-role values;
+// this metadata makes the operator's intentional deviation easy to audit.
+type RetryLimitOverrides struct {
+	Reviewers       []string  `json:"reviewers"`
+	ReviewerTimeout *Duration `json:"reviewer_timeout_ms,omitempty"`
+	OverallTimeout  *Duration `json:"overall_timeout_ms,omitempty"`
+	MaxTurns        *int      `json:"max_turns,omitempty"`
 }
 
 type Decision struct {
@@ -232,6 +345,8 @@ type Decision struct {
 	Reviewers            map[string]string     `json:"reviewers"`
 	ReviewerErrors       map[string]string     `json:"reviewer_errors,omitempty"`
 	OpenFindings         map[string]int        `json:"open_findings"`
+	BlockingFindings     int                   `json:"blocking_findings"`
+	NonBlockingFindings  int                   `json:"non_blocking_findings"`
 	Findings             []ConsolidatedFinding `json:"findings,omitempty"`
 	CarryForwardFindings []ConsolidatedFinding `json:"carry_forward_findings"`
 	RejectedFindings     []ConsolidatedFinding `json:"rejected_findings,omitempty"`
@@ -247,43 +362,47 @@ type Decision struct {
 }
 
 type Manifest struct {
-	SchemaVersion         string                `json:"schema_version"`
-	RunID                 string                `json:"run_id"`
-	Repository            string                `json:"repository"`
-	RepositoryIdentity    string                `json:"repository_identity"`
-	StartedAt             time.Time             `json:"started_at"`
-	FinishedAt            time.Time             `json:"finished_at,omitempty"`
-	WallElapsed           Duration              `json:"wall_elapsed_ms"`
-	ActiveExecution       Duration              `json:"active_execution_ms"`
-	ActiveTimingBasis     string                `json:"active_timing_basis,omitempty"`
-	ParentRunID           string                `json:"parent_run_id,omitempty"`
-	AutoFixLoopID         string                `json:"auto_fix_loop_id,omitempty"`
-	AutoFixIteration      int                   `json:"auto_fix_iteration,omitempty"`
-	ReviewScope           string                `json:"review_scope,omitempty"`
-	ApprovalBaselineRunID string                `json:"approval_baseline_run_id,omitempty"`
-	ApprovalBaselineHash  string                `json:"approval_baseline_diff_hash,omitempty"`
-	Target                Target                `json:"target"`
-	FullTarget            *Target               `json:"full_target,omitempty"`
-	ReviewPolicy          *AutoFixReviewPolicy  `json:"review_policy,omitempty"`
-	Reviewers             []ReviewerResult      `json:"reviewers,omitempty"`
-	SecurityReviews       []ReviewerResult      `json:"security_reviews,omitempty"`
-	CrossExaminations     []ReviewerResult      `json:"cross_examinations,omitempty"`
-	CarriedFindings       []ConsolidatedFinding `json:"carried_findings,omitempty"`
-	Checks                []CheckResult         `json:"checks,omitempty"`
-	PromptHash            string                `json:"prompt_hash"`
-	SecurityPromptHash    string                `json:"security_review_prompt_hash,omitempty"`
-	CrossExamPromptHash   string                `json:"cross_examination_prompt_hash,omitempty"`
-	PolicyHash            string                `json:"policy_hash"`
-	SchemaHash            string                `json:"schema_hash"`
-	CoraVersion           string                `json:"cora_version"`
-	CoraSourceSHA         string                `json:"cora_source_sha"`
-	CoraBuildTime         string                `json:"cora_build_time,omitempty"`
-	Security              SecurityMetadata      `json:"security"`
-	Escalation            EscalationMetadata    `json:"escalation"`
-	StrictPolicy          bool                  `json:"strict_policy"`
-	Usage                 Usage                 `json:"usage"`
-	IncrementalUsage      Usage                 `json:"incremental_usage"`
-	CumulativeUsage       Usage                 `json:"cumulative_usage"`
+	SchemaVersion           string                            `json:"schema_version"`
+	RunID                   string                            `json:"run_id"`
+	Repository              string                            `json:"repository"`
+	RepositoryIdentity      string                            `json:"repository_identity"`
+	StartedAt               time.Time                         `json:"started_at"`
+	FinishedAt              time.Time                         `json:"finished_at,omitempty"`
+	WallElapsed             Duration                          `json:"wall_elapsed_ms"`
+	ActiveExecution         Duration                          `json:"active_execution_ms"`
+	ActiveTimingBasis       string                            `json:"active_timing_basis,omitempty"`
+	ParentRunID             string                            `json:"parent_run_id,omitempty"`
+	RetryLimitOverrides     *RetryLimitOverrides              `json:"retry_limit_overrides,omitempty"`
+	ReviewerExecutionLimits map[string]ReviewerExecutionLimit `json:"reviewer_execution_limits,omitempty"`
+	AutoFixLoopID           string                            `json:"auto_fix_loop_id,omitempty"`
+	AutoFixIteration        int                               `json:"auto_fix_iteration,omitempty"`
+	ReviewScope             string                            `json:"review_scope,omitempty"`
+	ApprovalBaselineRunID   string                            `json:"approval_baseline_run_id,omitempty"`
+	ApprovalBaselineHash    string                            `json:"approval_baseline_diff_hash,omitempty"`
+	Target                  Target                            `json:"target"`
+	FullTarget              *Target                           `json:"full_target,omitempty"`
+	ReviewPolicy            *AutoFixReviewPolicy              `json:"review_policy,omitempty"`
+	Reviewers               []ReviewerResult                  `json:"reviewers,omitempty"`
+	SecurityReviews         []ReviewerResult                  `json:"security_reviews,omitempty"`
+	CrossExaminations       []ReviewerResult                  `json:"cross_examinations,omitempty"`
+	CarriedFindings         []ConsolidatedFinding             `json:"carried_findings,omitempty"`
+	Checks                  []CheckResult                     `json:"checks,omitempty"`
+	WebEvidence             *WebEvidenceSnapshot              `json:"web_evidence,omitempty"`
+	PromptHash              string                            `json:"prompt_hash"`
+	SecurityPromptHash      string                            `json:"security_review_prompt_hash,omitempty"`
+	CrossExamPromptHash     string                            `json:"cross_examination_prompt_hash,omitempty"`
+	DecisionHash            string                            `json:"decision_sha256,omitempty"`
+	PolicyHash              string                            `json:"policy_hash"`
+	SchemaHash              string                            `json:"schema_hash"`
+	CoraVersion             string                            `json:"cora_version"`
+	CoraSourceSHA           string                            `json:"cora_source_sha"`
+	CoraBuildTime           string                            `json:"cora_build_time,omitempty"`
+	Security                SecurityMetadata                  `json:"security"`
+	Escalation              EscalationMetadata                `json:"escalation"`
+	StrictPolicy            bool                              `json:"strict_policy"`
+	Usage                   Usage                             `json:"usage"`
+	IncrementalUsage        Usage                             `json:"incremental_usage"`
+	CumulativeUsage         Usage                             `json:"cumulative_usage"`
 }
 
 type AutoFixAttempt struct {
@@ -322,6 +441,8 @@ type AutoFixIteration struct {
 	FullDiffHash          string           `json:"full_diff_hash,omitempty"`
 	ApprovalBaselineRunID string           `json:"approval_baseline_run_id,omitempty"`
 	ApprovalBaselineHash  string           `json:"approval_baseline_diff_hash,omitempty"`
+	BlockingFindings      int              `json:"blocking_findings"`
+	NonBlockingFindings   int              `json:"non_blocking_findings"`
 	QualifyingFindingIDs  []string         `json:"qualifying_finding_ids,omitempty"`
 	QualifyingFingerprint string           `json:"qualifying_fingerprint,omitempty"`
 	ReviewUsage           Usage            `json:"review_usage"`
@@ -354,6 +475,7 @@ type AutoFixReviewPolicy struct {
 	CrossExamineBlockingFindings bool                          `json:"cross_examine_blocking_findings"`
 	RequireCleanTree             bool                          `json:"require_clean_tree"`
 	AllowAPIBilling              bool                          `json:"allow_api_billing"`
+	AllowReviewWeb               bool                          `json:"allow_review_web"`
 	AllowUnsafeChecks            bool                          `json:"allow_unsafe_host_checks"`
 	MinimumApprovals             int                           `json:"minimum_approvals"`
 	BlockingSeverities           []string                      `json:"blocking_severities"`
@@ -458,6 +580,7 @@ type Heartbeat struct {
 	ActiveTimingBasis string                         `json:"active_timing_basis,omitempty"`
 	PID               int                            `json:"pid"`
 	Reviewers         map[string]string              `json:"reviewers,omitempty"`
+	ReviewerVerdicts  map[string]string              `json:"reviewer_verdicts,omitempty"`
 	ReviewerStartedAt map[string]time.Time           `json:"reviewer_started_at,omitempty"`
 	Checks            map[string]string              `json:"checks,omitempty"`
 	Queues            map[string]ProviderQueueStatus `json:"queues,omitempty"`
@@ -477,7 +600,11 @@ type RunSummary struct {
 	AutoFixLoopID      string                         `json:"auto_fix_loop_id,omitempty"`
 	AutoFixIteration   int                            `json:"auto_fix_iteration,omitempty"`
 	RepositoryIdentity string                         `json:"repository_identity,omitempty"`
+	AwaitingResume     bool                           `json:"awaiting_resume,omitempty"`
+	RetryReady         bool                           `json:"retry_ready,omitempty"`
+	RetryAt            *time.Time                     `json:"retry_at,omitempty"`
 	Reviewers          map[string]string              `json:"reviewers,omitempty"`
+	ReviewerVerdicts   map[string]string              `json:"reviewer_verdicts,omitempty"`
 	ReviewerElapsedMS  map[string]int64               `json:"reviewer_elapsed_ms,omitempty"`
 	Checks             map[string]string              `json:"checks,omitempty"`
 	Queues             map[string]ProviderQueueStatus `json:"queues,omitempty"`

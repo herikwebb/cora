@@ -9,13 +9,14 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
 	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/herikwebb/cora/internal/model"
+	processx "github.com/herikwebb/cora/internal/process"
 )
 
 type Repo struct {
@@ -203,18 +204,25 @@ func (w *Workspace) Close(ctx context.Context) error {
 	if w.parent == "" || w.Root != filepath.Join(w.parent, directoryName) {
 		return errors.New("refusing to remove an invalid temporary review workspace")
 	}
+	// Cleanup must survive cancellation of the operation that created or used
+	// the workspace. Bound the detached cleanup so it cannot hang shutdown.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
 	var removeErr error
 	if w.linked {
-		_, removeErr = gitBytes(ctx, w.repository.Root, "worktree", "remove", "--force", w.Root)
+		_, removeErr = gitBytes(cleanupCtx, w.repository.Root, "worktree", "remove", "--force", w.Root)
 	}
-	filesystemErr := os.RemoveAll(w.parent)
-	w.temporary = false
+	filesystemErr := processx.RemoveAllWritable(w.parent)
 	if removeErr != nil {
 		return fmt.Errorf("remove temporary Git worktree: %w", removeErr)
 	}
 	if filesystemErr != nil {
 		return fmt.Errorf("remove temporary review directory: %w", filesystemErr)
 	}
+	w.temporary = false
 	return nil
 }
 
@@ -469,7 +477,9 @@ func (r Repo) ResolveRevision(ctx context.Context, revision string) (string, err
 }
 
 func (r Repo) IsDirty(ctx context.Context) (bool, error) {
-	status, err := gitOutput(ctx, r.Root, "status", "--porcelain=v1", "--untracked-files=normal")
+	// Status is observational here. Disable Git's optional locks so it cannot
+	// refresh and rewrite the index while resolving a review or read-only plan.
+	status, err := gitOutput(ctx, r.Root, "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=normal")
 	if err != nil {
 		return false, fmt.Errorf("read Git status: %w", err)
 	}
@@ -493,7 +503,7 @@ func (r Repo) VerifyTarget(ctx context.Context, target model.Target) (bool, erro
 // audit record. Untracked working-tree files are represented as new files.
 func (r Repo) ReviewDiff(ctx context.Context, target model.Target) ([]byte, error) {
 	if !workingTreeTarget(target) {
-		diff, err := gitBytes(ctx, r.Root, "diff", "--binary", "--no-ext-diff", "--no-textconv", target.BaseSHA, target.HeadSHA)
+		diff, err := gitBytes(ctx, r.Root, "--no-optional-locks", "diff", "--binary", "--no-ext-diff", "--no-textconv", target.BaseSHA, target.HeadSHA)
 		if err != nil {
 			return nil, fmt.Errorf("render review diff: %w", err)
 		}
@@ -503,25 +513,26 @@ func (r Repo) ReviewDiff(ctx context.Context, target model.Target) ([]byte, erro
 	return r.workingTreeDiff(ctx, target.BaseSHA)
 }
 
-func (r Repo) workingTreeDiff(ctx context.Context, baseSHA string) ([]byte, error) {
-	diff, err := gitBytes(ctx, r.Root, "diff", "--binary", "--no-ext-diff", "--no-textconv", baseSHA)
+func (r Repo) workingTreeDiff(ctx context.Context, baseSHA string) (diff []byte, returnErr error) {
+	environment, cleanup, err := r.readOnlyIndexEnvironment(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { returnErr = errors.Join(returnErr, cleanup()) }()
+	diff, err = gitBytesEnv(ctx, r.Root, environment, "diff", "--binary", "--no-ext-diff", "--no-textconv", baseSHA)
 	if err != nil {
 		return nil, fmt.Errorf("render working tree diff: %w", err)
 	}
-	untrackedRaw, err := gitBytes(ctx, r.Root, "ls-files", "--others", "--exclude-standard", "-z")
+	untrackedRaw, err := gitBytesEnv(ctx, r.Root, environment, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return nil, fmt.Errorf("list untracked files: %w", err)
 	}
 	untracked := splitNUL(untrackedRaw)
 	sort.Strings(untracked)
 	for _, name := range untracked {
-		command := exec.CommandContext(ctx, "git", "-C", r.Root, "diff", "--no-index", "--binary", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--", "/dev/null", name)
-		var stderr bytes.Buffer
-		command.Stderr = &stderr
-		fileDiff, commandErr := command.Output()
-		var exitErr *exec.ExitError
-		if commandErr != nil && (!errors.As(commandErr, &exitErr) || exitErr.ExitCode() != 1) {
-			return nil, fmt.Errorf("render untracked file %s: %s", name, firstGitError(stderr.String(), commandErr))
+		fileDiff, stderr, commandResult := gitCapture(ctx, r.Root, nil, "diff", "--no-index", "--binary", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--", "/dev/null", name)
+		if commandResult.Err != nil && commandResult.ExitCode != 1 {
+			return nil, fmt.Errorf("render untracked file %s: %s", name, firstGitError(string(stderr), commandResult.Err))
 		}
 		diff = append(diff, fileDiff...)
 	}
@@ -529,20 +540,31 @@ func (r Repo) workingTreeDiff(ctx context.Context, baseSHA string) ([]byte, erro
 }
 
 // ChangedPaths returns the repository-relative paths represented by a target.
-func (r Repo) ChangedPaths(ctx context.Context, target model.Target) ([]string, error) {
+func (r Repo) ChangedPaths(ctx context.Context, target model.Target) (paths []string, returnErr error) {
 	var raw []byte
 	var err error
+	var environment []string
 	if workingTreeTarget(target) {
-		raw, err = gitBytes(ctx, r.Root, "diff", "--name-only", "-z", "--no-ext-diff", target.BaseSHA)
+		var cleanup func() error
+		var environmentErr error
+		environment, cleanup, environmentErr = r.readOnlyIndexEnvironment(ctx)
+		if environmentErr != nil {
+			return nil, environmentErr
+		}
+		defer func() { returnErr = errors.Join(returnErr, cleanup()) }()
+		raw, err = gitBytesEnv(ctx, r.Root, environment, "diff", "--name-status", "-z", "--find-renames", "--no-ext-diff", target.BaseSHA)
 	} else {
-		raw, err = gitBytes(ctx, r.Root, "diff", "--name-only", "-z", "--no-ext-diff", target.BaseSHA, target.HeadSHA)
+		raw, err = gitBytes(ctx, r.Root, "--no-optional-locks", "diff", "--name-status", "-z", "--find-renames", "--no-ext-diff", target.BaseSHA, target.HeadSHA)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list changed paths: %w", err)
 	}
-	paths := splitNUL(raw)
+	paths, err = parseNameStatusPaths(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse changed paths: %w", err)
+	}
 	if workingTreeTarget(target) {
-		untrackedRaw, untrackedErr := gitBytes(ctx, r.Root, "ls-files", "--others", "--exclude-standard", "-z")
+		untrackedRaw, untrackedErr := gitBytesEnv(ctx, r.Root, environment, "ls-files", "--others", "--exclude-standard", "-z")
 		if untrackedErr != nil {
 			return nil, fmt.Errorf("list untracked paths: %w", untrackedErr)
 		}
@@ -562,6 +584,25 @@ func (r Repo) ChangedPaths(ctx context.Context, target model.Target) ([]string, 
 	return paths, nil
 }
 
+func parseNameStatusPaths(raw []byte) ([]string, error) {
+	fields := splitNUL(raw)
+	paths := make([]string, 0, len(fields)/2)
+	for index := 0; index < len(fields); {
+		status := fields[index]
+		index++
+		pathCount := 1
+		if status[0] == 'R' || status[0] == 'C' {
+			pathCount = 2
+		}
+		if len(fields)-index < pathCount {
+			return nil, fmt.Errorf("Git name-status entry %q is missing %d path(s)", status, pathCount-(len(fields)-index))
+		}
+		paths = append(paths, fields[index:index+pathCount]...)
+		index += pathCount
+	}
+	return paths, nil
+}
+
 func workingTreeTarget(target model.Target) bool {
 	return target.Mode == "uncommitted" || target.Mode == "working-tree"
 }
@@ -577,8 +618,8 @@ func (r Repo) ReadFileAt(ctx context.Context, revision, name string) ([]byte, bo
 		return nil, false, err
 	}
 	object := revision + ":" + clean
-	probe := exec.CommandContext(ctx, "git", "-C", r.Root, "cat-file", "-e", object)
-	if err := probe.Run(); err != nil {
+	_, _, probe := gitCapture(ctx, r.Root, nil, "cat-file", "-e", object)
+	if probe.Err != nil {
 		if ctx.Err() != nil {
 			return nil, false, ctx.Err()
 		}
@@ -592,7 +633,7 @@ func (r Repo) ReadFileAt(ctx context.Context, revision, name string) ([]byte, bo
 }
 
 func (r Repo) diffHash(ctx context.Context, base, head string) (string, bool, error) {
-	diff, err := gitBytes(ctx, r.Root, "diff", "--binary", "--no-ext-diff", "--no-textconv", base, head)
+	diff, err := gitBytes(ctx, r.Root, "--no-optional-locks", "diff", "--binary", "--no-ext-diff", "--no-textconv", base, head)
 	if err != nil {
 		return "", false, fmt.Errorf("calculate diff: %w", err)
 	}
@@ -600,16 +641,21 @@ func (r Repo) diffHash(ctx context.Context, base, head string) (string, bool, er
 	return hex.EncodeToString(sum[:]), len(diff) == 0, nil
 }
 
-func (r Repo) worktreeHash(ctx context.Context) (string, error) {
-	tracked, err := gitBytes(ctx, r.Root, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD")
+func (r Repo) worktreeHash(ctx context.Context) (hash string, returnErr error) {
+	environment, cleanup, err := r.readOnlyIndexEnvironment(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { returnErr = errors.Join(returnErr, cleanup()) }()
+	tracked, err := gitBytesEnv(ctx, r.Root, environment, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("calculate working tree diff: %w", err)
 	}
-	status, err := gitBytes(ctx, r.Root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	status, err := gitBytesEnv(ctx, r.Root, environment, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
 		return "", fmt.Errorf("calculate working tree status: %w", err)
 	}
-	untrackedRaw, err := gitBytes(ctx, r.Root, "ls-files", "--others", "--exclude-standard", "-z")
+	untrackedRaw, err := gitBytesEnv(ctx, r.Root, environment, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return "", fmt.Errorf("list untracked files: %w", err)
 	}
@@ -645,6 +691,74 @@ func splitNUL(data []byte) []string {
 	return result
 }
 
+// readOnlyIndexEnvironment gives observational working-tree commands a private
+// copy of the repository index. Git may refresh stat information in the index
+// even for commands such as diff, so GIT_OPTIONAL_LOCKS=0 alone is not enough
+// to keep a plan operation repository-read-only.
+func (r Repo) readOnlyIndexEnvironment(ctx context.Context) ([]string, func() error, error) {
+	indexName, err := gitOutput(ctx, r.Root, "--no-optional-locks", "rev-parse", "--git-path", "index")
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve Git index: %w", err)
+	}
+	if !filepath.IsAbs(indexName) {
+		indexName = filepath.Join(r.Root, indexName)
+	}
+	indexName = filepath.Clean(indexName)
+	indexContents, err := os.ReadFile(indexName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read Git index: %w", err)
+	}
+
+	temporaryDirectory, err := os.MkdirTemp("", "cora-read-index-")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create temporary Git index directory: %w", err)
+	}
+	cleanup := func() error {
+		if cleanupErr := processx.RemoveAllWritable(temporaryDirectory); cleanupErr != nil {
+			return fmt.Errorf("remove temporary Git index directory: %w", cleanupErr)
+		}
+		return nil
+	}
+	fail := func(cause error) ([]string, func() error, error) {
+		return nil, nil, errors.Join(cause, cleanup())
+	}
+
+	temporaryIndex := filepath.Join(temporaryDirectory, "index")
+	if err := os.WriteFile(temporaryIndex, indexContents, 0o600); err != nil {
+		return fail(fmt.Errorf("copy Git index: %w", err))
+	}
+	// A split index references sharedindex.* alongside the primary index. Copy
+	// those immutable companions as well so repositories using split-index mode
+	// retain the same semantics under GIT_INDEX_FILE.
+	entries, err := os.ReadDir(filepath.Dir(indexName))
+	if err != nil {
+		return fail(fmt.Errorf("inspect Git index directory: %w", err))
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "sharedindex.") {
+			continue
+		}
+		contents, readErr := os.ReadFile(filepath.Join(filepath.Dir(indexName), entry.Name()))
+		if readErr != nil {
+			return fail(fmt.Errorf("read shared Git index %s: %w", entry.Name(), readErr))
+		}
+		if writeErr := os.WriteFile(filepath.Join(temporaryDirectory, entry.Name()), contents, 0o600); writeErr != nil {
+			return fail(fmt.Errorf("copy shared Git index %s: %w", entry.Name(), writeErr))
+		}
+	}
+
+	environment := make([]string, 0, len(os.Environ())+2)
+	for _, value := range os.Environ() {
+		name, _, found := strings.Cut(value, "=")
+		if found && (strings.EqualFold(name, "GIT_INDEX_FILE") || strings.EqualFold(name, "GIT_OPTIONAL_LOCKS")) {
+			continue
+		}
+		environment = append(environment, value)
+	}
+	environment = append(environment, "GIT_INDEX_FILE="+temporaryIndex, "GIT_OPTIONAL_LOCKS=0")
+	return environment, cleanup, nil
+}
+
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
 	output, err := gitBytes(ctx, dir, args...)
 	if err != nil {
@@ -654,25 +768,36 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 }
 
 func gitBytes(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	command := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	output, err := command.Output()
-	if err != nil {
-		return nil, errors.New(firstGitError(stderr.String(), err))
+	output, stderr, result := gitCapture(ctx, dir, nil, args...)
+	if result.Err != nil {
+		return nil, errors.New(firstGitError(string(stderr), result.Err))
+	}
+	return output, nil
+}
+
+func gitBytesEnv(ctx context.Context, dir string, environment []string, args ...string) ([]byte, error) {
+	output, stderr, result := gitCaptureEnv(ctx, dir, environment, nil, args...)
+	if result.Err != nil {
+		return nil, errors.New(firstGitError(string(stderr), result.Err))
 	}
 	return output, nil
 }
 
 func gitInput(ctx context.Context, dir string, input []byte, args ...string) error {
-	command := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	command.Stdin = bytes.NewReader(input)
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		return errors.New(firstGitError(stderr.String(), err))
+	_, stderr, result := gitCapture(ctx, dir, input, args...)
+	if result.Err != nil {
+		return errors.New(firstGitError(string(stderr), result.Err))
 	}
 	return nil
+}
+
+func gitCapture(ctx context.Context, dir string, input []byte, args ...string) ([]byte, []byte, processx.Result) {
+	return gitCaptureEnv(ctx, dir, nil, input, args...)
+}
+
+func gitCaptureEnv(ctx context.Context, dir string, environment []string, input []byte, args ...string) ([]byte, []byte, processx.Result) {
+	commandArgs := append([]string{"-C", dir}, args...)
+	return processx.CaptureInput(ctx, "git", dir, environment, input, commandArgs...)
 }
 
 func firstGitError(stderr string, err error) string {

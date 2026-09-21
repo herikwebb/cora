@@ -15,9 +15,9 @@ func terminateProcess(command *exec.Cmd) {
 	if command.Process == nil {
 		return
 	}
-	if groupID, err := syscall.Getpgid(command.Process.Pid); err == nil {
-		_ = syscall.Kill(-groupID, syscall.SIGKILL)
-		return
-	}
+	// Setpgid makes the child's PID its process-group ID. Address that known
+	// group directly: Getpgid can race with a fast-exiting parent and otherwise
+	// leave still-running grandchildren behind.
+	_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 	_ = command.Process.Kill()
 }

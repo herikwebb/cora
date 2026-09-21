@@ -32,7 +32,7 @@ func TestHeartbeatTracksRunningReviewerElapsedTimeAndRefreshesTimestamp(t *testi
 	if !second.UpdatedAt.After(first.UpdatedAt) {
 		t.Fatalf("heartbeat timestamp did not refresh: first=%s second=%s", first.UpdatedAt, second.UpdatedAt)
 	}
-	heartbeat.Reviewer("codex", "completed")
+	heartbeat.ReviewerOutcome("codex", "completed", "approve")
 	completed, err := record.LoadHeartbeat(run)
 	if err != nil {
 		t.Fatal(err)
@@ -40,15 +40,43 @@ func TestHeartbeatTracksRunningReviewerElapsedTimeAndRefreshesTimestamp(t *testi
 	if !completed.ReviewerStartedAt["codex"].IsZero() {
 		t.Fatalf("completed reviewer retained running timestamp: %#v", completed.ReviewerStartedAt)
 	}
+	if completed.ReviewerVerdicts["codex"] != "approve" || !strings.Contains(heartbeatDetail(completed), "codex=completed(verdict=approve)") {
+		t.Fatalf("completed reviewer verdict was not exposed: %#v", completed)
+	}
+	heartbeat.Reviewer("codex", "queued")
+	queued, err := record.LoadHeartbeat(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.ReviewerVerdicts["codex"] != "" || strings.Contains(heartbeatDetail(queued), "verdict=") {
+		t.Fatalf("queued retry retained stale verdict: %#v", queued)
+	}
+	heartbeat.Reviewer("codex", "running")
+	runningAgain, err := record.LoadHeartbeat(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runningAgain.ReviewerVerdicts["codex"] != "" || runningAgain.ReviewerStartedAt["codex"].IsZero() {
+		t.Fatalf("running retry retained stale verdict or lost start time: %#v", runningAgain)
+	}
 }
 
-func TestHeartbeatQueueETAReportsExceededEstimateInsteadOfZero(t *testing.T) {
+func TestHeartbeatQueueShowsCapacityHolderAfterETA(t *testing.T) {
 	deadline := time.Now().Add(-time.Second)
+	timeoutAt := time.Now().Add(2 * time.Minute)
 	detail := heartbeatDetail(model.Heartbeat{
-		Phase:  "reviewers",
-		Queues: map[string]model.ProviderQueueStatus{"claude": {Position: 1, ETAAt: &deadline}},
+		Phase: "reviewers",
+		Queues: map[string]model.ProviderQueueStatus{"claude": {
+			Position: 1, ETAAt: &deadline,
+			Holders: []model.ProviderCapacityHolder{{RunID: "run-active", Reviewer: "claude", TimeoutAt: &timeoutAt}},
+		}},
 	})
-	if !strings.Contains(detail, "estimate-exceeded") || strings.Contains(detail, "~0s") {
-		t.Fatalf("expired queue ETA detail = %q", detail)
+	for _, want := range []string{"holder=claude@run-active", "timeout_in="} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("capacity-holder detail %q does not contain %q", detail, want)
+		}
+	}
+	if strings.Contains(detail, "estimate-exceeded") {
+		t.Fatalf("expired historical estimate remained in detail: %q", detail)
 	}
 }

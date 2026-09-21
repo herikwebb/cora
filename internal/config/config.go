@@ -96,6 +96,7 @@ type Config struct {
 	CrossExamineBlockingFindings bool                `toml:"cross_examine_blocking_findings"`
 	RequireCleanTree             bool                `toml:"require_clean_tree"`
 	AllowAPIBilling              bool                `toml:"allow_api_billing"`
+	AllowReviewWeb               bool                `toml:"allow_review_web"`
 	AllowUnsafeChecks            bool                `toml:"allow_unsafe_host_checks"`
 	MinimumApprovals             int                 `toml:"minimum_approvals"`
 	BlockingSeverities           []string            `toml:"blocking_severities"`
@@ -116,6 +117,7 @@ func Defaults() Config {
 		QueueTimeout:                 Duration{Duration: 24 * time.Hour},
 		CrossExamineBlockingFindings: true,
 		RequireCleanTree:             true,
+		AllowReviewWeb:               false,
 		MinimumApprovals:             2,
 		BlockingSeverities: []string{
 			"blocker",

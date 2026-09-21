@@ -12,6 +12,7 @@ import (
 func TestApplyReviewPolicyRoundTripsEffectiveConfiguration(t *testing.T) {
 	cfg := Defaults()
 	cfg.StrictPolicy = true
+	cfg.AllowReviewWeb = true
 	cfg.AllowUnsafeChecks = true
 	cfg.Escalation.ForceSecuritySensitive = true
 	cfg.Escalation.AdjudicateDisagreements = true
@@ -111,6 +112,9 @@ func TestDefaultsUseHighEffortClaudeOpusAndTargetedFable(t *testing.T) {
 	if cfg.Escalation.AdjudicateDisagreements {
 		t.Fatal("disagreement adjudication should require explicit opt-in")
 	}
+	if cfg.AllowReviewWeb {
+		t.Fatal("review web authorization must default off")
+	}
 	if !cfg.CrossExamineBlockingFindings {
 		t.Fatal("targeted blocking-finding cross-examination should default on")
 	}
@@ -139,6 +143,16 @@ max_budget_usd = 6.5
 	}
 	if cfg.Escalation.MaxBudgetUSD == nil || *cfg.Escalation.MaxBudgetUSD != 6.5 {
 		t.Fatalf("escalation max budget = %#v", cfg.Escalation.MaxBudgetUSD)
+	}
+}
+
+func TestApplyRepositoryDecodesReviewWebAuthorization(t *testing.T) {
+	cfg, err := ApplyRepository(Defaults(), ".cora/config.toml", []byte("allow_review_web = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AllowReviewWeb {
+		t.Fatal("trusted configuration did not enable review web evidence")
 	}
 }
 
@@ -254,6 +268,9 @@ func TestExampleConfigurationParses(t *testing.T) {
 	}
 	if len(cfg.ValidationProfiles) != 1 || cfg.ValidationProfiles[0].Name != "go-fast" {
 		t.Fatalf("validation profiles = %#v", cfg.ValidationProfiles)
+	}
+	if cfg.AllowReviewWeb {
+		t.Fatal("example configuration should leave review web authorization disabled")
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/herikwebb/cora/internal/model"
+	"github.com/herikwebb/cora/internal/webevidence"
 )
 
 type Store struct {
@@ -26,6 +27,12 @@ type Store struct {
 type Run struct {
 	ID   string
 	Path string
+}
+
+// IsWebEvidenceRun reports whether the record lives in the versioned
+// collection that pre-web Cora binaries cannot enumerate.
+func IsWebEvidenceRun(run Run) bool {
+	return filepath.Base(filepath.Dir(run.Path)) == webEvidenceRunsCollection
 }
 
 // ReviewerLineage is the reusable reviewer state recovered from an exact-diff
@@ -49,7 +56,8 @@ type ApprovedBaseline struct {
 }
 
 type Lock struct {
-	path string
+	path  string
+	token string
 }
 
 type ProviderLease struct {
@@ -59,6 +67,7 @@ type ProviderLease struct {
 	provider    string
 	runID       string
 	reviewer    string
+	token       string
 }
 
 type ProviderQueueRequest struct {
@@ -105,10 +114,14 @@ type providerQuotaRecord struct {
 
 var providerTicketSequence atomic.Uint64
 var providerQuotaSequence atomic.Uint64
+var providerLeaseSequence atomic.Uint64
+var runLockSequence atomic.Uint64
 
 const (
-	privateDirMode  os.FileMode = 0o700
-	privateFileMode os.FileMode = 0o600
+	privateDirMode            os.FileMode = 0o700
+	privateFileMode           os.FileMode = 0o600
+	standardRunsCollection                = "runs"
+	webEvidenceRunsCollection             = "web-evidence-runs-v1"
 )
 
 func New(commonDir string) Store {
@@ -116,14 +129,21 @@ func New(commonDir string) Store {
 }
 
 func (s Store) Create(started time.Time, headSHA string) (Run, error) {
-	return s.createRecord("runs", started, headSHA)
+	return s.createRecord(standardRunsCollection, started, headSHA, "")
+}
+
+// CreateWebEvidence stores web-backed runs outside the collection understood
+// by pre-web Cora binaries. Those binaries therefore cannot silently consume
+// their decisions or carried-finding dispositions while ignoring evidence.
+func (s Store) CreateWebEvidence(started time.Time, headSHA string) (Run, error) {
+	return s.createRecord(webEvidenceRunsCollection, started, headSHA, "web1-")
 }
 
 func (s Store) CreateAutoFixLoop(started time.Time, headSHA string) (Run, error) {
-	return s.createRecord("auto-fix", started, headSHA)
+	return s.createRecord("auto-fix", started, headSHA, "")
 }
 
-func (s Store) createRecord(collection string, started time.Time, headSHA string) (Run, error) {
+func (s Store) createRecord(collection string, started time.Time, headSHA, kind string) (Run, error) {
 	if err := ensurePrivateDir(s.Root); err != nil {
 		return Run{}, fmt.Errorf("secure CORA record directory: %w", err)
 	}
@@ -135,7 +155,7 @@ func (s Store) createRecord(collection string, started time.Time, headSHA string
 	if len(short) > 8 {
 		short = short[:8]
 	}
-	baseID := started.UTC().Format("20060102T150405.000000000Z") + "-" + short
+	baseID := started.UTC().Format("20060102T150405.000000000Z") + "-" + kind + short
 	for attempt := 0; attempt < 100; attempt++ {
 		id := baseID
 		if attempt > 0 {
@@ -162,14 +182,40 @@ func (s Store) Acquire(key string) (Lock, error) {
 		key = key[:24]
 	}
 	path := filepath.Join(s.Root, "locks", key+".lock")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, privateFileMode)
+	guard, err := acquireFileGuard(path + ".guard")
+	if err != nil {
+		return Lock{}, err
+	}
+	defer guard.Release()
+
+	file, err := createRunLockFile(path)
 	if errors.Is(err, os.ErrExist) {
-		return Lock{}, errors.New("a CORA review is already running for this target; remove the stale lock if no process is active")
+		stale, staleErr := staleRunLock(path, time.Now())
+		if errors.Is(staleErr, os.ErrNotExist) {
+			// The owner released the lock between our failed create and the
+			// inspection. Retry acquisition instead of surfacing a spurious
+			// filesystem error.
+			file, err = createRunLockFile(path)
+		} else if staleErr != nil {
+			return Lock{}, fmt.Errorf("inspect existing CORA review lock: %w", staleErr)
+		} else if !stale {
+			return Lock{}, errors.New("a CORA review is already running for this target; remove the stale lock if no process is active")
+		} else {
+			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return Lock{}, fmt.Errorf("remove stale CORA review lock: %w", removeErr)
+			}
+			file, err = createRunLockFile(path)
+		}
+		if errors.Is(err, os.ErrExist) {
+			return Lock{}, errors.New("a CORA review started while a stale lock was being reclaimed")
+		}
 	}
 	if err != nil {
 		return Lock{}, err
 	}
-	_, writeErr := fmt.Fprintf(file, "pid=%d\nstarted=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
+	started := time.Now().UTC()
+	token := fmt.Sprintf("%d-%d-%d", os.Getpid(), started.UnixNano(), runLockSequence.Add(1))
+	_, writeErr := fmt.Fprintf(file, "pid=%d\nstarted=%s\ntoken=%s\n", os.Getpid(), started.Format(time.RFC3339Nano), token)
 	closeErr := file.Close()
 	if writeErr != nil {
 		_ = os.Remove(path)
@@ -179,14 +225,50 @@ func (s Store) Acquire(key string) (Lock, error) {
 		_ = os.Remove(path)
 		return Lock{}, closeErr
 	}
-	return Lock{path: path}, nil
+	return Lock{path: path, token: token}, nil
 }
 
 func (l Lock) Release() error {
 	if l.path == "" {
 		return nil
 	}
-	return os.Remove(l.path)
+	guard, err := acquireFileGuard(l.path + ".guard")
+	if err != nil {
+		return err
+	}
+	defer guard.Release()
+
+	contents, err := os.ReadFile(l.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if l.token != "" && lockValue(string(contents), "token") != l.token {
+		return errors.New("refusing to release a CORA review lock owned by another process")
+	}
+	if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func createRunLockFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, privateFileMode)
+}
+
+func staleRunLock(path string, now time.Time) (bool, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	pid := lockPID(string(contents))
+	return (pid > 0 && !processAlive(pid)) || (pid <= 0 && now.Sub(info.ModTime()) > 24*time.Hour), nil
 }
 
 func (s Store) Finalize(run Run) error {
@@ -210,18 +292,21 @@ func (s Store) Resolve(id string) (Run, error) {
 	if id == "" || filepath.Base(id) != id {
 		return Run{}, errors.New("invalid run ID")
 	}
-	path := filepath.Join(s.Root, "runs", id)
-	info, err := os.Stat(path)
-	if err != nil {
+	for _, collection := range []string{standardRunsCollection, webEvidenceRunsCollection} {
+		path := filepath.Join(s.Root, collection, id)
+		info, err := os.Stat(path)
 		if errors.Is(err, os.ErrNotExist) {
-			return Run{}, fmt.Errorf("run not found: %s", id)
+			continue
 		}
-		return Run{}, err
+		if err != nil {
+			return Run{}, err
+		}
+		if !info.IsDir() {
+			return Run{}, fmt.Errorf("run record is not a directory: %s", id)
+		}
+		return Run{ID: id, Path: path}, nil
 	}
-	if !info.IsDir() {
-		return Run{}, fmt.Errorf("run record is not a directory: %s", id)
-	}
-	return Run{ID: id, Path: path}, nil
+	return Run{}, fmt.Errorf("run not found: %s", id)
 }
 
 // ResolveAutoFix resolves a parent loop record without falling back to the
@@ -320,29 +405,20 @@ func AcquireProviderQueued(ctx context.Context, provider string, limit int, requ
 			return ProviderLease{}, err
 		}
 		position := ticketPosition(tickets, ticketName)
-		active, err := activeProviderSlots(queueDir, limit)
+		holders, lease, acquired, err := tryAcquireProviderCapacity(queueDir, provider, limit, request, position)
 		if err != nil {
 			return ProviderLease{}, err
 		}
-		available := limit - active
-		if position > 0 && position <= available {
-			for slot := 0; slot < limit; slot++ {
-				path := filepath.Join(queueDir, fmt.Sprintf("slot-%d.lock", slot))
-				lease, acquired, err := tryProviderSlot(path, provider, request)
-				if err != nil {
-					return ProviderLease{}, err
-				}
-				if acquired {
-					_ = os.Remove(ticketPath)
-					lease.historyPath = historyPath
-					return lease, nil
-				}
-			}
+		active := len(holders)
+		if acquired {
+			_ = os.Remove(ticketPath)
+			lease.historyPath = historyPath
+			return lease, nil
 		}
 		if onWait != nil && (lastNotice.IsZero() || time.Since(lastNotice) >= 30*time.Second) {
 			status := model.ProviderQueueStatus{
 				Provider: provider, Position: max(position, 1), Ahead: max(position-1, 0),
-				Active: active, Limit: limit, WaitMS: time.Since(started).Milliseconds(),
+				Active: active, Limit: limit, WaitMS: time.Since(started).Milliseconds(), Holders: holders,
 			}
 			if estimate := providerQueueETA(historyPath, status.Position, limit); estimate > 0 {
 				estimatedAt = fixedProviderETA(estimatedAt, time.Now().UTC(), estimate)
@@ -360,6 +436,38 @@ func AcquireProviderQueued(ctx context.Context, provider string, limit int, requ
 		case <-timer.C:
 		}
 	}
+}
+
+// tryAcquireProviderCapacity serializes the capacity snapshot and slot claim
+// across CORA processes. This matters when separate processes use different
+// configured limits: every active slot is counted before the caller attempts
+// a slot within its own limit.
+func tryAcquireProviderCapacity(queueDir, provider string, limit int, request ProviderQueueRequest, position int) ([]model.ProviderCapacityHolder, ProviderLease, bool, error) {
+	guard, err := acquireFileGuard(filepath.Join(queueDir, "capacity.guard"))
+	if err != nil {
+		return nil, ProviderLease{}, false, err
+	}
+	defer guard.Release()
+
+	holders, err := activeProviderSlots(queueDir)
+	if err != nil {
+		return nil, ProviderLease{}, false, err
+	}
+	available := limit - len(holders)
+	if position <= 0 || position > available {
+		return holders, ProviderLease{}, false, nil
+	}
+	for slot := 0; slot < limit; slot++ {
+		path := filepath.Join(queueDir, fmt.Sprintf("slot-%d.lock", slot))
+		lease, acquired, err := tryProviderSlot(path, provider, request)
+		if err != nil {
+			return nil, ProviderLease{}, false, err
+		}
+		if acquired {
+			return holders, lease, true, nil
+		}
+	}
+	return holders, ProviderLease{}, false, nil
 }
 
 func providerQueueDirectory(provider string) (string, error) {
@@ -434,33 +542,44 @@ func fixedProviderETA(current *time.Time, observedAt time.Time, estimate time.Du
 }
 
 func tryProviderSlot(path, provider string, request ProviderQueueRequest) (ProviderLease, bool, error) {
-	started := time.Now().UTC()
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, privateFileMode)
-	if err == nil {
-		_, writeErr := fmt.Fprintf(file, "pid=%d\nstarted=%s\nrun_id=%s\nreviewer=%s\n", os.Getpid(), started.Format(time.RFC3339Nano), request.RunID, request.Reviewer)
-		closeErr := file.Close()
-		if writeErr != nil || closeErr != nil {
-			_ = os.Remove(path)
-			return ProviderLease{}, false, errors.Join(writeErr, closeErr)
-		}
-		return ProviderLease{path: path, started: started, provider: provider, runID: request.RunID, reviewer: request.Reviewer}, true, nil
-	}
-	if !errors.Is(err, os.ErrExist) {
+	guard, err := acquireFileGuard(path + ".guard")
+	if err != nil {
 		return ProviderLease{}, false, err
 	}
-	contents, readErr := os.ReadFile(path)
-	if readErr != nil {
-		return ProviderLease{}, false, nil
-	}
-	pid := lockPID(string(contents))
-	info, statErr := os.Stat(path)
-	staleByAge := statErr == nil && time.Since(info.ModTime()) > 24*time.Hour
-	if (pid > 0 && !processAlive(pid)) || staleByAge {
+	defer guard.Release()
+
+	contents, err := os.ReadFile(path)
+	if err == nil {
+		info, statErr := os.Stat(path)
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return ProviderLease{}, false, statErr
+		}
+		if statErr == nil && !staleProviderOwner(string(contents), info, time.Now()) {
+			return ProviderLease{}, false, nil
+		}
 		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			return ProviderLease{}, false, removeErr
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ProviderLease{}, false, err
 	}
-	return ProviderLease{}, false, nil
+
+	acquired := time.Now().UTC()
+	token := fmt.Sprintf("%d-%d-%d", os.Getpid(), acquired.UnixNano(), providerLeaseSequence.Add(1))
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, privateFileMode)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return ProviderLease{}, false, nil
+		}
+		return ProviderLease{}, false, err
+	}
+	_, writeErr := fmt.Fprintf(file, "pid=%d\nacquired_at=%s\ntoken=%s\nrun_id=%s\nreviewer=%s\n", os.Getpid(), acquired.Format(time.RFC3339Nano), token, request.RunID, request.Reviewer)
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(path)
+		return ProviderLease{}, false, errors.Join(writeErr, closeErr)
+	}
+	return ProviderLease{path: path, provider: provider, runID: request.RunID, reviewer: request.Reviewer, token: token}, true, nil
 }
 
 func liveProviderTickets(queueDir string) ([]string, error) {
@@ -478,9 +597,18 @@ func liveProviderTickets(queueDir string) ([]string, error) {
 		readErr := ReadJSON(path, &ticket)
 		info, statErr := entry.Info()
 		staleByAge := statErr == nil && time.Since(info.ModTime()) > 24*time.Hour
-		if readErr != nil || staleByAge || (ticket.PID > 0 && !processAlive(ticket.PID)) {
+		if errors.Is(readErr, os.ErrNotExist) {
+			continue
+		}
+		// Never age-reclaim a queue ticket from a live owner. Age is only a
+		// fallback for malformed legacy tickets that have no usable PID.
+		stale := ticket.PID > 0 && !processAlive(ticket.PID) || ticket.PID <= 0 && staleByAge
+		if stale {
 			_ = os.Remove(path)
 			continue
+		}
+		if readErr != nil && ticket.PID > 0 {
+			return nil, fmt.Errorf("read live provider queue ticket %s: %w", entry.Name(), readErr)
 		}
 		tickets = append(tickets, entry.Name())
 	}
@@ -497,29 +625,89 @@ func ticketPosition(tickets []string, name string) int {
 	return 0
 }
 
-func activeProviderSlots(queueDir string, limit int) (int, error) {
-	active := 0
-	for slot := 0; slot < limit; slot++ {
-		path := filepath.Join(queueDir, fmt.Sprintf("slot-%d.lock", slot))
-		contents, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
+func activeProviderSlots(queueDir string) ([]model.ProviderCapacityHolder, error) {
+	entries, err := os.ReadDir(queueDir)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "slot-") || !strings.HasSuffix(name, ".lock") {
 			continue
 		}
-		if err != nil {
-			return 0, err
+		slotText := strings.TrimSuffix(strings.TrimPrefix(name, "slot-"), ".lock")
+		if slot, parseErr := strconv.Atoi(slotText); parseErr != nil || slot < 0 || strconv.Itoa(slot) != slotText {
+			continue
+		}
+		paths = append(paths, filepath.Join(queueDir, name))
+	}
+	sort.Strings(paths)
+	holders := make([]model.ProviderCapacityHolder, 0, len(paths))
+	for _, path := range paths {
+		guard, guardErr := acquireFileGuard(path + ".guard")
+		if guardErr != nil {
+			return nil, guardErr
+		}
+		contents, readErr := os.ReadFile(path)
+		if errors.Is(readErr, os.ErrNotExist) {
+			guard.Release()
+			continue
+		}
+		if readErr != nil {
+			guard.Release()
+			return nil, readErr
 		}
 		info, statErr := os.Stat(path)
-		staleByAge := statErr == nil && time.Since(info.ModTime()) > 24*time.Hour
-		pid := lockPID(string(contents))
-		if staleByAge || (pid > 0 && !processAlive(pid)) {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return 0, err
+		if errors.Is(statErr, os.ErrNotExist) {
+			guard.Release()
+			continue
+		}
+		if statErr != nil {
+			guard.Release()
+			return nil, statErr
+		}
+		if staleProviderOwner(string(contents), info, time.Now()) {
+			removeErr := os.Remove(path)
+			guard.Release()
+			if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return nil, removeErr
 			}
 			continue
 		}
-		active++
+		holders = append(holders, providerCapacityHolder(string(contents)))
+		guard.Release()
 	}
-	return active, nil
+	return holders, nil
+}
+
+func staleProviderOwner(contents string, info os.FileInfo, now time.Time) bool {
+	pid := lockPID(contents)
+	if pid > 0 {
+		// A live provider subprocess can legitimately run longer than a day.
+		// Age is never sufficient to steal its capacity lease.
+		return !processAlive(pid)
+	}
+	return now.Sub(info.ModTime()) > 24*time.Hour
+}
+
+func providerCapacityHolder(contents string) model.ProviderCapacityHolder {
+	holder := model.ProviderCapacityHolder{
+		RunID: lockValue(contents, "run_id"), Reviewer: lockValue(contents, "reviewer"), PID: lockPID(contents),
+	}
+	startedValue := lockValue(contents, "execution_started")
+	if startedValue == "" {
+		// Read legacy slot files without treating acquisition time as a new
+		// execution deadline.
+		startedValue = lockValue(contents, "started")
+	}
+	if started, err := time.Parse(time.RFC3339Nano, startedValue); err == nil {
+		holder.StartedAt = started
+	}
+	if timeoutAt, err := time.Parse(time.RFC3339Nano, lockValue(contents, "timeout_at")); err == nil {
+		holder.TimeoutAt = &timeoutAt
+	}
+	return holder
 }
 
 func providerQueueETA(historyPath string, position, limit int) time.Duration {
@@ -553,12 +741,82 @@ func providerQueueETA(historyPath string, position, limit int) time.Duration {
 	return time.Duration(waves) * median
 }
 
+// MarkExecutionStarted publishes the real provider execution window. Slot
+// acquisition intentionally has no timeout because workspace preparation and
+// other preflight work happen before the provider subprocess starts.
+func (l *ProviderLease) MarkExecutionStarted(timeout time.Duration) error {
+	if l == nil || l.path == "" {
+		return errors.New("provider lease is not initialized")
+	}
+	if timeout < 0 {
+		return errors.New("provider execution timeout cannot be negative")
+	}
+	guard, err := acquireFileGuard(l.path + ".guard")
+	if err != nil {
+		return err
+	}
+	defer guard.Release()
+
+	contents, err := os.ReadFile(l.path)
+	if err != nil {
+		return err
+	}
+	if l.token == "" || lockValue(string(contents), "token") != l.token {
+		return errors.New("refusing to update a provider lease owned by another process")
+	}
+	if existing := lockValue(string(contents), "execution_started"); existing != "" {
+		started, parseErr := time.Parse(time.RFC3339Nano, existing)
+		if parseErr != nil {
+			return fmt.Errorf("parse provider execution start: %w", parseErr)
+		}
+		// Marking is idempotent and never extends an already published provider
+		// timeout if a caller retries the transition.
+		l.started = started
+		return nil
+	}
+	started := time.Now().UTC()
+	timeoutAt := ""
+	if timeout > 0 {
+		timeoutAt = started.Add(timeout).Format(time.RFC3339Nano)
+	}
+	updated := fmt.Sprintf(
+		"pid=%s\nacquired_at=%s\ntoken=%s\nrun_id=%s\nreviewer=%s\nexecution_started=%s\ntimeout_at=%s\n",
+		lockValue(string(contents), "pid"), lockValue(string(contents), "acquired_at"), l.token,
+		lockValue(string(contents), "run_id"), lockValue(string(contents), "reviewer"),
+		started.Format(time.RFC3339Nano), timeoutAt,
+	)
+	if err := atomicWrite(l.path, []byte(updated), privateFileMode); err != nil {
+		return fmt.Errorf("record provider execution start: %w", err)
+	}
+	l.started = started
+	return nil
+}
+
 func (l ProviderLease) Release() error {
 	if l.path == "" {
 		return nil
 	}
-	if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	guard, err := acquireFileGuard(l.path + ".guard")
+	if err != nil {
 		return err
+	}
+	contents, err := os.ReadFile(l.path)
+	if errors.Is(err, os.ErrNotExist) {
+		guard.Release()
+		return nil
+	}
+	if err != nil {
+		guard.Release()
+		return err
+	}
+	if l.token == "" || lockValue(string(contents), "token") != l.token {
+		guard.Release()
+		return errors.New("refusing to release a provider lease owned by another process")
+	}
+	removeErr := os.Remove(l.path)
+	guard.Release()
+	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return removeErr
 	}
 	if l.historyPath != "" && !l.started.IsZero() {
 		entry := providerHistoryEntry{FinishedAt: time.Now().UTC(), DurationMS: time.Since(l.started).Milliseconds(), RunID: l.runID, Reviewer: l.reviewer}
@@ -578,13 +836,18 @@ func (l ProviderLease) Release() error {
 }
 
 func lockPID(contents string) int {
+	pid, _ := strconv.Atoi(lockValue(contents, "pid"))
+	return pid
+}
+
+func lockValue(contents, key string) string {
+	prefix := key + "="
 	for _, line := range strings.Split(contents, "\n") {
-		if value, found := strings.CutPrefix(line, "pid="); found {
-			pid, _ := strconv.Atoi(value)
-			return pid
+		if value, found := strings.CutPrefix(line, prefix); found {
+			return value
 		}
 	}
-	return 0
+	return ""
 }
 
 func safeComponent(value string) string {
@@ -603,7 +866,17 @@ func safeComponent(value string) string {
 }
 
 func (s Store) Runs() ([]Run, error) {
-	return s.records("runs")
+	standard, err := s.records(standardRunsCollection)
+	if err != nil {
+		return nil, err
+	}
+	webEvidence, err := s.records(webEvidenceRunsCollection)
+	if err != nil {
+		return nil, err
+	}
+	runs := append(standard, webEvidence...)
+	sort.Slice(runs, func(i, j int) bool { return runs[i].ID > runs[j].ID })
+	return runs, nil
 }
 
 // AutoFixLoops returns parent loop records newest first. Review child runs are
@@ -683,7 +956,25 @@ func LoadApprovedBaseline(run Run) (ApprovedBaseline, error) {
 	if err != nil {
 		return ApprovedBaseline{}, err
 	}
-	if manifest.ReviewScope == "approved-baseline-delta" ||
+	if IsWebEvidenceRun(run) || manifest.WebEvidence != nil {
+		store := Store{Root: filepath.Dir(filepath.Dir(run.Path))}
+		if err := store.ValidateReviewArtifacts(run, manifest); err != nil {
+			return ApprovedBaseline{}, fmt.Errorf("%w: invalid immutable review inputs: %v", ErrNotApprovedBaseline, err)
+		}
+		return ApprovedBaseline{}, fmt.Errorf("%w: web-backed approvals cannot seed auto-fix without replaying their evidence", ErrNotApprovedBaseline)
+	} else {
+		if err := ValidateImportedValidationEvidence(run, manifest.Target, manifest.RepositoryIdentity, manifest.Checks); err != nil {
+			return ApprovedBaseline{}, fmt.Errorf("%w: %v", ErrNotApprovedBaseline, err)
+		}
+		if err := webevidence.ValidateReviewerBindings(nil, manifest.Reviewers, manifest.SecurityReviews, manifest.CrossExaminations); err != nil {
+			return ApprovedBaseline{}, fmt.Errorf("%w: %v", ErrNotApprovedBaseline, err)
+		}
+	}
+	reviewScope, err := webevidence.EffectiveReviewScope(manifest)
+	if err != nil {
+		return ApprovedBaseline{}, fmt.Errorf("%w: %v", ErrNotApprovedBaseline, err)
+	}
+	if reviewScope == "approved-baseline-delta" ||
 		!sameExactTarget(manifest.Target, model.Target{BaseSHA: decision.BaseSHA, HeadSHA: decision.HeadSHA, DiffHash: decision.DiffHash}) ||
 		!unanimousCompletedApproval(decision, append(append([]model.ReviewerResult(nil), manifest.Reviewers...), manifest.SecurityReviews...)) || !allChecksPassed(manifest.Checks) {
 		return ApprovedBaseline{}, ErrNotApprovedBaseline
@@ -749,6 +1040,11 @@ func (s Store) ExactDiffReviewerLineage(run Run, target model.Target, repository
 		if err != nil {
 			return ReviewerLineage{}, fmt.Errorf("load retry lineage manifest %s: %w", run.ID, err)
 		}
+		if IsWebEvidenceRun(run) || manifest.WebEvidence != nil {
+			if err := s.ValidateReviewArtifacts(run, manifest); err != nil {
+				return ReviewerLineage{}, fmt.Errorf("validate retry lineage inputs %s: %w", run.ID, err)
+			}
+		}
 		if !sameExactTarget(manifest.Target, target) {
 			return ReviewerLineage{}, fmt.Errorf("retry lineage run %s targets a different diff", run.ID)
 		}
@@ -794,12 +1090,28 @@ func (a *reviewerLineageAccumulator) add(results []model.ReviewerResult, runID s
 			}
 			a.latest[name] = result
 		}
-		if _, found := a.completed[name]; !found && result.Status == "completed" && result.Report != nil {
+		if _, found := a.completed[name]; !found && reusableCompletedReviewerEvidence(result) {
 			if result.ReusedFromRunID == "" {
 				result.ReusedFromRunID = runID
 			}
 			a.completed[name] = result
 		}
+	}
+}
+
+// reusableCompletedReviewerEvidence excludes operationally clean but
+// substantively incomplete reports. In particular, Claude's reserved-turn
+// finalizer can return a schema-valid abstention with context_complete=false;
+// it must not displace older complete evidence in an exact-diff retry lineage.
+func reusableCompletedReviewerEvidence(result model.ReviewerResult) bool {
+	if result.Status != "completed" || result.Report == nil || !result.Report.ContextComplete {
+		return false
+	}
+	switch result.Report.Verdict {
+	case "approve", "request_changes":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -839,6 +1151,19 @@ func (a *reviewerLineageAccumulator) latestResults() []model.ReviewerResult {
 // backed by a completed reviewer retires it. Partial-only recovery evidence
 // remains in its original audit record but is never promoted to durable truth.
 func (s Store) UnresolvedFindings(target model.Target) ([]model.ConsolidatedFinding, error) {
+	return s.unresolvedFindings(target, "")
+}
+
+// UnresolvedFindingsForWebEvidence includes web-derived dispositions only
+// when the consuming review presents the identical immutable snapshot.
+func (s Store) UnresolvedFindingsForWebEvidence(target model.Target, snapshotSHA256 string) ([]model.ConsolidatedFinding, error) {
+	if strings.TrimSpace(snapshotSHA256) == "" {
+		return nil, errors.New("web evidence snapshot hash is required for carried findings")
+	}
+	return s.unresolvedFindings(target, snapshotSHA256)
+}
+
+func (s Store) unresolvedFindings(target model.Target, snapshotSHA256 string) ([]model.ConsolidatedFinding, error) {
 	runs, err := s.Runs()
 	if err != nil {
 		return nil, err
@@ -846,6 +1171,9 @@ func (s Store) UnresolvedFindings(target model.Target) ([]model.ConsolidatedFind
 	seen := make(map[string]bool)
 	var findings []model.ConsolidatedFinding
 	for _, run := range runs {
+		if IsWebEvidenceRun(run) && snapshotSHA256 == "" {
+			continue
+		}
 		decision, loadErr := LoadDecision(run)
 		if errors.Is(loadErr, os.ErrNotExist) {
 			continue
@@ -855,6 +1183,27 @@ func (s Store) UnresolvedFindings(target model.Target) ([]model.ConsolidatedFind
 		}
 		if decision.DiffHash != target.DiffHash || decision.BaseSHA != target.BaseSHA || decision.HeadSHA != target.HeadSHA {
 			continue
+		}
+		manifest, manifestErr := LoadManifest(run)
+		if manifestErr == nil {
+			if !sameExactTarget(manifest.Target, target) {
+				return nil, fmt.Errorf("prior run %s has inconsistent target metadata", run.ID)
+			}
+			if IsWebEvidenceRun(run) || manifest.WebEvidence != nil {
+				if manifest.FinishedAt.IsZero() {
+					continue
+				}
+				if err := s.ValidateReviewArtifacts(run, manifest); err != nil {
+					return nil, fmt.Errorf("validate prior web-backed run %s: %w", run.ID, err)
+				}
+				if snapshotSHA256 == "" || manifest.WebEvidence == nil || manifest.WebEvidence.SnapshotSHA256 != snapshotSHA256 {
+					continue
+				}
+			} else if err := webevidence.ValidateReviewerBindings(nil, manifest.Reviewers, manifest.SecurityReviews, manifest.CrossExaminations); err != nil {
+				return nil, fmt.Errorf("validate prior reviewer bindings %s: %w", run.ID, err)
+			}
+		} else if IsWebEvidenceRun(run) || !errors.Is(manifestErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("load prior manifest %s: %w", run.ID, manifestErr)
 		}
 		for _, rejected := range decision.RejectedFindings {
 			if !findingBackedByCompletedReviewers(decision, rejected) {
@@ -949,12 +1298,23 @@ func appendUnique(values []string, value string) []string {
 }
 
 func WriteJSON(path string, value any) error {
+	_, err := WriteHashedJSON(path, value)
+	return err
+}
+
+// WriteHashedJSON atomically persists the canonical record encoding and
+// returns the SHA-256 of the exact bytes written.
+func WriteHashedJSON(path string, value any) (string, error) {
 	contents, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode %s: %w", filepath.Base(path), err)
+		return "", fmt.Errorf("encode %s: %w", filepath.Base(path), err)
 	}
 	contents = append(contents, '\n')
-	return atomicWrite(path, contents, privateFileMode)
+	if err := atomicWrite(path, contents, privateFileMode); err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(contents)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // WriteFile writes a private record artifact atomically.

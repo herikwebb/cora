@@ -4,8 +4,10 @@ package process
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -44,6 +46,28 @@ func TestReviewerWorkspaceEnvironmentRedirectsWritableCaches(t *testing.T) {
 		if !strings.HasPrefix(values[name], runtimeDir+string(filepath.Separator)) {
 			t.Fatalf("%s was not redirected into runtime: %q", name, values[name])
 		}
+	}
+}
+
+func TestRemoveAllWritableRepairsUntrustedDirectoryPermissions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "reviewer-runtime")
+	locked := filepath.Join(root, "locked", "nested")
+	if err := os.MkdirAll(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "artifact"), []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root, "locked"), 0); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(filepath.Join(root, "locked"), 0o700) }()
+
+	if err := RemoveAllWritable(root); err != nil {
+		t.Fatalf("remove permission-locked temporary tree: %v", err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("temporary tree survived cleanup: %v", err)
 	}
 }
 
@@ -130,5 +154,66 @@ func TestRunTerminatesProcessGroupOnTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("timeout termination took %s", elapsed)
+	}
+}
+
+func TestRunCancellationTerminatesGrandchildren(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "grandchild.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	resultChannel := make(chan Result, 1)
+	go func() {
+		resultChannel <- Run(ctx, Spec{
+			Command: "sh",
+			Args:    []string{"-c", "sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"; wait", "sh", pidPath},
+			Env:     ReviewerEnvironment(false),
+		})
+	}()
+
+	var pid int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		contents, err := os.ReadFile(pidPath)
+		if err == nil && len(contents) > 0 {
+			pid, err = strconv.Atoi(string(contents))
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pid == 0 {
+		cancel()
+		t.Fatal("reviewer grandchild did not start")
+	}
+
+	cancel()
+	select {
+	case result := <-resultChannel:
+		if !errors.Is(result.Err, context.Canceled) {
+			t.Fatalf("cancellation result = %#v", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled process group did not terminate")
+	}
+
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("grandchild process %d survived cancellation (kill probe: %v)", pid, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestCaptureInputDoesNotStartWithCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stdout, stderr, result := CaptureInput(ctx, "sh", "", ReviewerEnvironment(false), []byte("ignored"), "-c", "printf should-not-run")
+	if !errors.Is(result.Err, context.Canceled) || len(stdout) != 0 || len(stderr) != 0 {
+		t.Fatalf("pre-canceled capture = stdout %q stderr %q result %#v", stdout, stderr, result)
 	}
 }

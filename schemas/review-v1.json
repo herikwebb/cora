@@ -55,6 +55,7 @@
             "enum": ["confirmed", "demoted", "disproved", "uncertain", null]
           },
           "reachability": {
+            "description": "Reachability classification. Blocker and major findings require a demonstrated trigger-to-impact path; not_applicable is only for non-blocking findings where that analysis does not apply.",
             "type": ["object", "null"],
             "additionalProperties": false,
             "required": ["status", "trigger", "path", "impact", "preconditions"],

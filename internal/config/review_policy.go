@@ -18,7 +18,7 @@ func SnapshotReviewPolicy(cfg Config) model.AutoFixReviewPolicy {
 		ReviewerTimeout: model.NewDuration(cfg.ReviewerTimeout.Duration), OverallTimeout: model.NewDuration(cfg.OverallTimeout.Duration),
 		QueueTimeout: model.NewDuration(cfg.QueueTimeout.Duration), StrictPolicy: cfg.StrictPolicy,
 		CrossExamineBlockingFindings: cfg.CrossExamineBlockingFindings, RequireCleanTree: cfg.RequireCleanTree,
-		AllowAPIBilling: cfg.AllowAPIBilling, AllowUnsafeChecks: cfg.AllowUnsafeChecks,
+		AllowAPIBilling: cfg.AllowAPIBilling, AllowReviewWeb: cfg.AllowReviewWeb, AllowUnsafeChecks: cfg.AllowUnsafeChecks,
 		MinimumApprovals: cfg.MinimumApprovals, BlockingSeverities: append([]string(nil), cfg.BlockingSeverities...),
 		PromptFile: cfg.PromptFile, Codex: snapshotReviewerPolicy(cfg.Reviewers.Codex), Claude: snapshotReviewerPolicy(cfg.Reviewers.Claude),
 		Escalation: model.AutoFixEscalationPolicy{
@@ -35,6 +35,25 @@ func SnapshotReviewPolicy(cfg Config) model.AutoFixReviewPolicy {
 	}
 }
 
+// SnapshotReviewerExecutionLimits expands the shared configuration defaults
+// into explicit per-role limits. Retry manifests persist this map separately
+// from the immutable review policy so a targeted increase remains scoped to
+// that exact role throughout subsequent retry generations.
+func SnapshotReviewerExecutionLimits(cfg Config) map[string]model.ReviewerExecutionLimit {
+	escalationTurns := cfg.Reviewers.Claude.MaxTurns
+	if cfg.Escalation.MaxTurns != nil {
+		escalationTurns = *cfg.Escalation.MaxTurns
+	}
+	ordinaryTimeout := model.NewDuration(cfg.ReviewerTimeout.Duration)
+	return map[string]model.ReviewerExecutionLimit{
+		"codex":                    {Timeout: ordinaryTimeout},
+		"claude":                   {Timeout: ordinaryTimeout, MaxTurns: cfg.Reviewers.Claude.MaxTurns},
+		"claude-security":          {Timeout: ordinaryTimeout, MaxTurns: escalationTurns},
+		"claude-escalation":        {Timeout: ordinaryTimeout, MaxTurns: escalationTurns},
+		"claude-cross-examination": {Timeout: model.NewDuration(cfg.CrossExamination.Timeout.Duration), MaxTurns: cfg.CrossExamination.MaxTurns},
+	}
+}
+
 // ApplyReviewPolicy restores a previously captured effective policy onto a
 // freshly loaded trusted-base configuration. Effective checks are already
 // profile-expanded, so later profile/default changes cannot alter a retry or
@@ -47,6 +66,7 @@ func ApplyReviewPolicy(cfg Config, policy model.AutoFixReviewPolicy) (Config, er
 	cfg.CrossExamineBlockingFindings = policy.CrossExamineBlockingFindings
 	cfg.RequireCleanTree = policy.RequireCleanTree
 	cfg.AllowAPIBilling = policy.AllowAPIBilling
+	cfg.AllowReviewWeb = policy.AllowReviewWeb
 	cfg.AllowUnsafeChecks = policy.AllowUnsafeChecks
 	cfg.MinimumApprovals = policy.MinimumApprovals
 	cfg.BlockingSeverities = append([]string(nil), policy.BlockingSeverities...)

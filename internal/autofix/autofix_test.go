@@ -4,6 +4,7 @@ package autofix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,13 +20,21 @@ import (
 	"github.com/herikwebb/cora/internal/record"
 )
 
-func TestFormatQueueETAReportsExceededEstimateInsteadOfZero(t *testing.T) {
+func TestFormatQueueWaitReportsCapacityHolderAfterEstimate(t *testing.T) {
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
-	if got := formatQueueETA(now.Add(-time.Second), now); got != "estimate-exceeded" {
-		t.Fatalf("expired queue ETA = %q", got)
-	}
 	if got := formatQueueETA(now.Add(500*time.Millisecond), now); got != "<1s" {
 		t.Fatalf("subsecond queue ETA = %q", got)
+	}
+	deadline := now.Add(-time.Second)
+	timeoutAt := now.Add(2 * time.Minute)
+	got := formatQueueWait(model.ProviderQueueStatus{
+		ETAAt:   &deadline,
+		Holders: []model.ProviderCapacityHolder{{RunID: "loop-active", Reviewer: "auto-fix", TimeoutAt: &timeoutAt}},
+	}, now)
+	for _, want := range []string{"holder=auto-fix@loop-active", "timeout_in=2m"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("capacity-holder wait %q does not contain %q", got, want)
+		}
 	}
 }
 
@@ -41,6 +50,69 @@ func TestRunAgentPreservesTypedQuotaRetryAt(t *testing.T) {
 	if !attempt.Retryable || attempt.FailureKind != "quota" || attempt.RetryAt == nil || !attempt.RetryAt.Equal(retryAt) {
 		t.Fatalf("typed quota attempt = %#v", attempt)
 	}
+}
+
+func TestRunnerCancellationPersistsLoopAndReleasesLock(t *testing.T) {
+	repo, initial := autoFixTestRepo(t)
+	reviewer := &cancelAwareReviewer{started: make(chan struct{})}
+	cfg := autoFixConfig(filepath.Join(t.TempDir(), "agent-must-not-run"))
+	ctx, cancel := context.WithCancel(context.Background())
+	type outcome struct {
+		loop model.AutoFixLoop
+		err  error
+	}
+	finished := make(chan outcome, 1)
+	go func() {
+		loop, runErr := (Runner{Reviewer: reviewer}).Run(ctx, repo, initial, cfg)
+		finished <- outcome{loop: loop, err: runErr}
+	}()
+	select {
+	case <-reviewer.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("auto-fix review did not start")
+	}
+	cancel()
+
+	var result outcome
+	select {
+	case result = <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled auto-fix loop did not return after cleanup")
+	}
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("canceled auto-fix error = %v, loop = %#v", result.err, result.loop)
+	}
+	if result.loop.State != model.StateIncomplete || result.loop.RecordPath == "" || result.loop.FinishedAt == nil {
+		t.Fatalf("canceled auto-fix record = %#v", result.loop)
+	}
+	var persisted model.AutoFixLoop
+	if err := record.ReadJSON(filepath.Join(result.loop.RecordPath, "manifest.json"), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != model.StateIncomplete || !strings.Contains(persisted.Reason, "context canceled") {
+		t.Fatalf("persisted canceled loop = %#v", persisted)
+	}
+	if _, err := os.Stat(filepath.Join(result.loop.RecordPath, "heartbeat.json")); err != nil {
+		t.Fatalf("missing canceled-loop heartbeat: %v", err)
+	}
+	store := record.New(repo.CommonDir)
+	lock, err := store.Acquire("auto-fix-loop")
+	if err != nil {
+		t.Fatalf("auto-fix lock survived cancellation: %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type cancelAwareReviewer struct {
+	started chan struct{}
+}
+
+func (r *cancelAwareReviewer) RunWithOptions(ctx context.Context, _ gitx.Repo, _ model.Target, _ config.Config, _ orchestrator.RunOptions) (model.Decision, error) {
+	close(r.started)
+	<-ctx.Done()
+	return model.Decision{}, ctx.Err()
 }
 
 func TestRetryableQuotaIncludesOutcomeDependentDeferredReviewers(t *testing.T) {
@@ -407,6 +479,9 @@ func TestRunnerResumeRetriesOnlyQuotaReviewerInSameParentLoop(t *testing.T) {
 	}
 	if len(resumed.Iterations) != 1 || len(resumed.Iterations[0].ReviewAttemptRunIDs) != 2 || resumed.Iterations[0].ReviewAttemptRunIDs[0] == resumed.Iterations[0].ReviewAttemptRunIDs[1] {
 		t.Fatalf("review retry lineage = %#v", resumed.Iterations)
+	}
+	if usage := resumed.Iterations[0].ReviewUsage; !usage.TurnsKnown || usage.Turns != 4 || !usage.APIEquivalentCostKnown || usage.APIEquivalentCostUSD != 0.02 {
+		t.Fatalf("review retry usage did not include both attempts: %#v", usage)
 	}
 	if reviewer.calls != 2 || !reviewer.retriedOnlyClaude {
 		t.Fatalf("reviewer calls=%d retriedOnlyClaude=%t", reviewer.calls, reviewer.retriedOnlyClaude)

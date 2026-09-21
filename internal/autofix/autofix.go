@@ -21,6 +21,7 @@ import (
 	"github.com/herikwebb/cora/internal/orchestrator"
 	"github.com/herikwebb/cora/internal/provider"
 	"github.com/herikwebb/cora/internal/record"
+	"github.com/herikwebb/cora/internal/webevidence"
 )
 
 const codingAgentPolicy = `CORA auto-fix security policy:
@@ -138,6 +139,13 @@ func PrepareResume(ctx context.Context, repo gitx.Repo, loopID string) (ResumePl
 	if manifest.Target.BaseSHA != decision.BaseSHA || manifest.Target.HeadSHA != decision.HeadSHA || manifest.Target.DiffHash != decision.DiffHash {
 		return ResumePlan{}, errors.New("paused review manifest and decision target do not match")
 	}
+	reviewScope, err := webevidence.EffectiveReviewScope(manifest)
+	if err != nil {
+		return ResumePlan{}, fmt.Errorf("paused review has an invalid scope: %w", err)
+	}
+	if manifest.WebEvidence != nil {
+		return ResumePlan{}, errors.New("web evidence is not supported in auto-fix review lineage")
+	}
 	if manifest.FullTarget != nil && !sameTargetLineage(*manifest.FullTarget, current) {
 		return ResumePlan{}, errors.New("paused review full-target lineage does not match the current exact diff")
 	}
@@ -161,14 +169,16 @@ func PrepareResume(ctx context.Context, repo gitx.Repo, loopID string) (ResumePl
 	}
 	plan.ReviewOptions = orchestrator.RunOptions{
 		ParentRunID: loop.ResumeReviewRunID, RetryReviewers: selected,
-		ReuseReviewers: manifest.Reviewers, ReuseSecurityReviews: manifest.SecurityReviews,
+		ReviewerExecutionLimits: cloneReviewerExecutionLimits(manifest.ReviewerExecutionLimits),
+		ReuseReviewers:          manifest.Reviewers, ReuseSecurityReviews: manifest.SecurityReviews,
 		ReuseCrossExaminations: manifest.CrossExaminations,
 		ReuseChecks:            true, Checks: manifest.Checks, NotBefore: notBefore,
-		AutoFixLoopID: loop.LoopID, AutoFixIteration: loop.ResumeIteration,
+		ReuseWebEvidence: manifest.WebEvidence,
+		AutoFixLoopID:    loop.LoopID, AutoFixIteration: loop.ResumeIteration,
 	}
 	if manifest.FullTarget != nil {
 		plan.ReviewContext = model.AutoFixReviewContext{
-			ReviewScope: manifest.ReviewScope, ApprovalBaselineRunID: manifest.ApprovalBaselineRunID,
+			ReviewScope: reviewScope, ApprovalBaselineRunID: manifest.ApprovalBaselineRunID,
 			ApprovalBaselineHash: manifest.ApprovalBaselineHash, TrustedBaseSHA: loop.BaseSHA, FullTarget: *manifest.FullTarget,
 		}
 		if manifest.ApprovalBaselineRunID != "" {
@@ -182,10 +192,21 @@ func PrepareResume(ctx context.Context, repo gitx.Repo, loopID string) (ResumePl
 			}
 			plan.ReviewContext.BaselineFindings = append([]model.ConsolidatedFinding(nil), baseline.Decision.Findings...)
 		}
-	} else if manifest.ReviewScope == "approved-baseline-delta" || manifest.ReviewScope == "full-final" {
+	} else if reviewScope == "approved-baseline-delta" || reviewScope == "full-final" {
 		return ResumePlan{}, errors.New("paused scoped review is missing its complete full-target lineage")
 	}
 	return plan, nil
+}
+
+func cloneReviewerExecutionLimits(source map[string]model.ReviewerExecutionLimit) map[string]model.ReviewerExecutionLimit {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]model.ReviewerExecutionLimit, len(source))
+	for reviewer, limit := range source {
+		cloned[reviewer] = limit
+	}
+	return cloned
 }
 
 func sameTargetLineage(saved, current model.Target) bool {
@@ -211,7 +232,15 @@ func (r Runner) Resume(parent context.Context, repo gitx.Repo, loopID string, cf
 	return r.run(parent, repo, initial, cfg, &plan)
 }
 
-func (r Runner) run(parent context.Context, repo gitx.Repo, initial model.Target, cfg config.Config, resume *ResumePlan) (model.AutoFixLoop, error) {
+func (r Runner) run(parent context.Context, repo gitx.Repo, initial model.Target, cfg config.Config, resume *ResumePlan) (result model.AutoFixLoop, resultErr error) {
+	// Preserve the loop record first, then surface an operator cancellation to
+	// the caller. This defer is deliberately registered before the loop lock and
+	// heartbeat defers so they finish before context.Canceled is returned.
+	defer func() {
+		if callerErr := parent.Err(); callerErr != nil {
+			resultErr = errors.Join(callerErr, resultErr)
+		}
+	}()
 	if r.Progress != nil {
 		progress := &synchronizedWriter{writer: r.Progress}
 		r.Progress = progress
@@ -235,7 +264,11 @@ func (r Runner) run(parent context.Context, repo gitx.Repo, initial model.Target
 	if err != nil {
 		return model.AutoFixLoop{}, err
 	}
-	defer lock.Release()
+	defer func() {
+		if releaseErr := lock.Release(); releaseErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("release auto-fix loop lock: %w", releaseErr))
+		}
+	}()
 	if resume != nil {
 		fresh, refreshErr := PrepareResume(parent, repo, resume.Loop.LoopID)
 		if refreshErr != nil {
@@ -437,10 +470,13 @@ func (r Runner) run(parent context.Context, repo gitx.Repo, initial model.Target
 			return r.finish(loopRecord, &loop, model.StateIncomplete, "review iteration failed: "+reviewErr.Error(), nil, current)
 		}
 		qualifying := qualifyingFindings(decision.Findings, cfg.AutoFix.Threshold)
+		blockingFindings, nonBlockingFindings := effectiveDecisionFindingCounts(decision, cfg)
 		iteration := model.AutoFixIteration{
 			Number: iterationNumber, ReviewRunID: decision.RunID, ReviewRecordPath: decision.RecordPath, ReviewState: decision.State,
 			ReviewAttemptRunIDs: []string{decision.RunID},
 			ReviewScope:         reviewScope, ReviewDiffHash: decision.DiffHash, FullDiffHash: current.DiffHash,
+			BlockingFindings:      blockingFindings,
+			NonBlockingFindings:   nonBlockingFindings,
 			QualifyingFindingIDs:  findingIDs(qualifying),
 			QualifyingFingerprint: findingsFingerprint(qualifying), ReviewUsage: decision.IncrementalUsage,
 		}
@@ -453,13 +489,15 @@ func (r Runner) run(parent context.Context, repo gitx.Repo, initial model.Target
 			if index < 0 {
 				return r.finish(loopRecord, &loop, model.StateIncomplete, "paused review iteration is missing from its parent loop", &decision, current)
 			}
-			attemptRunIDs := append([]string(nil), loop.Iterations[index].ReviewAttemptRunIDs...)
+			previousIteration := loop.Iterations[index]
+			attemptRunIDs := append([]string(nil), previousIteration.ReviewAttemptRunIDs...)
 			if len(attemptRunIDs) == 0 {
-				attemptRunIDs = appendUniqueString(attemptRunIDs, loop.Iterations[index].ReviewRunID)
+				attemptRunIDs = appendUniqueString(attemptRunIDs, previousIteration.ReviewRunID)
 			}
 			iteration.ReviewAttemptRunIDs = appendUniqueString(attemptRunIDs, decision.RunID)
-			iteration.Fix = loop.Iterations[index].Fix
-			iteration.FixAttempts = append([]model.AutoFixAttempt(nil), loop.Iterations[index].FixAttempts...)
+			iteration.ReviewUsage = addUsage(previousIteration.ReviewUsage, decision.IncrementalUsage)
+			iteration.Fix = previousIteration.Fix
+			iteration.FixAttempts = append([]model.AutoFixAttempt(nil), previousIteration.FixAttempts...)
 			loop.Iterations[index] = iteration
 		} else {
 			loop.Iterations = append(loop.Iterations, iteration)
@@ -630,11 +668,7 @@ func (r Runner) runAgent(ctx context.Context, repo gitx.Repo, loopRecord record.
 	queueStarted := time.Now()
 	queueCtx, cancelQueue := context.WithTimeout(ctx, cfg.QueueTimeout.Duration)
 	lease, err := record.AcquireProviderQueued(queueCtx, "codex", cfg.AutoFix.MaxConcurrency, record.ProviderQueueRequest{RunID: loopRecord.ID, Reviewer: "auto-fix"}, func(status model.ProviderQueueStatus) {
-		eta := "unknown"
-		if status.ETAAt != nil {
-			eta = formatQueueETA(*status.ETAAt, time.Now())
-		}
-		r.progressf("cora: auto-fix agent queued (position=%d ahead=%d eta_in=%s)\n", status.Position, status.Ahead, eta)
+		r.progressf("cora: auto-fix agent queued (position=%d ahead=%d %s)\n", status.Position, status.Ahead, formatQueueWait(status, time.Now()))
 		_ = record.AppendEvent(loopRecord, map[string]any{"type": "auto_fix.agent_queued", "at": time.Now().UTC(), "queue": status})
 	})
 	cancelQueue()
@@ -651,8 +685,26 @@ func (r Runner) runAgent(ctx context.Context, repo gitx.Repo, loopRecord record.
 		}
 		return attempt
 	}
-	_ = record.AppendEvent(loopRecord, map[string]any{"type": "auto_fix.agent_started", "at": time.Now().UTC(), "model": cfg.AutoFix.Model, "effort": cfg.AutoFix.Effort})
 	agentCtx, cancelAgent := context.WithTimeout(ctx, cfg.AutoFix.AgentTimeout.Duration)
+	remainingTimeout := cfg.AutoFix.AgentTimeout.Duration
+	if deadline, found := agentCtx.Deadline(); found {
+		remainingTimeout = time.Until(deadline)
+		if remainingTimeout < 0 {
+			remainingTimeout = 0
+		}
+	}
+	if markErr := lease.MarkExecutionStarted(remainingTimeout); markErr != nil {
+		cancelAgent()
+		attempt := model.AutoFixAttempt{
+			Agent: "codex", Status: "incomplete", Model: cfg.AutoFix.Model, Effort: cfg.AutoFix.Effort,
+			QueueDuration: model.NewDuration(queueDuration), Duration: model.NewDuration(queueDuration),
+			FailureKind: "provider_lease", Error: "publish coding-agent execution deadline: " + markErr.Error(),
+			PromptHash: hash([]byte(prompt)), PolicyHash: hash([]byte(codingAgentPolicy)), BeforeDiffHash: target.DiffHash,
+		}
+		applyAutoFixProviderRelease(&attempt, lease.Release())
+		return attempt
+	}
+	_ = record.AppendEvent(loopRecord, map[string]any{"type": "auto_fix.agent_started", "at": time.Now().UTC(), "model": cfg.AutoFix.Model, "effort": cfg.AutoFix.Effort})
 	agentStarted := time.Now()
 	attempt := provider.RunCodexFix(agentCtx, cfg.AutoFix, provider.FixRequest{
 		RepoRoot: repo.Root, RecordDir: iterationDir, Prompt: prompt, Policy: codingAgentPolicy,
@@ -677,11 +729,27 @@ func (r Runner) runAgent(ctx context.Context, repo gitx.Repo, loopRecord record.
 			}
 		}
 	}
-	if releaseErr != nil && attempt.Status == "completed" {
-		attempt.Status = "incomplete"
-		attempt.Error = "release coding-agent provider slot: " + releaseErr.Error()
-	}
+	applyAutoFixProviderRelease(&attempt, releaseErr)
 	return attempt
+}
+
+func applyAutoFixProviderRelease(attempt *model.AutoFixAttempt, releaseErr error) {
+	if attempt == nil || releaseErr == nil {
+		return
+	}
+	wasCompleted := attempt.Status == "completed"
+	if wasCompleted {
+		attempt.Status = "incomplete"
+	}
+	if attempt.FailureKind == "" || wasCompleted {
+		attempt.FailureKind = "provider_cleanup"
+	}
+	detail := "release coding-agent provider slot: " + releaseErr.Error()
+	if strings.TrimSpace(attempt.Error) == "" {
+		attempt.Error = detail
+	} else {
+		attempt.Error = strings.TrimSpace(attempt.Error) + "; " + detail
+	}
 }
 
 func (r Runner) resumeFix(ctx context.Context, repo gitx.Repo, loopRecord record.Run, loop *model.AutoFixLoop, initial, current model.Target, cfg config.Config, heartbeat *loopHeartbeat, plan ResumePlan) (model.Target, error) {
@@ -892,6 +960,27 @@ func qualifyingFindings(findings []model.ConsolidatedFinding, threshold string) 
 		}
 	}
 	return result
+}
+
+func effectiveDecisionFindingCounts(decision model.Decision, cfg config.Config) (blocking, nonBlocking int) {
+	if decision.BlockingFindings+decision.NonBlockingFindings == len(decision.Findings) {
+		return decision.BlockingFindings, decision.NonBlockingFindings
+	}
+	blockingSeverities := make(map[string]bool, len(cfg.BlockingSeverities)+1)
+	for _, severity := range cfg.BlockingSeverities {
+		blockingSeverities[severity] = true
+	}
+	if cfg.StrictPolicy {
+		blockingSeverities["minor"] = true
+	}
+	for _, finding := range decision.Findings {
+		if blockingSeverities[finding.Severity] {
+			blocking++
+		} else {
+			nonBlocking++
+		}
+	}
+	return blocking, nonBlocking
 }
 
 func severityRank(severity string) int {
@@ -1108,9 +1197,6 @@ func baselineReviewersMatchPolicy(results []model.ReviewerResult, policy model.A
 }
 
 func baselineChecksMatchPolicy(results []model.CheckResult, checks []model.AutoFixCheckPolicy) bool {
-	if len(results) != len(checks) {
-		return false
-	}
 	required := make(map[string]string, len(checks))
 	for _, check := range checks {
 		if _, duplicate := required[check.Name]; duplicate {
@@ -1119,6 +1205,15 @@ func baselineChecksMatchPolicy(results []model.CheckResult, checks []model.AutoF
 		required[check.Name] = check.Profile
 	}
 	for _, result := range results {
+		// Imported evidence is an additive exact-diff attestation rather than a
+		// configured command. LoadApprovedBaseline has already revalidated its
+		// private artifact and binding; it must not hide a missing policy check.
+		if result.ImportedEvidence != nil {
+			if result.Status != "passed" || result.Profile != "imported-evidence" {
+				return false
+			}
+			continue
+		}
 		profile, found := required[result.Name]
 		if !found || result.Status != "passed" || result.Profile != profile {
 			return false
@@ -1361,12 +1456,42 @@ func formatDuration(duration time.Duration) string {
 func formatQueueETA(etaAt, now time.Time) string {
 	remaining := etaAt.Sub(now)
 	if remaining <= 0 {
-		return "estimate-exceeded"
+		return "waiting-for-capacity"
 	}
 	if remaining < time.Second {
 		return "<1s"
 	}
 	return remaining.Round(time.Second).String()
+}
+
+func formatQueueWait(status model.ProviderQueueStatus, now time.Time) string {
+	parts := make([]string, 0, 1+len(status.Holders))
+	if status.ETAAt != nil && status.ETAAt.After(now) {
+		parts = append(parts, "eta_in="+formatQueueETA(*status.ETAAt, now))
+	}
+	for _, holder := range status.Holders {
+		identity := holder.Reviewer
+		if identity == "" {
+			identity = fmt.Sprintf("pid-%d", holder.PID)
+		}
+		if holder.RunID != "" {
+			identity += "@" + holder.RunID
+		}
+		timeout := "timeout=unknown"
+		if holder.TimeoutAt != nil {
+			remaining := holder.TimeoutAt.Sub(now)
+			if remaining > 0 {
+				timeout = "timeout_in=" + formatDuration(remaining)
+			} else {
+				timeout = "timeout_overdue=" + formatDuration(-remaining)
+			}
+		}
+		parts = append(parts, "holder="+identity+" "+timeout)
+	}
+	if len(parts) == 0 {
+		return "waiting-for-capacity"
+	}
+	return strings.Join(parts, " ")
 }
 
 func formatUsage(usage model.Usage) string {

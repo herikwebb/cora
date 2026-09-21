@@ -1,0 +1,9 @@
+//go:build windows
+
+package cli
+
+import "os"
+
+func terminationSignals() []os.Signal {
+	return nil
+}

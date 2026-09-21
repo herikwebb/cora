@@ -208,6 +208,67 @@ func TestPrepareDisposableWorkspaceSnapshotUsesCapturedPatch(t *testing.T) {
 	}
 }
 
+func TestDisposableWorkspaceCloseRepairsUntrustedPermissions(t *testing.T) {
+	ctx := context.Background()
+	root := newGitRepository(t)
+	repo, err := Discover(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := gitTestOutput(t, root, "rev-parse", "HEAD")
+	workspace, err := repo.createDisposableClone(ctx, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceRoot := workspace.Root
+	locked := filepath.Join(workspaceRoot, "locked")
+	if err := os.MkdirAll(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "artifact"), []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(locked, 0o700) }()
+
+	if err := workspace.Close(ctx); err != nil {
+		t.Fatalf("close permission-locked disposable workspace: %v", err)
+	}
+	if _, err := os.Stat(workspaceRoot); !os.IsNotExist(err) {
+		t.Fatalf("disposable workspace survived cleanup: %v", err)
+	}
+}
+
+func TestWorkspaceCloseCompletesAfterParentCancellation(t *testing.T) {
+	ctx := context.Background()
+	root := newGitRepository(t)
+	repo, err := Discover(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := gitTestOutput(t, root, "rev-parse", "HEAD")
+	workspace, err := repo.createTemporaryWorkspace(ctx, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceRoot := workspace.Root
+	workspaceParent := workspace.parent
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := workspace.Close(canceled); err != nil {
+		t.Fatalf("close with canceled parent: %v", err)
+	}
+	if _, err := os.Stat(workspaceParent); !os.IsNotExist(err) {
+		t.Fatalf("temporary workspace survived cleanup: %v", err)
+	}
+	if listed := gitTestOutput(t, root, "worktree", "list", "--porcelain"); strings.Contains(listed, workspaceRoot) {
+		t.Fatalf("canceled cleanup left Git worktree registration:\n%s", listed)
+	}
+}
+
 func newGitRepository(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

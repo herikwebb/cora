@@ -36,7 +36,7 @@ func newRunHeartbeat(run record.Run, started time.Time, progress io.Writer, acti
 		run: run, progress: progress, activeElapsed: elapsed, stop: make(chan struct{}), done: make(chan struct{}),
 		value: model.Heartbeat{
 			RunID: run.ID, State: "active", Phase: "reviewers", StartedAt: started,
-			UpdatedAt: time.Now().UTC(), ActiveTimingBasis: activeTimingBasis, PID: os.Getpid(), Reviewers: map[string]string{}, ReviewerStartedAt: map[string]time.Time{}, Checks: map[string]string{}, Queues: map[string]model.ProviderQueueStatus{},
+			UpdatedAt: time.Now().UTC(), ActiveTimingBasis: activeTimingBasis, PID: os.Getpid(), Reviewers: map[string]string{}, ReviewerVerdicts: map[string]string{}, ReviewerStartedAt: map[string]time.Time{}, Checks: map[string]string{}, Queues: map[string]model.ProviderQueueStatus{},
 		},
 	}
 }
@@ -87,8 +87,19 @@ func (h *runHeartbeat) Phase(phase string) {
 }
 
 func (h *runHeartbeat) Reviewer(name, state string) {
+	h.ReviewerOutcome(name, state, "")
+}
+
+func (h *runHeartbeat) ReviewerOutcome(name, state, verdict string) {
 	h.mu.Lock()
 	h.value.Reviewers[name] = state
+	if verdict != "" {
+		h.value.ReviewerVerdicts[name] = verdict
+	} else {
+		// A role may be queued or rerun after an earlier completed attempt.
+		// Never expose the prior verdict as if it belonged to the new attempt.
+		delete(h.value.ReviewerVerdicts, name)
+	}
 	if state == "running" {
 		if h.value.ReviewerStartedAt[name].IsZero() {
 			h.value.ReviewerStartedAt[name] = time.Now().UTC()
@@ -141,6 +152,7 @@ func (h *runHeartbeat) snapshot() model.Heartbeat {
 	defer h.mu.Unlock()
 	value := h.value
 	value.Reviewers = cloneStates(h.value.Reviewers)
+	value.ReviewerVerdicts = cloneStates(h.value.ReviewerVerdicts)
 	value.ReviewerStartedAt = cloneTimes(h.value.ReviewerStartedAt)
 	value.Checks = cloneStates(h.value.Checks)
 	value.Queues = cloneQueues(h.value.Queues)
@@ -173,7 +185,7 @@ func cloneStates(source map[string]string) map[string]string {
 
 func heartbeatDetail(heartbeat model.Heartbeat) string {
 	parts := []string{"phase=" + heartbeat.Phase}
-	for _, states := range []map[string]string{heartbeat.Reviewers, heartbeat.Checks} {
+	for group, states := range []map[string]string{heartbeat.Reviewers, heartbeat.Checks} {
 		names := make([]string, 0, len(states))
 		for name := range states {
 			names = append(names, name)
@@ -181,7 +193,10 @@ func heartbeatDetail(heartbeat model.Heartbeat) string {
 		sort.Strings(names)
 		for _, name := range names {
 			detail := name + "=" + states[name]
-			if states[name] == "running" && !heartbeat.ReviewerStartedAt[name].IsZero() {
+			if verdict := heartbeat.ReviewerVerdicts[name]; group == 0 && verdict != "" {
+				detail += "(verdict=" + verdict + ")"
+			}
+			if group == 0 && states[name] == "running" && !heartbeat.ReviewerStartedAt[name].IsZero() {
 				detail += "(wall=" + formatDuration(wallElapsed(heartbeat.ReviewerStartedAt[name], time.Now())) + ")"
 			}
 			parts = append(parts, detail)
@@ -194,10 +209,7 @@ func heartbeatDetail(heartbeat model.Heartbeat) string {
 	sort.Strings(queueNames)
 	for _, name := range queueNames {
 		queue := heartbeat.Queues[name]
-		detail := fmt.Sprintf("%s=queue:%d", name, queue.Position)
-		if queue.ETAAt != nil {
-			detail += "~" + formatQueueETA(*queue.ETAAt, time.Now())
-		}
+		detail := fmt.Sprintf("%s=queue:%d(%s)", name, queue.Position, formatQueueWait(queue, time.Now()))
 		parts = append(parts, detail)
 	}
 	return strings.Join(parts, " ")
@@ -213,12 +225,42 @@ func nonNegativeDuration(duration time.Duration) time.Duration {
 func formatQueueETA(etaAt, now time.Time) string {
 	remaining := etaAt.Sub(now)
 	if remaining <= 0 {
-		return "estimate-exceeded"
+		return "waiting-for-capacity"
 	}
 	if remaining < time.Second {
 		return "<1s"
 	}
 	return remaining.Round(time.Second).String()
+}
+
+func formatQueueWait(status model.ProviderQueueStatus, now time.Time) string {
+	parts := make([]string, 0, 1+len(status.Holders))
+	if status.ETAAt != nil && status.ETAAt.After(now) {
+		parts = append(parts, "eta_in="+formatQueueETA(*status.ETAAt, now))
+	}
+	for _, holder := range status.Holders {
+		identity := holder.Reviewer
+		if identity == "" {
+			identity = fmt.Sprintf("pid-%d", holder.PID)
+		}
+		if holder.RunID != "" {
+			identity += "@" + holder.RunID
+		}
+		timeout := "timeout=unknown"
+		if holder.TimeoutAt != nil {
+			remaining := holder.TimeoutAt.Sub(now)
+			if remaining > 0 {
+				timeout = "timeout_in=" + formatDuration(remaining)
+			} else {
+				timeout = "timeout_overdue=" + formatDuration(-remaining)
+			}
+		}
+		parts = append(parts, "holder="+identity+" "+timeout)
+	}
+	if len(parts) == 0 {
+		return "waiting-for-capacity"
+	}
+	return strings.Join(parts, " ")
 }
 
 func wallElapsed(started, ended time.Time) time.Duration {

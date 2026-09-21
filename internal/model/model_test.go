@@ -53,3 +53,21 @@ func TestFindingMarshalEmitsRequiredNullableSchemaProperties(t *testing.T) {
 		}
 	}
 }
+
+func TestValidReachabilityStatus(t *testing.T) {
+	for _, status := range []string{
+		ReachabilityDemonstrated,
+		ReachabilityNotDemonstrated,
+		ReachabilityNotApplicable,
+		ReachabilityUncertain,
+	} {
+		if !ValidReachabilityStatus(status) {
+			t.Errorf("documented reachability status %q rejected", status)
+		}
+	}
+	for _, status := range []string{"", "applicable", "unknown"} {
+		if ValidReachabilityStatus(status) {
+			t.Errorf("undocumented reachability status %q accepted", status)
+		}
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,17 @@ import (
 	"github.com/herikwebb/cora/internal/model"
 	"github.com/herikwebb/cora/internal/record"
 )
+
+func TestCommandErrorExitCodePrioritizesCallerCancellation(t *testing.T) {
+	var stderr bytes.Buffer
+	err := errors.Join(stateError{state: model.StateIncomplete}, context.Canceled)
+	if got := commandErrorExitCode(err, &stderr); got != 130 {
+		t.Fatalf("exit code = %d, want 130", got)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want no diagnostic for caller cancellation", stderr.String())
+	}
+}
 
 func TestRootCommandUsesReviewInsteadOfRun(t *testing.T) {
 	root := newRootCommand()
@@ -44,9 +56,18 @@ func TestRootCommandUsesReviewInsteadOfRun(t *testing.T) {
 
 func TestReviewCommandExposesBoundedAutoFixFlags(t *testing.T) {
 	command := newReviewCommand(&options{})
-	for _, name := range []string{"auto-fix", "resume", "until", "max-iterations", "max-duration", "max-turns", "max-cost-usd", "agent-timeout"} {
+	for _, name := range []string{"auto-fix", "resume", "until", "max-iterations", "max-duration", "max-turns", "max-cost-usd", "agent-timeout", "allow-review-web", "web-evidence"} {
 		if command.Flags().Lookup(name) == nil {
 			t.Fatalf("review command is missing --%s", name)
+		}
+	}
+}
+
+func TestRetryCommandExposesAuditedLimitOverrides(t *testing.T) {
+	command := newRetryCommand(&options{})
+	for _, name := range []string{"reviewer-timeout", "overall-timeout", "max-turns"} {
+		if command.Flags().Lookup(name) == nil {
+			t.Fatalf("retry command is missing --%s", name)
 		}
 	}
 }
@@ -72,6 +93,16 @@ func TestAutoFixOnlyFlagsRequireExplicitOptIn(t *testing.T) {
 	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "cannot change the recorded review policy") {
 		t.Fatalf("auto-fix resume policy error = %v", err)
 	}
+	command = newReviewCommand(&options{})
+	command.SetArgs([]string{"--auto-fix", "--web-evidence", "https://docs.example.com/"})
+	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "cannot be combined with --auto-fix") {
+		t.Fatalf("auto-fix web evidence error = %v", err)
+	}
+	command = newReviewCommand(&options{})
+	command.SetArgs([]string{"--auto-fix", "--resume", "loop-id", "--allow-review-web"})
+	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "cannot change the recorded review policy") {
+		t.Fatalf("auto-fix resume web-policy error = %v", err)
+	}
 }
 
 func TestPrintAutoFixLoopShowsStopReasonAndUsage(t *testing.T) {
@@ -79,15 +110,78 @@ func TestPrintAutoFixLoopShowsStopReasonAndUsage(t *testing.T) {
 	printAutoFixLoop(&output, model.AutoFixLoop{
 		LoopID: "loop-1", State: model.StateIncomplete, Reason: "equivalent findings repeated",
 		Threshold: "minor", MaxIterations: 5, FinalDiffHash: "1234567890", Elapsed: model.NewDuration(time.Minute),
-		Usage:      model.Usage{Turns: 4, TurnsKnown: true, APIEquivalentCostUSD: 1.25, APIEquivalentCostKnown: true},
-		Iterations: []model.AutoFixIteration{{Number: 1, ReviewRunID: "run-1", ReviewState: model.StateChangesRequested, QualifyingFindingIDs: []string{"f1"}}},
+		Usage: model.Usage{Turns: 4, TurnsKnown: true, APIEquivalentCostUSD: 1.25, APIEquivalentCostKnown: true},
+		Iterations: []model.AutoFixIteration{{
+			Number: 1, ReviewRunID: "run-1", ReviewState: model.StateChangesRequested,
+			BlockingFindings: 1, NonBlockingFindings: 2, QualifyingFindingIDs: []string{"f1"},
+		}},
 		RecordPath: "/tmp/loop-1",
 	})
 	text := output.String()
-	for _, want := range []string{"INCOMPLETE AUTO-FIX loop-1", "equivalent findings repeated", "Iterations: 1/5", "provider-turns=4", "$1.2500", "run-1", "/tmp/loop-1"} {
+	for _, want := range []string{"INCOMPLETE AUTO-FIX loop-1", "equivalent findings repeated", "Iterations: 1/5", "findings: blocking=1, non-blocking=2 qualifying=1", "provider-turns=4", "$1.2500", "run-1", "/tmp/loop-1"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("auto-fix output does not contain %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestPrintAutoFixLoopRecoversLegacyIterationFindingCounts(t *testing.T) {
+	firstPath := t.TempDir()
+	secondPath := t.TempDir()
+	if err := record.WriteJSON(filepath.Join(firstPath, "decision.json"), model.Decision{
+		RunID: "run-1", OpenFindings: map[string]int{"major": 1, "minor": 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := record.WriteJSON(filepath.Join(secondPath, "decision.json"), model.Decision{
+		RunID: "run-2", OpenFindings: map[string]int{"note": 3},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loop := model.AutoFixLoop{
+		LoopID: "legacy-loop", State: model.StateIncomplete, MaxIterations: 3,
+		Iterations: []model.AutoFixIteration{
+			{Number: 1, ReviewRunID: "run-1", ReviewRecordPath: firstPath, ReviewState: model.StateChangesRequested, QualifyingFindingIDs: []string{"f-1"}},
+			{Number: 2, ReviewRunID: "run-2", ReviewRecordPath: secondPath, ReviewState: model.StateApproved},
+			{Number: 3, ReviewRunID: "missing", ReviewRecordPath: filepath.Join(t.TempDir(), "missing"), ReviewState: model.StateIncomplete, QualifyingFindingIDs: []string{"f-2"}},
+		},
+	}
+	var output bytes.Buffer
+	printAutoFixLoop(&output, loop)
+	for _, want := range []string{
+		"iteration 1: review=changes_requested findings: blocking=1, non-blocking=2 qualifying=1",
+		"iteration 2: review=approved findings: blocking=0, non-blocking=3 qualifying=0",
+		"iteration 3: review=incomplete findings: unknown qualifying=1",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("legacy loop output does not contain %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestFormatDecisionFindingSummaryShowsApprovedNonBlockingFindings(t *testing.T) {
+	decision := model.Decision{
+		State:               model.StateApproved,
+		BlockingFindings:    0,
+		NonBlockingFindings: 5,
+		OpenFindings:        map[string]int{"blocker": 0, "major": 0, "minor": 3, "note": 2},
+		OutcomeQualifier:    "non_blocking_findings",
+	}
+	got := formatDecisionFindingSummary(decision)
+	want := "blocking=0, non-blocking=5 (blocker=0 major=0 minor=3 note=2)"
+	if got != want {
+		t.Fatalf("finding summary = %q, want %q", got, want)
+	}
+}
+
+func TestDecisionFindingCountsSupportsHistoricalStrictRuns(t *testing.T) {
+	decision := model.Decision{
+		StrictPolicy: true,
+		OpenFindings: map[string]int{"blocker": 0, "major": 0, "minor": 2, "note": 1},
+	}
+	blocking, nonBlocking := decisionFindingCounts(decision)
+	if blocking != 2 || nonBlocking != 1 {
+		t.Fatalf("historical strict counts = blocking=%d non-blocking=%d; want 2, 1", blocking, nonBlocking)
 	}
 }
 
@@ -107,25 +201,45 @@ func TestPrintAutoFixLoopShowsResumeCommandWhenPaused(t *testing.T) {
 func TestPrintActiveRunsShowsConcurrentReviewerElapsedTime(t *testing.T) {
 	var output bytes.Buffer
 	printActiveRuns(&output, []model.RunSummary{
-		{RunID: "run-one", HeadSHA: "aaaaaaaaaa", ElapsedMS: 65_000, ActiveExecutionMS: 35_000, ActiveTimingBasis: "sampled-awake-while-executing", Phase: "reviewers", Reviewers: map[string]string{"codex": "running"}, ReviewerElapsedMS: map[string]int64{"codex": 42_000}},
+		{RunID: "run-one", HeadSHA: "aaaaaaaaaa", ElapsedMS: 65_000, ActiveExecutionMS: 35_000, ActiveTimingBasis: "sampled-awake-while-executing", Phase: "reviewers", Reviewers: map[string]string{"codex": "completed", "claude": "running"}, ReviewerVerdicts: map[string]string{"codex": "approve"}, ReviewerElapsedMS: map[string]int64{"claude": 42_000}},
 		{RunID: "run-two", HeadSHA: "bbbbbbbbbb", ElapsedMS: 30_000, Phase: "reviewers", Reviewers: map[string]string{"claude": "queued"}, Queues: map[string]model.ProviderQueueStatus{"claude": {Position: 2}}},
 	})
 	text := output.String()
-	for _, want := range []string{"run-one", "run-two", "35s", "codex=running(wall=42s)", "claude=queued#2"} {
+	for _, want := range []string{"run-one", "run-two", "35s", "claude=running(wall=42s)", "codex=completed(verdict=approve)", "claude=queued#2"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("active output does not contain %q:\n%s", want, text)
 		}
 	}
 }
 
-func TestActiveReviewerSummaryDoesNotShowZeroForExpiredQueueETA(t *testing.T) {
+func TestActiveReviewerSummaryUsesRawRunningStateBeforeVerdictDecoration(t *testing.T) {
+	summary := activeReviewerSummary(model.RunSummary{
+		Reviewers:         map[string]string{"claude": "running"},
+		ReviewerVerdicts:  map[string]string{"claude": "approve"},
+		ReviewerElapsedMS: map[string]int64{"claude": 42_000},
+	})
+	if !strings.Contains(summary, "claude=running(verdict=approve)(wall=42s)") {
+		t.Fatalf("verdict decoration hid running elapsed time: %q", summary)
+	}
+}
+
+func TestActiveReviewerSummaryShowsHolderAfterExpiredQueueETA(t *testing.T) {
 	deadline := time.Now().Add(-time.Second)
+	timeoutAt := time.Now().Add(2 * time.Minute)
 	summary := activeReviewerSummary(model.RunSummary{
 		Reviewers: map[string]string{"claude": "queued"},
-		Queues:    map[string]model.ProviderQueueStatus{"claude": {Position: 1, ETAAt: &deadline}},
+		Queues: map[string]model.ProviderQueueStatus{"claude": {
+			Position: 1, ETAAt: &deadline,
+			Holders: []model.ProviderCapacityHolder{{RunID: "run-active", Reviewer: "claude", TimeoutAt: &timeoutAt}},
+		}},
 	})
-	if !strings.Contains(summary, "estimate-exceeded") || strings.Contains(summary, "~0s") {
-		t.Fatalf("expired queue ETA summary = %q", summary)
+	for _, want := range []string{"holder=claude@run-active", "timeout_in="} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("capacity-holder summary %q does not contain %q", summary, want)
+		}
+	}
+	if strings.Contains(summary, "estimate-exceeded") {
+		t.Fatalf("expired historical estimate remained in summary: %q", summary)
 	}
 }
 
@@ -199,8 +313,8 @@ func TestExpandAutoProfilesDetectsCommonProjects(t *testing.T) {
 
 func TestSelectRetryReviewersDefaultsToIncompleteProviders(t *testing.T) {
 	results := []model.ReviewerResult{
-		{Reviewer: "codex", Status: "completed", Report: &model.ReviewReport{Verdict: "approve"}},
-		{Reviewer: "claude", Status: "completed", Report: &model.ReviewReport{Verdict: "approve"}},
+		{Reviewer: "codex", Status: "completed", Report: &model.ReviewReport{Verdict: "approve", ContextComplete: true}},
+		{Reviewer: "claude", Status: "completed", Report: &model.ReviewReport{Verdict: "approve", ContextComplete: true}},
 		{Reviewer: "claude-security", Status: "incomplete", FailureKind: "quota"},
 	}
 	selected, err := selectRetryReviewers(results, nil)
@@ -209,6 +323,72 @@ func TestSelectRetryReviewersDefaultsToIncompleteProviders(t *testing.T) {
 	}
 	if len(selected) != 1 || !selected["claude-security"] || selected["codex"] || selected["claude"] {
 		t.Fatalf("selected reviewers = %#v", selected)
+	}
+}
+
+func TestAllRetryReviewersIncludesConditionalRoles(t *testing.T) {
+	selected := allRetryReviewers()
+	for _, reviewer := range []string{"codex", "claude", "claude-security", "claude-escalation", "claude-cross-examination"} {
+		if !selected[reviewer] {
+			t.Fatalf("expected web-backed retry to select %q: %#v", reviewer, selected)
+		}
+	}
+	if len(selected) != 5 {
+		t.Fatalf("unexpected web-backed retry selection: %#v", selected)
+	}
+}
+
+func TestSelectRetryReviewersForWebRunRejectsTargetedRetry(t *testing.T) {
+	selected, wholeReview, err := selectRetryReviewersForRun(true, nil, []string{"codex"})
+	if err == nil || !strings.Contains(err.Error(), "omit --reviewer") {
+		t.Fatalf("targeted web retry error = %v", err)
+	}
+	if selected != nil || wholeReview {
+		t.Fatalf("rejected web retry returned selection %#v, whole=%t", selected, wholeReview)
+	}
+
+	selected, wholeReview, err = selectRetryReviewersForRun(true, nil, nil)
+	if err != nil || !wholeReview || len(selected) != 5 {
+		t.Fatalf("whole web retry = %#v, whole=%t, err=%v", selected, wholeReview, err)
+	}
+}
+
+func TestSelectRetryReviewersDefaultsToIncompleteOrAbstainingCompletedReports(t *testing.T) {
+	tests := []struct {
+		name   string
+		report *model.ReviewReport
+	}{
+		{
+			name: "context incomplete approval",
+			report: &model.ReviewReport{
+				Verdict: "approve", ContextComplete: false,
+			},
+		},
+		{
+			name: "reserved finalizer abstention",
+			report: &model.ReviewReport{
+				Verdict: "abstain", ContextComplete: false,
+			},
+		},
+		{
+			name: "context complete abstention",
+			report: &model.ReviewReport{
+				Verdict: "abstain", ContextComplete: true,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selected, err := selectRetryReviewers([]model.ReviewerResult{{
+				Reviewer: "claude", Status: "completed", Report: test.report,
+			}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(selected) != 1 || !selected["claude"] {
+				t.Fatalf("selected reviewers = %#v", selected)
+			}
+		})
 	}
 }
 
@@ -316,7 +496,7 @@ func TestDeltaApprovalIsNonFinalInCLIAndCannotVerify(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := record.WriteJSON(filepath.Join(run.Path, "manifest.json"), model.Manifest{
-		RunID: run.ID, Target: target, ReviewScope: "approved-baseline-delta", AutoFixLoopID: "loop-1", AutoFixIteration: 2,
+		RunID: run.ID, RepositoryIdentity: "github.com/example/project", Target: target, ReviewScope: "approved-baseline-delta", AutoFixLoopID: "loop-1", AutoFixIteration: 2,
 		Reviewers: []model.ReviewerResult{
 			{Reviewer: "codex", Status: "completed", Report: report},
 			{Reviewer: "claude", Status: "completed", Report: report},
@@ -333,7 +513,7 @@ func TestDeltaApprovalIsNonFinalInCLIAndCannotVerify(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, _, err := findApproval(store, run.ID, target.HeadSHA); err == nil {
+	if _, _, _, err := findApproval(store, run.ID, target.HeadSHA, "github.com/example/project"); err == nil {
 		t.Fatal("delta-only approval was accepted for verification")
 	}
 	summary, err := loadRunSummary(run)
@@ -416,6 +596,133 @@ func TestPreserveRetryReviewerSettingsDoesNotEscalateRoutineReview(t *testing.T)
 	}
 }
 
+func TestApplyRetryLimitOverridesRaisesSelectedRoleLimitsAndRecordsIntent(t *testing.T) {
+	cfg := config.Defaults()
+	escalationTurns := 35
+	cfg.Escalation.MaxTurns = &escalationTurns
+	limits := config.SnapshotReviewerExecutionLimits(cfg)
+	selected := map[string]bool{
+		"claude": true, "claude-security": true, "claude-cross-examination": true,
+	}
+
+	overrides, err := applyRetryLimitOverrides(&cfg, limits, selected, retryLimitOverrideInput{
+		ReviewerTimeout: 30 * time.Minute, ReviewerTimeoutSet: true,
+		OverallTimeout: 90 * time.Minute, OverallTimeoutSet: true,
+		MaxTurns: 60, MaxTurnsSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReviewerTimeout.Duration != 15*time.Minute || cfg.CrossExamination.Timeout.Duration != 10*time.Minute || cfg.OverallTimeout.Duration != 90*time.Minute {
+		t.Fatalf("role-specific retry mutated shared policy = reviewer %s cross %s overall %s", cfg.ReviewerTimeout.Duration, cfg.CrossExamination.Timeout.Duration, cfg.OverallTimeout.Duration)
+	}
+	for _, reviewer := range []string{"claude", "claude-security", "claude-cross-examination"} {
+		if limits[reviewer].Timeout.Duration != 30*time.Minute || limits[reviewer].MaxTurns != 60 {
+			t.Fatalf("selected %s limits = %#v", reviewer, limits[reviewer])
+		}
+	}
+	if limits["claude-escalation"].Timeout.Duration != 15*time.Minute || limits["claude-escalation"].MaxTurns != 35 {
+		t.Fatalf("selected retry leaked to dispute adjudication: %#v", limits["claude-escalation"])
+	}
+	if overrides == nil || overrides.ReviewerTimeout == nil || overrides.OverallTimeout == nil || overrides.MaxTurns == nil || !slices.Equal(overrides.Reviewers, []string{"claude", "claude-cross-examination", "claude-security"}) {
+		t.Fatalf("recorded retry overrides = %#v", overrides)
+	}
+}
+
+func TestApplyRetryLimitOverridesRejectsWeakeningAndIneffectiveTimeouts(t *testing.T) {
+	tests := []struct {
+		name     string
+		selected map[string]bool
+		input    retryLimitOverrideInput
+		want     string
+	}{
+		{name: "timeout must rise", selected: map[string]bool{"claude": true}, input: retryLimitOverrideInput{ReviewerTimeout: 10 * time.Minute, ReviewerTimeoutSet: true}, want: "must raise"},
+		{name: "overall must rise", selected: map[string]bool{"claude": true}, input: retryLimitOverrideInput{OverallTimeout: 30 * time.Minute, OverallTimeoutSet: true}, want: "must raise"},
+		{name: "reviewer timeout must fit overall", selected: map[string]bool{"claude": true}, input: retryLimitOverrideInput{ReviewerTimeout: time.Hour, ReviewerTimeoutSet: true}, want: "also raise --overall-timeout"},
+		{name: "turns require Claude", selected: map[string]bool{"codex": true}, input: retryLimitOverrideInput{MaxTurns: 60, MaxTurnsSet: true}, want: "Claude-backed"},
+		{name: "turns must rise", selected: map[string]bool{"claude": true}, input: retryLimitOverrideInput{MaxTurns: 40, MaxTurnsSet: true}, want: "must raise"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.Defaults()
+			limits := config.SnapshotReviewerExecutionLimits(cfg)
+			_, err := applyRetryLimitOverrides(&cfg, limits, test.selected, test.input)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("override error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestApplyRetryTimeoutOverrideDoesNotChangeUnselectedRoleLimit(t *testing.T) {
+	cfg := config.Defaults()
+	limits := config.SnapshotReviewerExecutionLimits(cfg)
+	_, err := applyRetryLimitOverrides(&cfg, limits, map[string]bool{"claude-cross-examination": true}, retryLimitOverrideInput{
+		ReviewerTimeout: 12 * time.Minute, ReviewerTimeoutSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits["claude-cross-examination"].Timeout.Duration != 12*time.Minute || limits["claude"].Timeout.Duration != 15*time.Minute || cfg.CrossExamination.Timeout.Duration != 10*time.Minute {
+		t.Fatalf("targeted timeout leaked to unselected role: limits=%#v config=%s", limits, cfg.CrossExamination.Timeout.Duration)
+	}
+}
+
+func TestRetryExecutionLimitsRemainRoleSpecificAcrossGenerations(t *testing.T) {
+	cfg := config.Defaults()
+	escalationTurns := 35
+	cfg.Escalation.MaxTurns = &escalationTurns
+	limits := config.SnapshotReviewerExecutionLimits(cfg)
+	_, err := applyRetryLimitOverrides(&cfg, limits, map[string]bool{"claude-security": true}, retryLimitOverrideInput{
+		ReviewerTimeout: 30 * time.Minute, ReviewerTimeoutSet: true,
+		OverallTimeout: 90 * time.Minute, OverallTimeoutSet: true,
+		MaxTurns: 60, MaxTurnsSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := config.SnapshotReviewPolicy(cfg)
+	child := model.Manifest{ReviewPolicy: &policy, ReviewerExecutionLimits: limits}
+
+	nextCfg, err := config.ApplyReviewPolicy(config.Defaults(), *child.ReviewPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextLimits := savedReviewerExecutionLimits(nextCfg, child)
+	if nextLimits["claude-security"].Timeout.Duration != 30*time.Minute || nextLimits["claude-security"].MaxTurns != 60 {
+		t.Fatalf("security limits were not inherited: %#v", nextLimits["claude-security"])
+	}
+	for _, reviewer := range []string{"claude", "claude-escalation"} {
+		if nextLimits[reviewer].Timeout.Duration != 15*time.Minute || nextLimits[reviewer].MaxTurns != map[string]int{"claude": 50, "claude-escalation": 35}[reviewer] {
+			t.Fatalf("security retry leaked into %s: %#v", reviewer, nextLimits[reviewer])
+		}
+	}
+	if nextLimits["claude-cross-examination"].Timeout.Duration != 10*time.Minute || nextLimits["claude-cross-examination"].MaxTurns != 20 {
+		t.Fatalf("security retry leaked into cross-examination: %#v", nextLimits["claude-cross-examination"])
+	}
+
+	_, err = applyRetryLimitOverrides(&nextCfg, nextLimits, map[string]bool{"claude-escalation": true}, retryLimitOverrideInput{
+		ReviewerTimeout: 35 * time.Minute, ReviewerTimeoutSet: true,
+		MaxTurns: 65, MaxTurnsSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grandchildPolicy := config.SnapshotReviewPolicy(nextCfg)
+	grandchild := model.Manifest{ReviewPolicy: &grandchildPolicy, ReviewerExecutionLimits: nextLimits}
+	thirdCfg, err := config.ApplyReviewPolicy(config.Defaults(), *grandchild.ReviewPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grandchildLimits := savedReviewerExecutionLimits(thirdCfg, grandchild)
+	if grandchildLimits["claude-security"].Timeout.Duration != 30*time.Minute || grandchildLimits["claude-security"].MaxTurns != 60 {
+		t.Fatalf("second-generation adjudication override changed security limits: %#v", grandchildLimits["claude-security"])
+	}
+	if grandchildLimits["claude-escalation"].Timeout.Duration != 35*time.Minute || grandchildLimits["claude-escalation"].MaxTurns != 65 {
+		t.Fatalf("second-generation adjudication limits = %#v", grandchildLimits["claude-escalation"])
+	}
+}
+
 func TestShowInActiveStatusIncludesQuotaQueuedAndPausedRuns(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -472,6 +779,35 @@ func TestLoadAutoFixSummariesKeepsPausedQuotaLoopVisible(t *testing.T) {
 	}
 }
 
+func TestLoadAutoFixSummariesMarksElapsedQuotaPauseRetryReady(t *testing.T) {
+	store := record.New(t.TempDir())
+	now := time.Now().UTC()
+	run, err := store.CreateAutoFixLoop(now.Add(-time.Hour), "abcdef123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pausedAt := now.Add(-30 * time.Minute)
+	retryAt := now.Add(-time.Minute)
+	loop := model.AutoFixLoop{
+		LoopID: run.ID, State: model.StatePaused, StartedAt: now.Add(-time.Hour), InitialHeadSHA: "abcdef123456",
+		PausedAt: &pausedAt, RetryAt: &retryAt, ResumePhase: "review", ResumeReviewers: []string{"claude-security"}, RecordPath: run.Path,
+	}
+	if err := record.WriteJSON(filepath.Join(run.Path, "manifest.json"), loop); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := loadAutoFixSummaries(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("auto-fix summaries = %#v", summaries)
+	}
+	summary := summaries[0]
+	if !summary.AwaitingResume || !summary.RetryReady || summary.Phase != "awaiting-resume" || summary.Reviewers["claude-security"] != "retry-ready" || len(summary.Queues) != 0 || summary.RetryAt == nil {
+		t.Fatalf("elapsed quota pause still looks capacity-queued: %#v", summary)
+	}
+}
+
 func TestManifestReviewerResultsIncludesTargetedSecurityReview(t *testing.T) {
 	results := manifestReviewerResults(model.Manifest{
 		Reviewers:         []model.ReviewerResult{{Reviewer: "codex"}, {Reviewer: "claude"}},
@@ -518,6 +854,7 @@ enabled = false
 	writeCLIFile(t, filepath.Join(root, "app.txt"), "base\nfeature\n")
 	writeCLIFile(t, filepath.Join(root, ".cora", "config.toml"), `
 minimum_approvals = 2
+allow_review_web = true
 [reviewers.claude]
 enabled = true
 [[checks]]
@@ -539,7 +876,7 @@ command = ["sh", "-c", "env"]
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Reviewers.Claude.Enabled || cfg.MinimumApprovals != 1 || len(cfg.Checks) != 0 {
+	if cfg.Reviewers.Claude.Enabled || cfg.MinimumApprovals != 1 || cfg.AllowReviewWeb || len(cfg.Checks) != 0 {
 		t.Fatalf("head config influenced effective config: %#v", cfg)
 	}
 }

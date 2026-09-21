@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,257 @@ func TestStoreLifecycleAndLock(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o700 || filepath.Base(filepath.Dir(loop.Path)) != "auto-fix" {
 		t.Fatalf("auto-fix record = %s, mode=%v", loop.Path, info.Mode().Perm())
+	}
+}
+
+func TestWebEvidenceRunsAreHiddenFromLegacyCollection(t *testing.T) {
+	store := New(t.TempDir())
+	standard, err := store.Create(time.Unix(1, 0), "aaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, err := store.CreateWebEvidence(time.Unix(2, 0), "bbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsWebEvidenceRun(web) || IsWebEvidenceRun(standard) || !strings.Contains(web.ID, "-web1-") {
+		t.Fatalf("record collections: standard=%#v web=%#v", standard, web)
+	}
+	legacy, err := store.records(standardRunsCollection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy) != 1 || legacy[0].ID != standard.ID {
+		t.Fatalf("legacy-visible runs = %#v", legacy)
+	}
+	runs, err := store.Runs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 2 || runs[0].ID != web.ID {
+		t.Fatalf("current runs = %#v", runs)
+	}
+	resolved, err := store.Resolve(web.ID)
+	if err != nil || resolved.Path != web.Path {
+		t.Fatalf("resolve web run = %#v, %v", resolved, err)
+	}
+}
+
+func TestUnresolvedFindingsDoesNotLaunderWebEvidenceIntoOfflineReview(t *testing.T) {
+	store := New(t.TempDir())
+	run, err := store.CreateWebEvidence(time.Unix(1, 0), "head")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := model.Target{BaseSHA: "base", HeadSHA: "head", DiffHash: "diff"}
+	if err := WriteJSON(filepath.Join(run.Path, "decision.json"), model.Decision{
+		SchemaVersion: model.SchemaVersion,
+		RunID:         run.ID,
+		BaseSHA:       target.BaseSHA,
+		HeadSHA:       target.HeadSHA,
+		DiffHash:      target.DiffHash,
+		State:         model.StateChangesRequested,
+		CarryForwardFindings: []model.ConsolidatedFinding{{
+			ID: "web-only", Severity: "major", Claim: "depends on external evidence",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := store.UnresolvedFindings(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("offline review inherited web-backed findings: %#v", findings)
+	}
+}
+
+func TestStoreAcquireReclaimsStaleLockWithoutReleasingReplacement(t *testing.T) {
+	store := New(t.TempDir())
+	stale, err := store.Acquire("stale-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(stale.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = []byte(strings.Replace(string(contents), fmt.Sprintf("pid=%d", os.Getpid()), "pid=0", 1))
+	if err := os.WriteFile(stale.path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(stale.path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement, err := store.Acquire("stale-target")
+	if err != nil {
+		t.Fatalf("reclaim stale lock: %v", err)
+	}
+	if err := stale.Release(); err == nil || !strings.Contains(err.Error(), "another process") {
+		t.Fatalf("stale owner release error = %v", err)
+	}
+	if _, err := os.Stat(replacement.path); err != nil {
+		t.Fatalf("stale owner removed replacement lock: %v", err)
+	}
+	if err := replacement.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Release(); err != nil {
+		t.Fatalf("idempotent release: %v", err)
+	}
+}
+
+func TestStoreAcquireStaleLockHasOneCrossProcessWinner(t *testing.T) {
+	root := t.TempDir()
+	store := New(root)
+	stale, err := store.Acquire("contended-stale-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(stale.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = []byte(strings.Replace(string(contents), fmt.Sprintf("pid=%d", os.Getpid()), "pid=0", 1))
+	if err := os.WriteFile(stale.path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(stale.path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	coordination := t.TempDir()
+	gatePath := filepath.Join(coordination, "gate")
+	releasePath := filepath.Join(coordination, "release")
+	commands := make([]*exec.Cmd, 0, 2)
+	for index := 0; index < 2; index++ {
+		id := strconv.Itoa(index)
+		command := exec.Command(os.Args[0], "-test.run=^TestStoreAcquireStaleLockHelperProcess$")
+		command.Env = append(os.Environ(),
+			"CORA_RECORD_LOCK_HELPER=1",
+			"CORA_RECORD_LOCK_ROOT="+root,
+			"CORA_RECORD_LOCK_COORDINATION="+coordination,
+			"CORA_RECORD_LOCK_HELPER_ID="+id,
+		)
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		commands = append(commands, command)
+	}
+	t.Cleanup(func() {
+		_ = os.WriteFile(releasePath, []byte("release\n"), 0o600)
+		for _, command := range commands {
+			if command.ProcessState == nil {
+				_ = command.Process.Kill()
+				_ = command.Wait()
+			}
+		}
+	})
+	for index := 0; index < 2; index++ {
+		waitForRecordTestFile(t, filepath.Join(coordination, "ready-"+strconv.Itoa(index)))
+	}
+	if err := os.WriteFile(gatePath, []byte("go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 2; index++ {
+		waitForRecordTestFile(t, filepath.Join(coordination, "result-"+strconv.Itoa(index)))
+	}
+	results := make([]string, 2)
+	for index := range results {
+		result, err := os.ReadFile(filepath.Join(coordination, "result-"+strconv.Itoa(index)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		results[index] = strings.TrimSpace(string(result))
+	}
+	acquired := 0
+	for _, result := range results {
+		if result == "acquired" {
+			acquired++
+		}
+	}
+	if acquired != 1 || !(results[0] == "rejected" || results[1] == "rejected") {
+		t.Fatalf("cross-process stale-lock results = %v, want one acquired and one rejected", results)
+	}
+	if err := os.WriteFile(releasePath, []byte("release\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range commands {
+		if err := command.Wait(); err != nil {
+			t.Fatalf("lock helper failed: %v", err)
+		}
+	}
+}
+
+func TestStoreAcquireStaleLockHelperProcess(t *testing.T) {
+	if os.Getenv("CORA_RECORD_LOCK_HELPER") != "1" {
+		return
+	}
+	coordination := os.Getenv("CORA_RECORD_LOCK_COORDINATION")
+	id := os.Getenv("CORA_RECORD_LOCK_HELPER_ID")
+	if err := os.WriteFile(filepath.Join(coordination, "ready-"+id), []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForRecordTestSignal(filepath.Join(coordination, "gate")); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := New(os.Getenv("CORA_RECORD_LOCK_ROOT")).Acquire("contended-stale-target")
+	result := "rejected\n"
+	if err == nil {
+		result = "acquired\n"
+	} else if !strings.Contains(err.Error(), "already running") {
+		result = "error: " + err.Error() + "\n"
+	}
+	if writeErr := os.WriteFile(filepath.Join(coordination, "result-"+id), []byte(result), 0o600); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if err != nil {
+		return
+	}
+	if err := waitForRecordTestSignal(filepath.Join(coordination, "release")); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForRecordTestFile(t *testing.T, path string) {
+	t.Helper()
+	if err := waitForRecordTestSignal(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForRecordTestSignal(path string) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting for %s", path)
+}
+
+func TestStoreAcquireDoesNotStealOldLockFromLiveOwner(t *testing.T) {
+	store := New(t.TempDir())
+	lock, err := store.Acquire("live-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(lock.path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Acquire("live-owner"); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("old live-owner lock was reclaimed: %v", err)
 	}
 }
 
@@ -149,6 +401,69 @@ func TestExactDiffReviewerLineagePreservesNewestCompletedResults(t *testing.T) {
 	}
 }
 
+func TestExactDiffReviewerLineageDoesNotReuseIncompleteCompletedReport(t *testing.T) {
+	store := New(t.TempDir())
+	target := model.Target{BaseSHA: "base", HeadSHA: "head", DiffHash: "diff"}
+	parent, err := store.Create(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), target.HeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteJSON(filepath.Join(parent.Path, "manifest.json"), model.Manifest{
+		RunID: parent.ID, Target: target, RepositoryIdentity: "repo-id",
+		Reviewers: []model.ReviewerResult{{
+			Reviewer: "claude", Status: "completed", Attempt: 1,
+			Report: &model.ReviewReport{Verdict: "approve", ContextComplete: true},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	child, err := store.Create(time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC), target.HeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteJSON(filepath.Join(child.Path, "manifest.json"), model.Manifest{
+		RunID: child.ID, ParentRunID: parent.ID, Target: target, RepositoryIdentity: "repo-id",
+		Reviewers: []model.ReviewerResult{{
+			Reviewer: "claude", Status: "completed", Attempt: 2,
+			Report: &model.ReviewReport{Verdict: "abstain", ContextComplete: false},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	lineage, err := store.ExactDiffReviewerLineage(child, target, "repo-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lineage.Reviewers) != 1 || lineage.Reviewers[0].Attempt != 1 || lineage.Reviewers[0].Report == nil || lineage.Reviewers[0].Report.Verdict != "approve" || lineage.Reviewers[0].ReusedFromRunID != parent.ID {
+		t.Fatalf("reusable lineage = %#v", lineage.Reviewers)
+	}
+	if len(lineage.LatestReviewers) != 1 || lineage.LatestReviewers[0].Attempt != 2 || lineage.LatestReviewers[0].Report == nil || lineage.LatestReviewers[0].Report.Verdict != "abstain" || lineage.LatestReviewers[0].ReusedFromRunID != child.ID {
+		t.Fatalf("latest lineage = %#v", lineage.LatestReviewers)
+	}
+}
+
+func TestReusableCompletedReviewerEvidenceRequiresConclusiveReport(t *testing.T) {
+	tests := []struct {
+		name   string
+		result model.ReviewerResult
+		want   bool
+	}{
+		{name: "complete approval", result: model.ReviewerResult{Status: "completed", Report: &model.ReviewReport{Verdict: "approve", ContextComplete: true}}, want: true},
+		{name: "complete request changes", result: model.ReviewerResult{Status: "completed", Report: &model.ReviewReport{Verdict: "request_changes", ContextComplete: true}}, want: true},
+		{name: "incomplete context", result: model.ReviewerResult{Status: "completed", Report: &model.ReviewReport{Verdict: "approve", ContextComplete: false}}},
+		{name: "abstention", result: model.ReviewerResult{Status: "completed", Report: &model.ReviewReport{Verdict: "abstain", ContextComplete: true}}},
+		{name: "partial provider status", result: model.ReviewerResult{Status: "partial", Report: &model.ReviewReport{Verdict: "request_changes", ContextComplete: true}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := reusableCompletedReviewerEvidence(test.result); got != test.want {
+				t.Fatalf("reusable evidence = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestExactDiffReviewerLineageRejectsMismatchedAncestor(t *testing.T) {
 	store := New(t.TempDir())
 	target := model.Target{BaseSHA: "base", HeadSHA: "head", DiffHash: "diff"}
@@ -178,6 +493,9 @@ func TestProviderLeaseQueueIsFIFOAndReportsETA(t *testing.T) {
 	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
 	first, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "first"}, nil)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.MarkExecutionStarted(time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(10 * time.Millisecond)
@@ -228,8 +546,11 @@ func TestProviderLeaseQueueIsFIFOAndReportsETA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	active, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "active"}, nil)
+	active, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{RunID: "holder-run", Reviewer: "active"}, nil)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := active.MarkExecutionStarted(5 * time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -245,8 +566,216 @@ func TestProviderLeaseQueueIsFIFOAndReportsETA(t *testing.T) {
 	status := <-statusChannel
 	cancel()
 	_ = active.Release()
-	if status.Position != 1 || status.Active != 1 || status.ETAAt == nil {
+	if status.Position != 1 || status.Active != 1 || status.ETAAt == nil || len(status.Holders) != 1 {
 		t.Fatalf("queue status = %#v", status)
+	}
+	holder := status.Holders[0]
+	if holder.RunID != "holder-run" || holder.Reviewer != "active" || holder.PID != os.Getpid() || holder.StartedAt.IsZero() || holder.TimeoutAt == nil || !holder.TimeoutAt.After(holder.StartedAt) {
+		t.Fatalf("capacity holder = %#v", holder)
+	}
+}
+
+func TestProviderCapacityCountsSlotsOutsideCurrentLimit(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	first, err := AcquireProviderQueued(context.Background(), provider, 2, ProviderQueueRequest{Reviewer: "first"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := AcquireProviderQueued(context.Background(), provider, 2, ProviderQueueRequest{Reviewer: "second"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(second.path) != "slot-1.lock" {
+		t.Fatalf("second lease path = %s, want slot-1.lock", second.path)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	if _, err := AcquireProviderQueued(ctx, provider, 1, ProviderQueueRequest{Reviewer: "lower-limit"}, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lower-limit acquire = %v, want deadline while slot-1 is active", err)
+	}
+	if _, err := os.Stat(second.path); err != nil {
+		t.Fatalf("higher slot was removed or ignored: %v", err)
+	}
+	if err := second.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProviderLeaseOwnershipProtectsReplacement(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	stale, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "stale"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(stale.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = []byte(strings.Replace(string(contents), fmt.Sprintf("pid=%d", os.Getpid()), "pid=0", 1))
+	if err := os.WriteFile(stale.path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(stale.path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement, acquired, err := tryProviderSlot(stale.path, provider, ProviderQueueRequest{Reviewer: "replacement"})
+	if err != nil || !acquired {
+		t.Fatalf("replace stale provider lease: acquired=%t err=%v", acquired, err)
+	}
+	if err := stale.Release(); err == nil || !strings.Contains(err.Error(), "another process") {
+		t.Fatalf("stale provider release error = %v", err)
+	}
+	if err := stale.MarkExecutionStarted(time.Minute); err == nil || !strings.Contains(err.Error(), "another process") {
+		t.Fatalf("stale provider update error = %v", err)
+	}
+	current, err := os.ReadFile(replacement.path)
+	if err != nil {
+		t.Fatalf("stale owner removed replacement: %v", err)
+	}
+	if lockValue(string(current), "token") != replacement.token {
+		t.Fatalf("replacement token changed: %q", lockValue(string(current), "token"))
+	}
+	if err := replacement.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Release(); err != nil {
+		t.Fatalf("idempotent provider release: %v", err)
+	}
+}
+
+func TestProviderLeaseReclaimsDeadOwnerImmediately(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	dead, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "dead"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(dead.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = []byte(strings.Replace(string(contents), fmt.Sprintf("pid=%d", os.Getpid()), "pid=1073741823", 1))
+	if err := os.WriteFile(dead.path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement, acquired, err := tryProviderSlot(dead.path, provider, ProviderQueueRequest{Reviewer: "replacement"})
+	if err != nil || !acquired {
+		t.Fatalf("replace dead provider lease immediately: acquired=%t err=%v", acquired, err)
+	}
+	if err := replacement.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProviderLeaseDoesNotReclaimOldLiveOwner(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	lease, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{Reviewer: "live"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(lease.path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	queueDir := filepath.Join(root, safeComponent(provider))
+	holders, err := activeProviderSlots(queueDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holders) != 1 || holders[0].Reviewer != "live" {
+		t.Fatalf("old live provider lease was reclaimed: %#v", holders)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProviderExecutionDeadlineStartsWhenMarked(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	lease, err := AcquireProviderQueued(context.Background(), provider, 1, ProviderQueueRequest{RunID: "run", Reviewer: "reviewer"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(lease.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lockValue(string(before), "execution_started") != "" || lockValue(string(before), "timeout_at") != "" {
+		t.Fatalf("acquisition published a false execution deadline:\n%s", before)
+	}
+	beforeHolder := providerCapacityHolder(string(before))
+	if !beforeHolder.StartedAt.IsZero() || beforeHolder.TimeoutAt != nil {
+		t.Fatalf("preflight holder has execution timing: %#v", beforeHolder)
+	}
+
+	markedAt := time.Now().UTC()
+	if err := lease.MarkExecutionStarted(5 * time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(lease.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := providerCapacityHolder(string(after))
+	if holder.StartedAt.Before(markedAt) || holder.TimeoutAt == nil || holder.TimeoutAt.Sub(holder.StartedAt) != 5*time.Minute {
+		t.Fatalf("marked execution holder = %#v", holder)
+	}
+	firstStarted := holder.StartedAt
+	firstTimeout := *holder.TimeoutAt
+	if err := lease.MarkExecutionStarted(time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	afterRepeat, err := os.ReadFile(lease.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated := providerCapacityHolder(string(afterRepeat))
+	if !repeated.StartedAt.Equal(firstStarted) || repeated.TimeoutAt == nil || !repeated.TimeoutAt.Equal(firstTimeout) {
+		t.Fatalf("repeated mark extended execution window: before=%#v after=%#v", holder, repeated)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProviderQueueTicketDoesNotAgeReclaimLiveOwner(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CORA_PROVIDER_QUEUE_DIR", root)
+	provider := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	queueDir, err := providerQueueDirectory(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(queueDir, "ticket-00000000000000000001-live-000001.json")
+	if err := WriteJSON(path, providerTicket{PID: os.Getpid(), EnqueuedAt: time.Now().UTC(), Reviewer: "live"}); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	tickets, err := liveProviderTickets(queueDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tickets) != 1 || tickets[0] != filepath.Base(path) {
+		t.Fatalf("old live queue ticket was reclaimed: %v", tickets)
 	}
 }
 
@@ -602,6 +1131,33 @@ func TestLoadApprovedBaselineRejectsNonUnanimousOrUnverifiableRecords(t *testing
 	}
 	if _, err := LoadApprovedBaseline(run); !errors.Is(err, ErrNotApprovedBaseline) {
 		t.Fatalf("non-unanimous baseline error = %v", err)
+	}
+}
+
+func TestLoadApprovedBaselineRejectsMissingWebEvidenceArtifacts(t *testing.T) {
+	store := New(t.TempDir())
+	patch := []byte("diff --git a/app.go b/app.go\n")
+	sum := sha256.Sum256(patch)
+	target := model.Target{BaseSHA: "base", HeadSHA: "head", DiffHash: fmt.Sprintf("%x", sum[:])}
+	run := writeApprovedBaseline(t, store, time.Unix(1, 0), target, patch, "")
+	manifest, err := LoadManifest(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("a", sha256.Size*2)
+	manifest.WebEvidence = &model.WebEvidenceSnapshot{
+		Mode: "captured", IndexFile: "web-evidence/index.json", IndexSHA256: digest,
+		PromptFile: "web-evidence/prompt.md", PromptSHA256: digest, Count: 1,
+		Sources: []model.WebEvidenceSource{{ID: "web-001"}},
+	}
+	for index := range manifest.Reviewers {
+		manifest.Reviewers[index].WebEvidenceHash = digest
+	}
+	if err := WriteJSON(filepath.Join(run.Path, "manifest.json"), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadApprovedBaseline(run); !errors.Is(err, ErrNotApprovedBaseline) {
+		t.Fatalf("missing web evidence baseline error = %v", err)
 	}
 }
 
