@@ -15,6 +15,7 @@ surface is:
 
 ```text
 cora review    review a branch, range, commit, or working tree
+cora plan      preview the effective target, policy, reviewers, and checks
 cora retry     retry selected reviewers while reusing completed results
 cora status    show the latest local run
 cora list      list and filter saved runs
@@ -50,6 +51,10 @@ make install INSTALL_DIR=/path/already/on/PATH
 # Review the current branch against the configured or detected base
 cora review --base upstream/main
 
+# Preview the same trusted-base policy without creating a run or invoking a
+# provider. Add --json for automation.
+cora plan --base upstream/main --strict --profile auto --allow-unsafe-checks
+
 # Review one commit
 cora review --commit abc123
 
@@ -82,9 +87,23 @@ cora review --auto-fix --resume <loop-id>
 # requires an explicit trust decision.
 cora review --base upstream/main --profile auto --allow-unsafe-checks
 
+# Import an independently produced passing test attestation for this exact
+# repository/base/head/diff. CORA records it but does not run its command.
+cora review --base upstream/main --validation-evidence /path/to/ci-evidence.json
+
+# Capture bounded official documentation or advisory pages once, then give the
+# same immutable snapshot to every offline reviewer.
+cora review --base upstream/main --allow-review-web \
+  --web-evidence https://pkg.go.dev/net/http \
+  --web-evidence https://go.dev/security/vuln/
+
 # Retain the completed Codex result and queue only Claude until a recorded
 # quota reset time.
 cora retry latest --reviewer claude
+
+# Raise only the limits that ended the prior attempt. The child run records
+# these overrides while preserving the parent's model, effort, and evidence.
+cora retry latest --reviewer claude --reviewer-timeout 30m --overall-timeout 1h --max-turns 65
 
 cora status --active
 cora list --state incomplete
@@ -92,6 +111,21 @@ cora show latest --verbose
 cora show latest --json
 cora verify --head HEAD
 ```
+
+`cora plan` accepts the review targeting and policy flags (`--base`,
+`--commit`, `--range`, `--uncommitted`, `--parent`, `--profile`, `--strict`,
+`--security-sensitive`, `--adjudicate`, and the billing/check/web authorization
+flags). It also accepts repeatable `--validation-evidence` files and
+`--web-evidence` HTTPS URLs. Planning validates these inputs without importing
+or fetching them. It
+resolves repository configuration from the trusted base revision,
+then reports the exact target and diff hash, effective ordinary and conditional
+reviewer model/effort/limits, security triggers and matched paths, expanded
+validation checks, and provider concurrency demand. Planning is read-only: it
+does not create a run, acquire a provider slot, execute a check, or invoke a
+reviewer. Capacity output therefore distinguishes configured global limits and
+planned demand from live availability, which remains unknown until review-time
+slot acquisition.
 
 Each reviewer and local-check phase receives an independent local clone at the
 exact target. Cora removes every remote before execution and discards the clone
@@ -133,14 +167,16 @@ effective review policy, Cora keeps that approval as an immutable baseline and
 reviews the cumulative coding-agent delta instead of paying to rediscover the
 unchanged code. Baseline compatibility includes strictness, reviewer quorum and
 settings, required security review, and the exact validation checks. A weaker
-or differently configured approval is never reused. Every review uses an exact
-snapshot, and after the delta is approved Cora always performs a fresh full
-review of the complete working tree against the original merge base. That final
-review includes the branch's committed changes, agent edits, and untracked
-files. Checks run in disposable materialized clones. Approval requires the
-ordinary Cora policy, all configured reviewers to return `approve`, every
-required check to pass, and no open finding at or above the selected threshold.
-An adjudicated disagreement is therefore insufficient for auto-fix approval.
+or differently configured approval is never reused. Web-backed approvals are
+also ineligible because auto-fix does not replay web evidence into its review
+lineage. Every review uses an exact snapshot, and after the delta is approved
+Cora always performs a fresh full review of the complete working tree against
+the original merge base. That final review includes the branch's committed
+changes, agent edits, and untracked files. Checks run in disposable materialized
+clones. Approval requires the ordinary Cora policy, all configured reviewers to
+return `approve`, every required check to pass, and no open finding at or above
+the selected threshold. An adjudicated disagreement is therefore insufficient
+for auto-fix approval.
 
 The loop stops fail-closed on incomplete reviews, abstentions, failed checks,
 agent failures, repeated equivalent findings, unchanged patches, Git-state
@@ -180,6 +216,7 @@ Exit codes are part of the CLI contract:
 | 5 | Approval is stale |
 | 6 | Auto-fix paused for a retryable quota reset |
 | 10 | Configuration, Git, or tool failure |
+| 130 | Canceled by an interrupt or termination signal |
 
 ## Configuration
 
@@ -203,6 +240,7 @@ strict = false
 cross_examine_blocking_findings = true
 require_clean_tree = true
 allow_api_billing = false
+allow_review_web = false
 allow_unsafe_host_checks = false
 minimum_approvals = 2
 blocking_severities = ["blocker", "major"]
@@ -220,6 +258,8 @@ command = "claude"
 model = "opus"
 effort = "high"
 max_turns = 50
+# Cora hard-caps tool-enabled inspection at max_turns-finalization_turns,
+# then uses the reserve in a separate tools-disabled finalizer if necessary.
 finalization_turns = 2
 # Optional hard ceiling passed to Claude Code; 0 disables it.
 max_budget_usd = 0
@@ -275,6 +315,44 @@ env_allowlist = []
 By default, CORA refuses API-key authentication. Pass `--allow-api-billing`
 only when separately billed usage is intentional.
 
+Reviewer web evidence is also default-off. Pass `--allow-review-web` (or set
+`allow_review_web = true` in trusted configuration) together with one or more
+repeatable `--web-evidence URL` values. Each URL is an exact operator-selected
+source; Cora does not discover or follow URLs from the reviewed repository.
+Only absolute HTTPS URLs on public DNS addresses and the default HTTPS port are
+accepted. Credentials, query strings, and fragments are rejected, redirects
+must remain on the same explicitly selected origin, environment proxies are
+ignored, and local, private, link-local, metadata, documentation, and other
+non-public IP ranges are blocked at dial time. Cora sends an unauthenticated GET
+with no cookie jar.
+
+Cora captures at most four sources, retaining at most 32 KiB of UTF-8 textual
+content per source and 64 KiB across the review. Larger individual responses are
+visibly marked as truncated; capture fails if the aggregate presentation would
+exceed its bound. Cora saves the exact bounded bodies, a strict metadata index,
+and the exact prompt appendix beneath `web-evidence/` in the private run record.
+`manifest.json` records the individual SHA-256 hashes and a composite
+`snapshot_sha256` that binds the index and rendered appendix. The appendix is
+JSON-escaped and labels every page as untrusted corroborating material. All
+ordinary, security, adjudication, and cross-examination reviewers receive the
+same bytes.
+
+A retry validates and copies that exact snapshot into its child record without
+refetching. It reruns the whole review, including any conditional role newly
+triggered by changed ordinary reports, so `--reviewer` is rejected for these
+retries. Changing or refreshing the evidence requires a fresh review. Web
+evidence never counts as a passing validation check, cannot be combined with
+`--auto-fix`, and a web-backed approval cannot seed an auto-fix baseline.
+
+This option does not enable provider-native WebFetch, WebSearch, MCP, or shell
+networking. Codex, Claude/Fable, reviewer-selected tests, and Bash remain under
+their existing network-denied sandboxes. Web-backed records use a versioned run
+collection that older Cora binaries do not enumerate. They also carry an
+existing delta-scope compatibility sentinel that delta-aware older readers
+already reject for retry, verification, and approval-baseline reuse. Upgrade
+Cora to inspect or retry these records; current readers validate the guard and
+present their effective review scope as `full`.
+
 Configured checks execute code from the reviewed tree. Until sandboxed check
 execution is available, CORA refuses to run them unless
 `--allow-unsafe-checks` is passed or `allow_unsafe_host_checks = true` is set.
@@ -293,11 +371,44 @@ selection is also available. Trusted base configuration can define additional
 `--allow-unsafe-checks` requirement.
 
 When trusted host checks are enabled but no profile was selected, CORA performs
-the same auto-detection automatically. Without a configured validation check,
-CORA records `validation_status = "not_run"` plus a residual risk instead of
-implying that reviewer-selected tests provide deterministic validation. Strict
-policy fails closed as `incomplete` when no validation profile or configured
-check is available.
+the same auto-detection automatically. Without a configured validation check or
+imported passing attestation, CORA records `validation_status = "not_run"` plus
+a residual risk instead of implying that reviewer-selected tests provide
+deterministic validation. Strict policy fails closed as `incomplete` when no
+validation profile, configured check, or imported passing evidence is
+available.
+
+An external CI or test operator can instead provide a passing attestation with
+the repeatable `--validation-evidence PATH` flag. Use `cora plan --json` to get
+`repository_identity` and the exact `target.base_sha`, `target.head_sha`, and
+`target.diff_hash`, then produce a JSON file like this:
+
+```json
+{
+  "schema_version": "1",
+  "name": "ci-unit",
+  "repository_identity": "github.com/example/project",
+  "base_sha": "0123456789abcdef0123456789abcdef01234567",
+  "head_sha": "89abcdef0123456789abcdef0123456789abcdef",
+  "diff_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "status": "passed",
+  "verified_at": "2026-09-03T14:30:00Z",
+  "verifier": "github-actions",
+  "source": "https://github.com/example/project/actions/runs/123",
+  "command": ["go", "test", "./..."],
+  "summary": "All unit tests passed."
+}
+```
+
+CORA requires `status = "passed"`, rejects unknown or duplicate fields and any
+repository/base/head/diff mismatch, and treats the imported result as a normal
+validation check. It copies the exact source bytes into the private run record
+with a SHA-256 hash and repeats that validation before retry, verification, or
+approval-lineage reuse. The `verifier` and `source` fields are
+operator-supplied labels, not cryptographic authentication; importing the file
+is an explicit trust decision. CORA records `command` for audit purposes and
+never executes it. Because the attestation is bound to one exact diff,
+`--validation-evidence` cannot be combined with `--auto-fix`.
 
 `minimum_approvals = 2` makes the default policy true two-agent consensus. All
 enabled reviewers must complete with full context; a corroborated blocking
@@ -306,8 +417,9 @@ decision to a human.
 Set `strict = true` or pass `--strict` to add `minor` to the blocking severities
 and require at least one validation check. Notes remain non-blocking.
 
-Claude defaults to Opus at high effort. It reserves its final two turns for a
-structured response. Both reviewers receive a low-overhead recovery contract:
+Claude defaults to Opus at high effort. Cora mechanically reserves its final
+turns for the tools-disabled finalization phase described below. Both reviewers
+receive a low-overhead recovery contract:
 after confirming a finding, they checkpoint only when the confirmed evidence
 changes. If a reviewer times out, or Claude reaches its turn ceiling, CORA
 retains any valid provider output or checkpoint as a partial abstaining report
@@ -369,7 +481,9 @@ Every initial blocker or major must also include demonstrated reachability: an
 external trigger, an ordered code/data/control path through relevant guards and
 transformations, the observable impact, and required preconditions. A serious
 claim without that evidence is an incomplete reviewer result, not a blocking
-finding.
+finding. Non-blocking findings may use `reachability.status = "not_applicable"`
+when trigger-to-impact analysis genuinely does not apply; the schema and runtime
+validator accept the same status set.
 
 `effort` accepts `low`, `medium`, `high`, `xhigh`, or `max`; Codex also accepts
 `none` and `minimal`. Codex defaults to `gpt-5.6-sol` at high effort so its effective
@@ -391,7 +505,9 @@ is not otherwise available on `PATH`.
 The Claude adapter requires first-party Claude.ai subscription authentication
 and runs with safe mode plus Claude's strict Bash sandbox: network access and
 unsandboxed command fallback are denied, source-editing tools are unavailable,
-and sandbox startup failure is terminal. Both reviewers may run focused local
+and sandbox startup failure is terminal. When explicitly requested, only the
+parent Cora process performs the bounded web-evidence capture described above;
+reviewer processes still cannot access the network. Both reviewers may run focused local
 tests; each gets a private temporary/cache directory for tools such as Go and
 Vitest. Common API-key environment variables are removed unless
 `--allow-api-billing` is explicitly passed.
@@ -420,12 +536,36 @@ its exact candidate set is unchanged, avoiding another expensive targeted pass.
 It also recovers reset timestamps from older saved Claude errors that predate
 the structured retry field, including hour-only messages such as `resets 4am`.
 `--no-wait` returns immediately when a saved reset time is still in the future.
+`--reviewer-timeout`, `--overall-timeout`, and `--max-turns` may only increase
+the saved limits. They are applied after restoring the parent policy, mapped to
+the selected ordinary or targeted reviewer roles, and recorded explicitly in
+the child manifest along with the complete resulting effective policy. Cora
+also persists each role's effective timeout and turn ceiling, so a targeted
+security retry cannot broaden an ordinary review or later adjudication retry.
+
+A web-backed retry is deliberately whole-review rather than selective. Cora
+first validates and copies the frozen snapshot without refetching it, then
+reuses no ordinary or conditional reviewer result. Every ordinary reviewer runs
+again against those same bytes, as does any security, adjudication, or
+cross-examination role required by the retry's outcome. Explicit `--reviewer`
+selection is rejected for a web-backed run.
+
+Claude's `finalization_turns` are enforced rather than advisory. Cora caps the
+tool-enabled inspection process at `max_turns - finalization_turns`; if that
+boundary is reached, a second process receives the reserved turns with tools
+disabled and only the best persisted inspection evidence. The finalizer may
+serialize that evidence into the required schema, but it cannot change the
+verdict, context status, findings, reviewed paths, omitted paths, or residual
+risks. When `max_budget_usd` is set, it receives only the known remaining
+whole-review budget and is skipped fail-closed if that budget cannot be
+established.
 
 After every reviewer and at the end of a run, CORA prints the effective model,
-effort, provider-reported turns, thinking tokens, and API-equivalent cost. An
-incomplete reviewer line also includes the provider's normalized failure
-immediately. The normalized values are saved per reviewer and checkpointed in
-`manifest.json` as each reviewer finishes, then aggregated in `decision.json`.
+effort, provider-reported turns, thinking tokens, API-equivalent cost, and that
+reviewer's verdict as soon as it completes. An incomplete reviewer line also
+includes the provider's normalized failure immediately. The normalized values
+are saved per reviewer and checkpointed in `manifest.json` and `heartbeat.json`
+as each reviewer finishes, then aggregated in `decision.json`.
 Retry records distinguish incremental usage for that attempt from cumulative
 usage across their parent lineage; the compatibility `usage` field is
 cumulative. Claude cost comes from the CLI result envelope; Codex cost is
@@ -456,16 +596,22 @@ Run records are stored beneath the repository's Git common directory:
 
 ```text
 .git/cora/runs/<run-id>/
+.git/cora/web-evidence-runs-v1/<run-id>/
 .git/cora/auto-fix/<loop-id>/
 ```
 
 This keeps local records shared by Git worktrees without adding review output
-to the source tree. Each record includes the canonical patch, exact prompt and
-schema, raw tool logs, normalized reviewer reports, check logs, manifest, event
-stream, and deterministic decision. Each auto-fix parent manifest links its
-child review runs and stores every coding-agent prompt, pre/post patch, raw log,
-usage record, limit, and stop reason. Publishing signed records to a dedicated
-Git ref is planned as a separate command.
+to the source tree. The versioned web collection keeps evidence-dependent
+records invisible to readers that predate the binding rules. Its manifests use
+`approved-baseline-delta` as a raw, old-reader-visible compatibility sentinel;
+current Cora validates the guarded record and reports its effective scope as
+`full`. Each record includes the canonical patch, exact prompt and schema, raw
+tool logs, normalized reviewer reports, check logs, any captured web-evidence
+bodies/index/prompt, manifest, event stream, and deterministic decision. Each
+auto-fix parent manifest links its child review runs and stores every
+coding-agent prompt, pre/post patch, raw log, usage record, limit, and stop
+reason. Publishing signed records to a dedicated Git ref is planned as a
+separate command.
 
 Each active review run and auto-fix parent updates `heartbeat.json` every 30
 seconds. Auto-fix heartbeats include the current iteration, phase, elapsed time,
@@ -476,10 +622,14 @@ provider queues, and discounts long sampling gaps caused by machine sleep;
 records label this basis explicitly. Running-reviewer durations remain labeled
 as wall time. `cora status --active`
 shows concurrent runs in one table with reviewer elapsed time and fixed-deadline
-queue ETA countdowns. A passed estimate is displayed as `estimate-exceeded`
-instead of an inaccurate zero. `cora list` supports
-state and head-SHA filters. `latest` is resolved by run start time instead of
-completion order, so concurrent reviews cannot overwrite its meaning.
+queue ETA countdowns. Once a historical estimate elapses, Cora shows the active
+capacity holder and its remaining execution timeout instead of a zero or a
+sliding replacement estimate. SIGINT and SIGTERM cancel the complete reviewer
+process group, remove disposable workspaces, and release owned run and provider
+locks; abandoned run locks are reclaimed after their owner exits. `cora list`
+supports state and head-SHA filters. `latest` is resolved by run start time
+instead of completion order, so concurrent reviews cannot overwrite its
+meaning.
 
 Builds embed the Cora source SHA and UTC build time. Manifests record those
 values plus a credential-free repository identity such as

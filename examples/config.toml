@@ -9,6 +9,9 @@ strict = false
 cross_examine_blocking_findings = true
 require_clean_tree = true
 allow_api_billing = false
+# Permit only Cora's explicit, bounded `--web-evidence` capture. Reviewer tools,
+# tests, and shell commands remain offline even when this is true.
+allow_review_web = false
 # Host checks can read the local filesystem and use the network. Leave this
 # false unless every reviewed change is trusted and the risk is understood.
 allow_unsafe_host_checks = false
@@ -28,6 +31,8 @@ command = "claude"
 model = "opus"
 effort = "high"
 max_turns = 50
+# Tool-enabled inspection is capped at max_turns-finalization_turns; the
+# reserve is available only to a separate tools-disabled finalizer.
 finalization_turns = 2
 # Optional hard ceiling passed to Claude Code; 0 disables it.
 max_budget_usd = 0
