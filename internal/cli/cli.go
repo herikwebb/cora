@@ -1590,24 +1590,19 @@ func newShowCommand(opts *options) *cobra.Command {
 				if reviewer.Report != nil {
 					fmt.Printf("\n%s: %s (model=%s effort=%s)\n%s\n", strings.ToUpper(reviewer.Reviewer), reviewer.Report.Verdict, modelName, effort, reviewer.Report.Summary)
 					if verbose {
-						for _, finding := range reviewer.Report.Findings {
-							fmt.Printf("  [%s] %s:%d %s\n", finding.Severity, finding.File, finding.Line, finding.Claim)
-							fmt.Printf("    Confidence: %.0f%%\n", finding.Confidence*100)
-							fmt.Printf("    Evidence: %s\n", finding.Evidence)
-							fmt.Printf("    Suggested fix: %s\n", finding.SuggestedFix)
-						}
+						printReviewerFindings(command.OutOrStdout(), reviewer.Report.Findings)
 						if len(reviewer.Report.OmittedPaths) > 0 {
 							fmt.Printf("Omitted paths: %s\n", strings.Join(reviewer.Report.OmittedPaths, ", "))
 						}
 						if len(reviewer.Report.ResidualRisks) > 0 {
-							fmt.Println("Residual risks:")
+							fmt.Println("Remaining risks:")
 							for _, risk := range reviewer.Report.ResidualRisks {
 								fmt.Printf("  - %s\n", risk)
 							}
 						}
 					}
 				} else {
-					fmt.Printf("\n%s: incomplete (model=%s effort=%s) — %s\n", strings.ToUpper(reviewer.Reviewer), modelName, effort, reviewer.Error)
+					fmt.Printf("\n%s: incomplete (model=%s effort=%s): %s\n", strings.ToUpper(reviewer.Reviewer), modelName, effort, reviewer.Error)
 				}
 				if reviewer.EscalationCause != "" {
 					fmt.Printf("Escalation: %s\n", reviewer.EscalationCause)
@@ -1620,7 +1615,7 @@ func newShowCommand(opts *options) *cobra.Command {
 				for _, check := range manifest.Checks {
 					fmt.Printf("  %s: %s", check.Name, check.Status)
 					if check.Error != "" {
-						fmt.Printf(" — %s", check.Error)
+						fmt.Printf(": %s", check.Error)
 					}
 					fmt.Println()
 					if evidence := check.ImportedEvidence; evidence != nil {
@@ -1669,15 +1664,39 @@ func manifestReviewerResults(manifest model.Manifest) []model.ReviewerResult {
 	return results
 }
 
+// findingSeverityLabel affects human output only. Saved reports and blocking
+// rules keep their original severity values.
+func findingSeverityLabel(severity string) string {
+	switch severity {
+	case "blocker", "major":
+		return "High"
+	case "minor":
+		return "Medium"
+	case "note":
+		return "Low"
+	default:
+		return "Unknown"
+	}
+}
+
+func printReviewerFindings(writer io.Writer, findings []model.Finding) {
+	for _, finding := range findings {
+		fmt.Fprintf(writer, "  [Severity: %s] %s:%d %s\n", findingSeverityLabel(finding.Severity), finding.File, finding.Line, finding.Claim)
+		fmt.Fprintf(writer, "    Confidence: %.0f%%\n", finding.Confidence*100)
+		fmt.Fprintf(writer, "    Evidence: %s\n", finding.Evidence)
+		fmt.Fprintf(writer, "    Suggested fix: %s\n", finding.SuggestedFix)
+	}
+}
+
 func printConsolidatedDetails(writer io.Writer, decision model.Decision) {
 	crossByFinding := make(map[string]model.CrossExamination, len(decision.CrossExaminations))
 	for _, examination := range decision.CrossExaminations {
 		crossByFinding[examination.FindingID] = examination
 	}
 	if len(decision.Findings) > 0 {
-		fmt.Fprintln(writer, "\nConsolidated findings:")
+		fmt.Fprintln(writer, "\nFindings:")
 		for _, finding := range decision.Findings {
-			fmt.Fprintf(writer, "  [%s] %s:%d %s (%s)\n", finding.Severity, finding.File, finding.Line, finding.Claim, strings.Join(finding.Reviewers, ", "))
+			fmt.Fprintf(writer, "  [Severity: %s] %s:%d %s (%s)\n", findingSeverityLabel(finding.Severity), finding.File, finding.Line, finding.Claim, strings.Join(finding.Reviewers, ", "))
 			fmt.Fprintf(writer, "    Confidence: %.0f%%\n", finding.Confidence*100)
 			if len(finding.CarriedFromRunIDs) > 0 {
 				fmt.Fprintf(writer, "    Carried from runs: %s\n", strings.Join(finding.CarriedFromRunIDs, ", "))
@@ -1698,7 +1717,7 @@ func printConsolidatedDetails(writer io.Writer, decision model.Decision) {
 	if len(decision.RejectedFindings) > 0 {
 		fmt.Fprintln(writer, "\nDisproved findings:")
 		for _, finding := range decision.RejectedFindings {
-			fmt.Fprintf(writer, "  [%s] %s:%d %s\n", finding.OriginalSeverity, finding.File, finding.Line, finding.Claim)
+			fmt.Fprintf(writer, "  [Original severity: %s] %s:%d %s\n", findingSeverityLabel(finding.OriginalSeverity), finding.File, finding.Line, finding.Claim)
 			fmt.Fprintf(writer, "    Confidence: %.0f%%\n", finding.Confidence*100)
 			if len(finding.CarriedFromRunIDs) > 0 {
 				fmt.Fprintf(writer, "    Carried from runs: %s\n", strings.Join(finding.CarriedFromRunIDs, ", "))
@@ -1712,7 +1731,7 @@ func printConsolidatedDetails(writer io.Writer, decision model.Decision) {
 		}
 	}
 	if len(decision.ResidualRisks) > 0 {
-		fmt.Fprintln(writer, "\nResidual risks:")
+		fmt.Fprintln(writer, "\nRemaining risks:")
 		for _, risk := range decision.ResidualRisks {
 			fmt.Fprintf(writer, "  - %s\n", risk)
 		}
@@ -1720,9 +1739,9 @@ func printConsolidatedDetails(writer io.Writer, decision model.Decision) {
 }
 
 func printCrossExaminationDetails(writer io.Writer, examination model.CrossExamination) {
-	fmt.Fprintf(writer, "    Cross-examination: %s by %s (%s -> %s)\n", examination.Disposition, examination.Reviewer, examination.OriginalSeverity, examination.EffectiveSeverity)
+	fmt.Fprintf(writer, "    Finding check: %s by %s (%s)\n", examination.Disposition, examination.Reviewer, formatFindingSeverityChange(examination))
 	if examination.Rationale != "" {
-		fmt.Fprintf(writer, "    Rationale: %s\n", examination.Rationale)
+		fmt.Fprintf(writer, "    Reason: %s\n", examination.Rationale)
 	}
 	if examination.Reachability == nil {
 		return
@@ -1730,22 +1749,31 @@ func printCrossExaminationDetails(writer io.Writer, examination model.CrossExami
 	printReachabilityDetails(writer, examination.Reachability, "    ")
 }
 
+func formatFindingSeverityChange(examination model.CrossExamination) string {
+	original := findingSeverityLabel(examination.OriginalSeverity)
+	if examination.Disposition == "disproved" {
+		return fmt.Sprintf("Original severity: %s; finding removed", original)
+	}
+	return fmt.Sprintf("Severity: %s -> %s", original, findingSeverityLabel(examination.EffectiveSeverity))
+}
+
 func printReachabilityDetails(writer io.Writer, reachability *model.Reachability, indent string) {
 	if reachability == nil {
 		return
 	}
-	fmt.Fprintf(writer, "%sReachability: %s\n", indent, reachability.Status)
+	status := strings.ReplaceAll(reachability.Status, "_", " ")
+	fmt.Fprintf(writer, "%sEvidence of impact: %s\n", indent, status)
 	if reachability.Trigger != "" {
 		fmt.Fprintf(writer, "%s  Trigger: %s\n", indent, reachability.Trigger)
 	}
 	if len(reachability.Path) > 0 {
-		fmt.Fprintf(writer, "%s  Path: %s\n", indent, strings.Join(reachability.Path, " -> "))
+		fmt.Fprintf(writer, "%s  Code path: %s\n", indent, strings.Join(reachability.Path, " -> "))
 	}
 	if reachability.Impact != "" {
 		fmt.Fprintf(writer, "%s  Impact: %s\n", indent, reachability.Impact)
 	}
 	if len(reachability.Preconditions) > 0 {
-		fmt.Fprintf(writer, "%s  Preconditions: %s\n", indent, strings.Join(reachability.Preconditions, ", "))
+		fmt.Fprintf(writer, "%s  Conditions: %s\n", indent, strings.Join(reachability.Preconditions, ", "))
 	}
 }
 
@@ -1920,11 +1948,11 @@ func manifestChecksPassed(checks []model.CheckResult) bool {
 func printDecision(decision model.Decision) {
 	stateLabel := strings.ToUpper(decision.State)
 	if decision.State == stateDeltaApproved {
-		stateLabel = "DELTA APPROVED — FINAL FULL REVIEW REQUIRED"
+		stateLabel = "DELTA APPROVED. FINAL FULL REVIEW REQUIRED"
 	} else if decision.State == model.StateApproved && decision.OutcomeQualifier == "non_blocking_findings" {
 		stateLabel = "APPROVED WITH NON-BLOCKING FINDINGS"
 	} else if decision.State == model.StateApproved && decision.OutcomeQualifier == "cross_examined" {
-		stateLabel = "APPROVED AFTER CROSS-EXAMINATION"
+		stateLabel = "APPROVED AFTER FINDINGS WERE CHECKED"
 	}
 	fmt.Printf("%s %s\n", stateLabel, shortSHA(decision.HeadSHA))
 	fmt.Printf("Reason: %s\n", decision.Reason)
@@ -1968,12 +1996,12 @@ func printDecision(decision model.Decision) {
 		fmt.Printf("Disagreement: %s\n", disagreement)
 	}
 	for _, examination := range decision.CrossExaminations {
-		fmt.Printf("Cross-examination: %s %s", examination.FindingID, examination.Status)
+		fmt.Printf("Finding check: %s %s", examination.FindingID, examination.Status)
 		if examination.Disposition != "" {
-			fmt.Printf(" (%s: %s -> %s)", examination.Disposition, examination.OriginalSeverity, examination.EffectiveSeverity)
+			fmt.Printf(" (%s; %s)", examination.Disposition, formatFindingSeverityChange(examination))
 		}
 		if examination.Error != "" {
-			fmt.Printf(" — %s", examination.Error)
+			fmt.Printf(": %s", examination.Error)
 		}
 		fmt.Println()
 	}
@@ -1984,8 +2012,8 @@ func printDecision(decision model.Decision) {
 
 func formatDecisionFindingSummary(decision model.Decision) string {
 	blocking, nonBlocking := decisionFindingCounts(decision)
-	return fmt.Sprintf("blocking=%d, non-blocking=%d (blocker=%d major=%d minor=%d note=%d)",
-		blocking, nonBlocking, decision.OpenFindings["blocker"], decision.OpenFindings["major"],
+	return fmt.Sprintf("blocking=%d, non-blocking=%d (Severity: High=%d Medium=%d Low=%d)",
+		blocking, nonBlocking, decision.OpenFindings["blocker"]+decision.OpenFindings["major"],
 		decision.OpenFindings["minor"], decision.OpenFindings["note"])
 }
 

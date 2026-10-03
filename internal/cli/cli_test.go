@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -168,9 +169,77 @@ func TestFormatDecisionFindingSummaryShowsApprovedNonBlockingFindings(t *testing
 		OutcomeQualifier:    "non_blocking_findings",
 	}
 	got := formatDecisionFindingSummary(decision)
-	want := "blocking=0, non-blocking=5 (blocker=0 major=0 minor=3 note=2)"
+	want := "blocking=0, non-blocking=5 (Severity: High=0 Medium=3 Low=2)"
 	if got != want {
 		t.Fatalf("finding summary = %q, want %q", got, want)
+	}
+}
+
+func TestFindingDisplayPreservesRecordedSeverityAndEvidence(t *testing.T) {
+	for _, test := range []struct{ severity, label string }{
+		{"blocker", "High"}, {"major", "High"}, {"minor", "Medium"}, {"note", "Low"}, {"future-value", "Unknown"},
+	} {
+		t.Run(test.severity, func(t *testing.T) {
+			// Literal source evidence must not be rewritten to enforce prose style.
+			evidence := "`message := \"left\u2014right\"`"
+			finding := model.Finding{
+				Severity: test.severity, Confidence: 0.6, File: "app.go", Line: 12,
+				Claim: "Handle lookup failures", Evidence: evidence, SuggestedFix: "Return the error to the caller.",
+			}
+			decision := model.Decision{
+				Findings: []model.ConsolidatedFinding{{
+					Severity: finding.Severity, Confidence: finding.Confidence, File: finding.File, Line: finding.Line,
+					Claim: finding.Claim, Evidence: []string{evidence}, SuggestedFixes: []string{finding.SuggestedFix},
+				}},
+				OpenFindings: map[string]int{test.severity: 1},
+			}
+			before, err := json.Marshal([]any{finding, decision})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var original, consolidated bytes.Buffer
+			printReviewerFindings(&original, []model.Finding{finding})
+			printConsolidatedDetails(&consolidated, decision)
+			for _, output := range []string{original.String(), consolidated.String()} {
+				for _, want := range []string{
+					"[Severity: " + test.label + "] app.go:12 Handle lookup failures",
+					"Confidence: 60%", evidence, finding.SuggestedFix,
+				} {
+					if !strings.Contains(output, want) {
+						t.Fatalf("finding output does not contain %q:\n%s", want, output)
+					}
+				}
+			}
+			after, err := json.Marshal([]any{finding, decision})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("human display changed the recorded finding or decision")
+			}
+		})
+	}
+}
+
+func TestFindingSummarySeparatesSeverityFromStrictBlockingPolicy(t *testing.T) {
+	decision := model.Decision{
+		StrictPolicy: true,
+		OpenFindings: map[string]int{"blocker": 1, "major": 2, "minor": 3, "note": 4},
+	}
+	want := "blocking=6, non-blocking=4 (Severity: High=3 Medium=3 Low=4)"
+	if got := formatDecisionFindingSummary(decision); got != want {
+		t.Fatalf("finding summary = %q, want %q", got, want)
+	}
+}
+
+func TestFindingCheckDisplaysSeverityChange(t *testing.T) {
+	var output bytes.Buffer
+	printCrossExaminationDetails(&output, model.CrossExamination{
+		Reviewer: "reviewer", Disposition: "demoted", OriginalSeverity: "major", EffectiveSeverity: "minor",
+		Rationale: "Only an optional export is affected.",
+	})
+	if !strings.Contains(output.String(), "Severity: High -> Medium") {
+		t.Fatalf("missing severity change:\n%s", output.String())
 	}
 }
 
@@ -276,10 +345,13 @@ func TestPrintConsolidatedDetailsExplainsDisprovedFinding(t *testing.T) {
 		}},
 	})
 	text := output.String()
-	for _, want := range []string{"Disproved findings", "Original evidence: handler calls runner", "disproved by claude-cross-examination", "validation replaces the input", "handler.go:18 validates -> runner.go:40 receives constant", "attacker input never reaches execution"} {
+	for _, want := range []string{"Disproved findings", "[Original severity: High]", "finding removed", "Original evidence: handler calls runner", "disproved by claude-cross-examination", "validation replaces the input", "Evidence of impact: not demonstrated", "handler.go:18 validates -> runner.go:40 receives constant", "attacker input never reaches execution"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("disproved finding details do not contain %q:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "Severity: Low") {
+		t.Fatalf("disproved finding appears to remain open at low severity:\n%s", text)
 	}
 }
 

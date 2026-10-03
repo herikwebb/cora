@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	coraassets "github.com/herikwebb/cora"
 	"github.com/herikwebb/cora/internal/config"
 	"github.com/herikwebb/cora/internal/gitx"
 	"github.com/herikwebb/cora/internal/model"
@@ -429,6 +430,14 @@ func TestRunnerWithSubscriptionBackedCLIAdapters(t *testing.T) {
 	}
 	if manifest.PromptHash == "" || manifest.SecurityPromptHash == "" || manifest.PolicyHash == "" || manifest.SchemaHash == "" || len(manifest.Reviewers) != 2 || len(manifest.SecurityReviews) != 1 {
 		t.Fatalf("manifest is incomplete: %#v", manifest)
+	}
+	policyContents, err := os.ReadFile(filepath.Join(latest.Path, "policy.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPolicy := reviewerSecurityPolicy + "\n\n" + coraassets.ReviewWritingRules + "\n"
+	if string(policyContents) != wantPolicy || manifest.PolicyHash != hashBytes(policyContents) {
+		t.Fatalf("recorded policy does not include the shared writing rules with a matching hash")
 	}
 	wantReviewPolicy := config.SnapshotReviewPolicy(cfg)
 	if manifest.ReviewPolicy == nil || !reflect.DeepEqual(*manifest.ReviewPolicy, wantReviewPolicy) {

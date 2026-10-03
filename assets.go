@@ -11,3 +11,8 @@ var ReviewSchema []byte
 //
 //go:embed prompts/default-review.md
 var DefaultReviewPrompt string
+
+// ReviewWritingRules apply to every reviewer, including custom review prompts.
+//
+//go:embed prompts/review-writing.md
+var ReviewWritingRules string

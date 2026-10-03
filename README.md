@@ -153,6 +153,42 @@ Every iteration gets a new immutable-by-convention run directory; earlier
 feedback remains available. Coding agents can use `--json` plus the documented
 exit codes as their control interface.
 
+## Review writing and GitHub comments
+
+CORA asks every reviewer to use [the same writing rules](prompts/review-writing.md),
+including when a repository supplies a custom prompt. Reviews should use plain,
+simple terms and short titles. Each finding should explain what causes the
+problem, what happens as a result, and what needs to change. Avoid AI jargon and
+em dashes in new prose. Keep literal code and quoted evidence unchanged.
+
+Human-readable findings use explicit severity labels:
+
+| Label | Stored severity |
+| --- | --- |
+| Severity: High | `blocker` or `major` |
+| Severity: Medium | `minor` |
+| Severity: Low | `note` |
+
+Severity describes the finding's impact. It is separate from model effort,
+confidence, and the overall review verdict. The labels do not change the JSON
+schema, blocking policy, or approval rules. Finding titles do not include P1/P2
+or repeat the severity label.
+
+Use the same style when copying a finding into a GitHub review. For example:
+
+> **Severity: High**
+>
+> **Retry can overwrite another workflow**
+>
+> If the original workflow was deleted and another workflow uses the same name,
+> retry can replace the new workflow's contents. Check that the workflow belongs
+> to this run before updating it. Add a test showing that an unrelated workflow
+> with the same name stays unchanged.
+
+Keep the finding's code location and supporting evidence with the comment.
+Posting is a separate step performed by the caller through GitHub or its CLI.
+CORA does not have a command that posts reviews.
+
 ## Auto-fix loop
 
 `--auto-fix` is opt-in and operates only on a clean, checked-out feature branch.

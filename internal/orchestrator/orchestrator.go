@@ -61,6 +61,8 @@ const reviewerSecurityPolicy = `CORA security policy:
 - You may run focused local tests. Incidental test, build, cache, and temporary files are allowed because the workspace is discarded.
 - Do not attempt to obtain credentials, access unrelated user files, or use the network. Only the parent Cora process may capture explicitly authorized web evidence before review.`
 
+var reviewerPolicy = reviewerSecurityPolicy + "\n\n" + coraassets.ReviewWritingRules
+
 func (r Runner) Run(parent context.Context, repo gitx.Repo, target model.Target, cfg config.Config) (model.Decision, error) {
 	return r.RunWithOptions(parent, repo, target, cfg, RunOptions{})
 }
@@ -297,7 +299,7 @@ func (r Runner) runWithReviewContext(parent context.Context, repo gitx.Repo, tar
 			return model.Decision{}, err
 		}
 	}
-	if err := record.WriteFile(filepath.Join(run.Path, "policy.md"), []byte(reviewerSecurityPolicy+"\n")); err != nil {
+	if err := record.WriteFile(filepath.Join(run.Path, "policy.md"), []byte(reviewerPolicy+"\n")); err != nil {
 		return model.Decision{}, err
 	}
 	checkExecution := "none"
@@ -360,7 +362,7 @@ func (r Runner) runWithReviewContext(parent context.Context, repo gitx.Repo, tar
 		Target:                  target,
 		PromptHash:              hashBytes([]byte(prompt)),
 		SecurityPromptHash:      hashOptionalPrompt(securityPrompt),
-		PolicyHash:              hashBytes([]byte(reviewerSecurityPolicy + "\n")),
+		PolicyHash:              hashBytes([]byte(reviewerPolicy + "\n")),
 		SchemaHash:              hashBytes(coraassets.ReviewSchema),
 		CoraVersion:             r.Version,
 		CoraSourceSHA:           r.SourceSHA,
@@ -596,7 +598,7 @@ func (r Runner) runWithReviewContext(parent context.Context, repo gitx.Repo, tar
 			r.progressf("cora: reviewer %s queued until provider quota resets at %s\n", reviewer, notBefore.Local().Format(time.RFC3339))
 		}
 	}
-	newReviewers, err := runReviewerAdapters(execution.Context(), execution, initialAdapters, repo, run, target, diff, changedPaths, cfg, prompt, reviewerSecurityPolicy, schemaPath, webEvidenceHash(webEvidence),
+	newReviewers, err := runReviewerAdapters(execution.Context(), execution, initialAdapters, repo, run, target, diff, changedPaths, cfg, prompt, reviewerPolicy, schemaPath, webEvidenceHash(webEvidence),
 		reviewerCallbacks{Queued: onReviewerQueue, Started: onReviewerStart, Finished: onReviewerFinish}, attempts, options.NotBefore, reviewerExecutionLimits)
 	if err != nil {
 		return model.Decision{}, err
@@ -701,7 +703,7 @@ func (r Runner) runWithReviewContext(parent context.Context, repo gitx.Repo, tar
 			})
 			securityResults, securityErr := runReviewerAdapters(execution.Context(), execution, []provider.Adapter{provider.Claude{
 				Config: securityConfig, ReviewerName: "claude-security", EscalationCause: "security_sensitive",
-			}}, repo, run, target, diff, changedPaths, cfg, securityPrompt, reviewerSecurityPolicy, schemaPath, webEvidenceHash(webEvidence),
+			}}, repo, run, target, diff, changedPaths, cfg, securityPrompt, reviewerPolicy, schemaPath, webEvidenceHash(webEvidence),
 				reviewerCallbacks{Queued: onReviewerQueue, Started: onReviewerStart, Finished: onReviewerFinish}, attempts, options.NotBefore, reviewerExecutionLimits)
 			if securityErr != nil {
 				return model.Decision{}, securityErr
@@ -764,7 +766,7 @@ func (r Runner) runWithReviewContext(parent context.Context, repo gitx.Repo, tar
 			escalationPrompt := disputeEscalationPrompt(prompt, reviewers)
 			escalated, escalationErr := runReviewerAdapters(execution.Context(), execution, []provider.Adapter{provider.Claude{
 				Config: escalatedConfig, ReviewerName: "claude-escalation", EscalationCause: "disputed",
-			}}, repo, run, target, diff, changedPaths, cfg, escalationPrompt, reviewerSecurityPolicy, schemaPath, webEvidenceHash(webEvidence),
+			}}, repo, run, target, diff, changedPaths, cfg, escalationPrompt, reviewerPolicy, schemaPath, webEvidenceHash(webEvidence),
 				reviewerCallbacks{Queued: onReviewerQueue, Started: onReviewerStart, Finished: onReviewerFinish}, attempts, options.NotBefore, reviewerExecutionLimits)
 			if escalationErr != nil {
 				return model.Decision{}, escalationErr
@@ -835,7 +837,7 @@ func (r Runner) runWithReviewContext(parent context.Context, repo gitx.Repo, tar
 			r.progressf("cora: cross-examining %d uncorroborated blocking finding(s) with %s/%s\n", len(candidates), crossConfig.Model, crossConfig.Effort)
 			newCrossResults, crossErr := runReviewerAdapters(execution.Context(), execution, []provider.Adapter{provider.Claude{
 				Config: crossConfig, ReviewerName: "claude-cross-examination", EscalationCause: "blocking_cross_examination",
-			}}, repo, run, target, diff, changedPaths, cfg, crossPrompt, reviewerSecurityPolicy, schemaPath, webEvidenceHash(webEvidence),
+			}}, repo, run, target, diff, changedPaths, cfg, crossPrompt, reviewerPolicy, schemaPath, webEvidenceHash(webEvidence),
 				reviewerCallbacks{Queued: onReviewerQueue, Started: onReviewerStart, Finished: onReviewerFinish}, attempts, options.NotBefore, reviewerExecutionLimits)
 			if crossErr != nil {
 				return model.Decision{}, crossErr
