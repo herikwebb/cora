@@ -400,12 +400,12 @@ func TestSelectRetryReviewersDefaultsToIncompleteProviders(t *testing.T) {
 
 func TestAllRetryReviewersIncludesConditionalRoles(t *testing.T) {
 	selected := allRetryReviewers()
-	for _, reviewer := range []string{"codex", "claude", "claude-security", "claude-escalation", "claude-cross-examination"} {
+	for _, reviewer := range []string{"codex", "claude", "gemini", "claude-security", "claude-escalation", "claude-cross-examination"} {
 		if !selected[reviewer] {
 			t.Fatalf("expected web-backed retry to select %q: %#v", reviewer, selected)
 		}
 	}
-	if len(selected) != 5 {
+	if len(selected) != 6 {
 		t.Fatalf("unexpected web-backed retry selection: %#v", selected)
 	}
 }
@@ -420,7 +420,7 @@ func TestSelectRetryReviewersForWebRunRejectsTargetedRetry(t *testing.T) {
 	}
 
 	selected, wholeReview, err = selectRetryReviewersForRun(true, nil, nil)
-	if err != nil || !wholeReview || len(selected) != 5 {
+	if err != nil || !wholeReview || len(selected) != 6 {
 		t.Fatalf("whole web retry = %#v, whole=%t, err=%v", selected, wholeReview, err)
 	}
 }

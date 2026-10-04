@@ -617,7 +617,7 @@ func newRetryCommand(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if parentManifest.WebEvidence == nil && ((selected["codex"] && !cfg.Reviewers.Codex.Enabled) || (selectedAny(selected, "claude", "claude-security", "claude-escalation", "claude-cross-examination") && !cfg.Reviewers.Claude.Enabled)) {
+			if parentManifest.WebEvidence == nil && ((selected["codex"] && !cfg.Reviewers.Codex.Enabled) || (selected["gemini"] && !cfg.Reviewers.Gemini.Enabled) || (selectedAny(selected, "claude", "claude-security", "claude-escalation", "claude-cross-examination") && !cfg.Reviewers.Claude.Enabled)) {
 				return errors.New("selected reviewer is disabled by the trusted configuration")
 			}
 			previous := prepareRetryResults(lineage.Reviewers, lineage.LatestReviewers, selected)
@@ -662,14 +662,14 @@ func newRetryCommand(opts *options) *cobra.Command {
 			return nil
 		},
 	}
-	command.Flags().StringSliceVar(&reviewers, "reviewer", nil, "reviewer to retry: codex, claude, claude-security, claude-escalation, or claude-cross-examination (repeatable)")
+	command.Flags().StringSliceVar(&reviewers, "reviewer", nil, "reviewer to retry: codex, claude, gemini, claude-security, claude-escalation, or claude-cross-examination (repeatable)")
 	command.Flags().BoolVar(&noWait, "no-wait", false, "return instead of waiting for a recorded provider quota reset")
 	command.Flags().BoolVar(&allowAPIBilling, "allow-api-billing", false, "allow API-key or other separately billed authentication")
 	command.Flags().BoolVar(&adjudicate, "adjudicate", false, "run a Fable adjudicator when reviewers disagree")
 	command.Flags().BoolVar(&strict, "strict", false, "treat minor findings as blocking and require validation checks")
 	command.Flags().DurationVar(&reviewerTimeout, "reviewer-timeout", 0, "raise the execution timeout for each selected reviewer")
 	command.Flags().DurationVar(&overallTimeout, "overall-timeout", 0, "raise the retry's overall active execution timeout")
-	command.Flags().IntVar(&maxTurns, "max-turns", 0, "raise the Claude turn ceiling for each selected Claude-backed reviewer")
+	command.Flags().IntVar(&maxTurns, "max-turns", 0, "raise the turn ceiling for each selected Claude-backed or Gemini reviewer")
 	return command
 }
 
@@ -743,10 +743,13 @@ func applyRetryLimitOverrides(cfg *config.Config, reviewerLimits map[string]mode
 		overrides.ReviewerTimeout = &value
 	}
 	if input.MaxTurnsSet {
-		if !selectedAny(selected, "claude", "claude-security", "claude-escalation", "claude-cross-examination") {
-			return nil, errors.New("--max-turns requires at least one selected Claude-backed reviewer")
+		if !selectedAny(selected, "gemini", "claude", "claude-security", "claude-escalation", "claude-cross-examination") {
+			return nil, errors.New("--max-turns requires at least one selected Claude-backed or Gemini reviewer")
 		}
-		if input.MaxTurns <= cfg.Reviewers.Claude.FinalizationTurns {
+		if input.MaxTurns <= 0 {
+			return nil, errors.New("--max-turns must be positive")
+		}
+		if selectedAny(selected, "claude", "claude-security", "claude-escalation", "claude-cross-examination") && input.MaxTurns <= cfg.Reviewers.Claude.FinalizationTurns {
 			return nil, fmt.Errorf("--max-turns must exceed the saved %d-turn finalization reserve", cfg.Reviewers.Claude.FinalizationTurns)
 		}
 		for _, reviewer := range selectedNames {
@@ -824,7 +827,7 @@ func retryAutoFixReviewContext(store record.Store, manifest model.Manifest) (mod
 func selectRetryReviewers(results []model.ReviewerResult, requested []string) (map[string]bool, error) {
 	available := make(map[string]model.ReviewerResult)
 	for _, result := range results {
-		if result.Reviewer == "codex" || result.Reviewer == "claude" || result.Reviewer == "claude-security" || result.Reviewer == "claude-escalation" || result.Reviewer == "claude-cross-examination" {
+		if result.Reviewer == "codex" || result.Reviewer == "claude" || result.Reviewer == "gemini" || result.Reviewer == "claude-security" || result.Reviewer == "claude-escalation" || result.Reviewer == "claude-cross-examination" {
 			available[result.Reviewer] = result
 		}
 	}
@@ -868,6 +871,7 @@ func allRetryReviewers() map[string]bool {
 	return map[string]bool{
 		"codex":                    true,
 		"claude":                   true,
+		"gemini":                   true,
 		"claude-security":          true,
 		"claude-escalation":        true,
 		"claude-cross-examination": true,
@@ -955,6 +959,12 @@ func preserveRetryReviewerSettings(cfg *config.Config, manifest model.Manifest, 
 		if previous, found := effectiveRetryResult("claude", lineage.Reviewers, lineage.LatestReviewers); found {
 			cfg.Reviewers.Claude.Enabled = true
 			applySavedModelEffort(&cfg.Reviewers.Claude.Model, &cfg.Reviewers.Claude.Effort, previous)
+		}
+	}
+	if selected["gemini"] {
+		if previous, found := effectiveRetryResult("gemini", lineage.Reviewers, lineage.LatestReviewers); found {
+			cfg.Reviewers.Gemini.Enabled = true
+			applySavedModelEffort(&cfg.Reviewers.Gemini.Model, &cfg.Reviewers.Gemini.Effort, previous)
 		}
 	}
 

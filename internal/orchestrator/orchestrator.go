@@ -368,7 +368,7 @@ func (r Runner) runWithReviewContext(parent context.Context, repo gitx.Repo, tar
 		CoraSourceSHA:           r.SourceSHA,
 		CoraBuildTime:           r.BuildTime,
 		Security: model.SecurityMetadata{
-			ReviewerIsolation:   "per-reviewer-disposable-clone-workspace-write-sandboxed",
+			ReviewerIsolation:   reviewerIsolation(cfg),
 			RepositoryPolicy:    "ignored",
 			ControlFilesChanged: controlFiles,
 			CheckExecution:      checkExecution,
@@ -446,16 +446,17 @@ func (r Runner) runWithReviewContext(parent context.Context, repo gitx.Repo, tar
 
 	initialConfig := cfg
 	initialConfig.Reviewers.Claude.MaxTurns = reviewerExecutionLimits["claude"].MaxTurns
+	initialConfig.Reviewers.Gemini.MaxTurns = reviewerExecutionLimits["gemini"].MaxTurns
 	initialAdapters := provider.Enabled(initialConfig)
 	initialAdapters = filterAdapters(initialAdapters, options.RetryReviewers)
 	reusableReviewers := options.ReuseReviewers
 	reusableCrossExaminations := options.ReuseCrossExaminations
-	if retriesAny(options.RetryReviewers, "codex", "claude") {
+	if retriesAny(options.RetryReviewers, "codex", "claude", "gemini") {
 		// Adjudication depends on the ordinary reports, not only on the target
 		// diff. An upstream retry invalidates the old adjudicator input.
 		reusableReviewers = withoutReviewer(reusableReviewers, "claude-escalation")
 	}
-	if retriesAny(options.RetryReviewers, "codex", "claude", "claude-security", "claude-escalation") {
+	if retriesAny(options.RetryReviewers, "codex", "claude", "gemini", "claude-security", "claude-escalation") {
 		// Cross-examination depends on the exact consolidated candidates.
 		// Never apply an old disposition after an upstream report changed.
 		reusableCrossExaminations = nil
@@ -1231,6 +1232,7 @@ func runReviewerAdapters(queueParent context.Context, execution *executionBudget
 				AllowAPIBilling: cfg.AllowAPIBilling,
 				Attempt:         attemptFor(attempts, adapter.Name()),
 				ChangedPaths:    append([]string(nil), snapshotChangedPaths...),
+				SnapshotPatch:   append([]byte(nil), snapshotPatch...),
 			})
 			cancelReviewer()
 			if result.FailureKind == "quota" && result.RetryAt != nil && result.RetryAt.After(time.Now()) {
@@ -1290,12 +1292,21 @@ func maximumQueueDelay(notBefore map[string]time.Time, now time.Time) time.Durat
 	return maximum
 }
 
+func reviewerIsolation(cfg config.Config) string {
+	if cfg.Reviewers.Gemini.Enabled {
+		return "per-reviewer-disposable-clone-provider-tool-restrictions"
+	}
+	return "per-reviewer-disposable-clone-workspace-write-sandboxed"
+}
+
 func providerConcurrency(cfg config.Config, name string) int {
 	switch name {
 	case "claude":
 		return cfg.Reviewers.Claude.MaxConcurrency
 	case "codex":
 		return cfg.Reviewers.Codex.MaxConcurrency
+	case "gemini":
+		return cfg.Reviewers.Gemini.MaxConcurrency
 	default:
 		return 1
 	}
@@ -1351,7 +1362,10 @@ func resolveReviewerExecutionLimits(cfg config.Config, saved map[string]model.Re
 		if limit.Timeout.Duration <= 0 {
 			return nil, fmt.Errorf("saved execution timeout for %s must be positive", reviewer)
 		}
-		if reviewer != "codex" && limit.MaxTurns <= cfg.Reviewers.Claude.FinalizationTurns {
+		if reviewer == "gemini" && (limit.MaxTurns < 0 || cfg.Reviewers.Gemini.Enabled && limit.MaxTurns == 0) {
+			return nil, errors.New("saved max turns for gemini must be positive")
+		}
+		if strings.HasPrefix(reviewer, "claude") && limit.MaxTurns <= cfg.Reviewers.Claude.FinalizationTurns {
 			return nil, fmt.Errorf("saved max turns for %s must exceed the %d-turn finalization reserve", reviewer, cfg.Reviewers.Claude.FinalizationTurns)
 		}
 		limits[reviewer] = limit
@@ -1685,7 +1699,7 @@ func changedControlFiles(paths []string) []string {
 	for _, path := range paths {
 		normalized := strings.ToLower(filepath.ToSlash(path))
 		base := filepath.Base(normalized)
-		if base == "agents.md" || base == "claude.md" || base == "copilot-instructions.md" || pathContainsControlDirectory(normalized) {
+		if base == "agents.md" || base == "claude.md" || base == "gemini.md" || base == "copilot-instructions.md" || pathContainsControlDirectory(normalized) {
 			changed = append(changed, filepath.ToSlash(path))
 		}
 	}
@@ -2179,7 +2193,7 @@ func formatCost(usage model.Usage) string {
 
 func pathContainsControlDirectory(path string) bool {
 	padded := "/" + strings.Trim(path, "/") + "/"
-	for _, directory := range []string{"/.cora/", "/.codex/", "/.claude/", "/.cursor/", "/.github/instructions/"} {
+	for _, directory := range []string{"/.cora/", "/.codex/", "/.claude/", "/.gemini/", "/.cursor/", "/.github/instructions/"} {
 		if strings.Contains(padded, directory) {
 			return true
 		}

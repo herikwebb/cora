@@ -12,6 +12,7 @@ import (
 func TestEvaluate(t *testing.T) {
 	approve := completedReview("codex", "approve")
 	claudeApprove := completedReview("claude", "approve")
+	geminiApprove := completedReview("gemini", "approve")
 	requestChanges := completedReview("claude", "request_changes")
 	abstain := completedReview("claude", "abstain")
 	incomplete := model.ReviewerResult{Reviewer: "claude", Status: "incomplete"}
@@ -27,6 +28,10 @@ func TestEvaluate(t *testing.T) {
 		want      string
 	}{
 		{name: "consensus", target: finalTarget(), reviewers: []model.ReviewerResult{approve, claudeApprove}, minimum: 2, want: model.StateApproved},
+		{name: "three provider consensus", target: finalTarget(), reviewers: []model.ReviewerResult{approve, claudeApprove, geminiApprove}, minimum: 3, want: model.StateApproved},
+		{name: "Gemini counts toward quorum", target: finalTarget(), reviewers: []model.ReviewerResult{approve, geminiApprove}, minimum: 2, want: model.StateApproved},
+		{name: "Gemini dissent blocks majority approval", target: finalTarget(), reviewers: []model.ReviewerResult{approve, claudeApprove, completedReview("gemini", "request_changes")}, minimum: 2, want: model.StateChangesRequested},
+		{name: "Gemini incomplete fails closed despite quorum", target: finalTarget(), reviewers: []model.ReviewerResult{approve, claudeApprove, {Reviewer: "gemini", Status: "incomplete"}}, minimum: 2, want: model.StateIncomplete},
 		{name: "explicit request outranks approval", target: finalTarget(), reviewers: []model.ReviewerResult{approve, requestChanges}, minimum: 2, want: model.StateChangesRequested},
 		{name: "blocking finding", target: finalTarget(), reviewers: []model.ReviewerResult{approve, majorFinding}, minimum: 2, want: model.StateChangesRequested},
 		{name: "request outranks abstention", target: finalTarget(), reviewers: []model.ReviewerResult{requestChanges, abstain}, minimum: 2, want: model.StateChangesRequested},
@@ -65,6 +70,21 @@ func TestEvaluateDeduplicatesEquivalentFindings(t *testing.T) {
 	finding := decision.Findings[0]
 	if len(finding.Reviewers) != 2 || len(finding.Evidence) != 2 || len(finding.SuggestedFixes) != 2 {
 		t.Fatalf("merged finding lost source detail: %#v", finding)
+	}
+}
+
+func TestGeminiCorroborationRemovesSingleReviewerCrossExamination(t *testing.T) {
+	codex := completedReview("codex", "request_changes")
+	codex.Report.Findings = []model.Finding{blockingFinding("C1")}
+	gemini := completedReview("gemini", "request_changes")
+	gemini.Report.Findings = []model.Finding{blockingFinding("G1")}
+	reviewers := []model.ReviewerResult{codex, completedReview("claude", "approve"), gemini}
+	if candidates := BlockingCandidates(reviewers); len(candidates) != 0 {
+		t.Fatalf("Gemini corroboration was not recognized: %#v", candidates)
+	}
+	decision := Evaluate("run", finalTarget(), reviewers, nil, []string{"blocker", "major"}, 2, time.Unix(1, 0))
+	if decision.State != model.StateChangesRequested || len(decision.Findings) != 1 || !slices.Equal(decision.Findings[0].Reviewers, []string{"codex", "gemini"}) {
+		t.Fatalf("Gemini corroborated consensus = %#v", decision)
 	}
 }
 

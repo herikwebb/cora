@@ -1084,7 +1084,7 @@ func quotaResumeReviewers(manifest model.Manifest) (*time.Time, []string, bool) 
 	// reviewer-specific retry or terminating only to request another resume.
 	if manifest.ReviewPolicy != nil {
 		policy := manifest.ReviewPolicy
-		if reviewers["codex"] || reviewers["claude"] || reviewers["claude-security"] {
+		if reviewers["codex"] || reviewers["claude"] || reviewers["gemini"] || reviewers["claude-security"] {
 			if policy.Escalation.Enabled && policy.Escalation.AdjudicateDisagreements {
 				reviewers["claude-escalation"] = true
 			}
@@ -1169,6 +1169,12 @@ func approvedBaselineCompatible(ctx context.Context, repo gitx.Repo, baseline re
 }
 
 func sameReviewPolicy(left, right model.AutoFixReviewPolicy) bool {
+	// Older records predate optional Gemini support. Disabled reviewer settings
+	// do not change the approval policy or invalidate those approved baselines.
+	if !left.Gemini.Enabled && !right.Gemini.Enabled {
+		left.Gemini = model.AutoFixReviewerPolicy{}
+		right.Gemini = model.AutoFixReviewerPolicy{}
+	}
 	leftJSON, leftErr := json.Marshal(left)
 	rightJSON, rightErr := json.Marshal(right)
 	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
@@ -1181,6 +1187,9 @@ func baselineReviewersMatchPolicy(results []model.ReviewerResult, policy model.A
 	}
 	if policy.Claude.Enabled {
 		required["claude"] = policy.Claude
+	}
+	if policy.Gemini.Enabled {
+		required["gemini"] = policy.Gemini
 	}
 	matched := make(map[string]bool, len(required))
 	for _, result := range results {
@@ -1228,7 +1237,7 @@ func hasSecuritySensitivePath(paths, markers []string) bool {
 		normalized := strings.ToLower(filepath.ToSlash(path))
 		base := filepath.Base(normalized)
 		padded := "/" + strings.Trim(normalized, "/") + "/"
-		if base == "agents.md" || base == "claude.md" || base == "copilot-instructions.md" || containsControlDirectory(padded) {
+		if base == "agents.md" || base == "claude.md" || base == "gemini.md" || base == "copilot-instructions.md" || containsControlDirectory(padded) {
 			return true
 		}
 		for _, marker := range markers {
@@ -1242,7 +1251,7 @@ func hasSecuritySensitivePath(paths, markers []string) bool {
 }
 
 func containsControlDirectory(paddedPath string) bool {
-	for _, directory := range []string{"/.cora/", "/.codex/", "/.claude/", "/.cursor/", "/.github/instructions/"} {
+	for _, directory := range []string{"/.cora/", "/.codex/", "/.claude/", "/.gemini/", "/.cursor/", "/.github/instructions/"} {
 		if strings.Contains(paddedPath, directory) {
 			return true
 		}
@@ -1273,6 +1282,11 @@ func preserveRetryReviewerSettings(cfg *config.Config, manifest model.Manifest, 
 			}
 			if result.Effort != "" {
 				cfg.Reviewers.Codex.Effort = result.Effort
+			}
+		case "gemini":
+			cfg.Reviewers.Gemini.Enabled = true
+			if result.Model != "" {
+				cfg.Reviewers.Gemini.Model = result.Model
 			}
 		case "claude":
 			cfg.Reviewers.Claude.Enabled = true

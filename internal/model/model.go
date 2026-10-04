@@ -482,6 +482,7 @@ type AutoFixReviewPolicy struct {
 	PromptFile                   string                        `json:"prompt_file,omitempty"`
 	Codex                        AutoFixReviewerPolicy         `json:"codex"`
 	Claude                       AutoFixReviewerPolicy         `json:"claude"`
+	Gemini                       AutoFixReviewerPolicy         `json:"gemini"`
 	Escalation                   AutoFixEscalationPolicy       `json:"escalation"`
 	CrossExamination             AutoFixCrossExaminationPolicy `json:"cross_examination"`
 	Checks                       []AutoFixCheckPolicy          `json:"checks"`

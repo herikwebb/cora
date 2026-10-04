@@ -42,6 +42,7 @@ type Reviewer struct {
 type Reviewers struct {
 	Codex  Reviewer `toml:"codex"`
 	Claude Reviewer `toml:"claude"`
+	Gemini Reviewer `toml:"gemini"`
 }
 
 type Check struct {
@@ -139,6 +140,12 @@ func Defaults() Config {
 				MaxTurns:          50,
 				FinalizationTurns: 2,
 				MaxConcurrency:    1,
+			},
+			Gemini: Reviewer{
+				Command:        "gemini",
+				Model:          "gemini-2.5-pro",
+				MaxTurns:       50,
+				MaxConcurrency: 1,
 			},
 		},
 		Escalation: Escalation{
@@ -283,6 +290,9 @@ func (c Config) Validate() error {
 	if c.Reviewers.Claude.Enabled {
 		enabledReviewers++
 	}
+	if c.Reviewers.Gemini.Enabled {
+		enabledReviewers++
+	}
 	if enabledReviewers == 0 {
 		return errors.New("at least one reviewer must be enabled")
 	}
@@ -294,6 +304,29 @@ func (c Config) Validate() error {
 	}
 	if c.Reviewers.Claude.Enabled && strings.TrimSpace(c.Reviewers.Claude.Command) == "" {
 		return errors.New("reviewers.claude.command cannot be empty")
+	}
+	if c.Reviewers.Gemini.Enabled {
+		if strings.TrimSpace(c.Reviewers.Gemini.Command) == "" {
+			return errors.New("reviewers.gemini.command cannot be empty")
+		}
+		if strings.TrimSpace(c.Reviewers.Gemini.Model) == "" {
+			return errors.New("reviewers.gemini.model cannot be empty")
+		}
+		if c.Reviewers.Gemini.MaxTurns < 1 {
+			return errors.New("reviewers.gemini.max_turns must be positive")
+		}
+		if c.Reviewers.Gemini.MaxConcurrency < 1 {
+			return errors.New("reviewers.gemini.max_concurrency must be positive")
+		}
+	}
+	if c.Reviewers.Gemini.Effort != "" {
+		return errors.New("reviewers.gemini.effort is not supported by Gemini CLI; leave it empty")
+	}
+	if c.Reviewers.Gemini.FinalizationTurns != 0 {
+		return errors.New("reviewers.gemini.finalization_turns is not supported by Gemini CLI; leave it at zero")
+	}
+	if c.Reviewers.Gemini.MaxBudgetUSD != 0 {
+		return errors.New("reviewers.gemini.max_budget_usd is not supported by Gemini CLI; leave it at zero")
 	}
 	if c.Reviewers.Claude.MaxTurns < 1 {
 		return errors.New("reviewers.claude.max_turns must be positive")

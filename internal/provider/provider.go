@@ -36,6 +36,7 @@ type Request struct {
 	AllowAPIBilling bool
 	Attempt         int
 	ChangedPaths    []string
+	SnapshotPatch   []byte
 }
 
 type FixRequest struct {
@@ -75,6 +76,12 @@ func DescribeAdapter(adapter Adapter) AdapterDescriptor {
 		if value != nil {
 			return AdapterDescriptor{Model: value.Config.Model, Effort: value.Config.Effort, EscalationCause: value.EscalationCause}
 		}
+	case Gemini:
+		return AdapterDescriptor{Model: value.Config.Model, Effort: value.Config.Effort}
+	case *Gemini:
+		if value != nil {
+			return AdapterDescriptor{Model: value.Config.Model, Effort: value.Config.Effort}
+		}
 	}
 	return AdapterDescriptor{}
 }
@@ -84,12 +91,15 @@ func Enabled(cfg config.Config) []Adapter {
 }
 
 func EnabledWithClaudeEscalation(cfg config.Config, cause string) []Adapter {
-	adapters := make([]Adapter, 0, 2)
+	adapters := make([]Adapter, 0, 3)
 	if cfg.Reviewers.Codex.Enabled {
 		adapters = append(adapters, Codex{Config: cfg.Reviewers.Codex})
 	}
 	if cfg.Reviewers.Claude.Enabled {
 		adapters = append(adapters, Claude{Config: cfg.Reviewers.Claude, EscalationCause: cause})
+	}
+	if cfg.Reviewers.Gemini.Enabled {
+		adapters = append(adapters, Gemini{Config: cfg.Reviewers.Gemini})
 	}
 	return adapters
 }
@@ -862,6 +872,7 @@ var (
 	quotaResetPattern    = regexp.MustCompile(`(?i)\breset(?:s)?(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b`)
 	quotaTimezonePattern = regexp.MustCompile(`\(([A-Za-z][A-Za-z0-9_+\-/]+(?:/[A-Za-z0-9_+\-]+)+)\)`)
 	easternTimePattern   = regexp.MustCompile(`(?i)\bET\b`)
+	quotaDelayPattern    = regexp.MustCompile(`(?i)\b(?:reset(?:s)?\s+after|retry(?:\s+again)?\s+(?:in|after))\s+([0-9][0-9hms.]*)`)
 )
 
 func classifyFailure(result *model.ReviewerResult, now time.Time) {
@@ -1014,8 +1025,13 @@ func decodeProviderError(message string) string {
 // the failure occurred, including an IANA location emitted by the provider.
 func QuotaRetryAt(message string, observedAt time.Time) (time.Time, bool) {
 	normalized := strings.ToLower(message)
-	if !strings.Contains(normalized, "quota") && !strings.Contains(normalized, "usage limit") && !strings.Contains(normalized, "session limit") && !strings.Contains(normalized, "rate limit") && !strings.Contains(normalized, "hit your limit") {
+	if !strings.Contains(normalized, "quota") && !strings.Contains(normalized, "usage limit") && !strings.Contains(normalized, "session limit") && !strings.Contains(normalized, "rate limit") && !strings.Contains(normalized, "hit your limit") && !strings.Contains(normalized, "resource_exhausted") && !strings.Contains(normalized, "exhausted your capacity") {
 		return time.Time{}, false
+	}
+	if match := quotaDelayPattern.FindStringSubmatch(message); len(match) == 2 {
+		if delay, err := time.ParseDuration(strings.TrimSuffix(strings.ToLower(match[1]), ".")); err == nil && delay > 0 {
+			return observedAt.Add(delay), true
+		}
 	}
 	match := quotaResetPattern.FindStringSubmatch(message)
 	if len(match) != 4 {

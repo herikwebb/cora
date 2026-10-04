@@ -360,6 +360,7 @@ func plannedReviewers(cfg config.Config, securityTriggered bool) []planReviewer 
 	reviewers := []planReviewer{
 		plannedReviewer("codex", "codex", "initial", cfg.Reviewers.Codex, limits["codex"], cfg.Reviewers.Codex.Enabled, false, cfg.Reviewers.Codex.Enabled, ""),
 		plannedReviewer("claude", "claude", "initial", cfg.Reviewers.Claude, limits["claude"], cfg.Reviewers.Claude.Enabled, false, cfg.Reviewers.Claude.Enabled, ""),
+		plannedReviewer("gemini", "gemini", "initial", cfg.Reviewers.Gemini, limits["gemini"], cfg.Reviewers.Gemini.Enabled, false, cfg.Reviewers.Gemini.Enabled, ""),
 		plannedReviewer("claude-security", "claude", "security-review", escalation, limits["claude-security"], cfg.Escalation.Enabled && cfg.Reviewers.Claude.Enabled, false, securityTriggered, "security-sensitive paths are present or explicitly forced"),
 		plannedReviewer("claude-escalation", "claude", "dispute-adjudication", escalation, limits["claude-escalation"], cfg.Escalation.Enabled && cfg.Escalation.AdjudicateDisagreements && cfg.Reviewers.Claude.Enabled, true, false, "ordinary reviewers disagree while approval remains possible"),
 		plannedReviewer("claude-cross-examination", "claude", "cross-examination", cross, limits["claude-cross-examination"], cfg.CrossExamineBlockingFindings && cfg.Reviewers.Claude.Enabled, true, false, "an uncorroborated blocking finding could determine the outcome"),
@@ -461,7 +462,7 @@ func plannedCapacity(cfg config.Config, reviewers []planReviewer) []planProvider
 		initial, targeted int
 		conditional       []string
 	}
-	demands := map[string]*demand{"codex": {}, "claude": {}}
+	demands := map[string]*demand{"codex": {}, "claude": {}, "gemini": {}}
 	for _, reviewer := range reviewers {
 		if !reviewer.Enabled {
 			continue
@@ -476,12 +477,14 @@ func plannedCapacity(cfg config.Config, reviewers []planReviewer) []planProvider
 			entry.conditional = append(entry.conditional, reviewer.Name)
 		}
 	}
-	capacities := make([]planProviderCapacity, 0, 2)
-	for _, providerName := range []string{"codex", "claude"} {
+	capacities := make([]planProviderCapacity, 0, 3)
+	for _, providerName := range []string{"codex", "claude", "gemini"} {
 		entry := demands[providerName]
 		limit := cfg.Reviewers.Codex.MaxConcurrency
 		if providerName == "claude" {
 			limit = cfg.Reviewers.Claude.MaxConcurrency
+		} else if providerName == "gemini" {
+			limit = cfg.Reviewers.Gemini.MaxConcurrency
 		}
 		if entry.initial == 0 && entry.targeted == 0 && len(entry.conditional) == 0 {
 			continue

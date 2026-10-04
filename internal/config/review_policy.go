@@ -21,6 +21,7 @@ func SnapshotReviewPolicy(cfg Config) model.AutoFixReviewPolicy {
 		AllowAPIBilling: cfg.AllowAPIBilling, AllowReviewWeb: cfg.AllowReviewWeb, AllowUnsafeChecks: cfg.AllowUnsafeChecks,
 		MinimumApprovals: cfg.MinimumApprovals, BlockingSeverities: append([]string(nil), cfg.BlockingSeverities...),
 		PromptFile: cfg.PromptFile, Codex: snapshotReviewerPolicy(cfg.Reviewers.Codex), Claude: snapshotReviewerPolicy(cfg.Reviewers.Claude),
+		Gemini: snapshotReviewerPolicy(cfg.Reviewers.Gemini),
 		Escalation: model.AutoFixEscalationPolicy{
 			Enabled: cfg.Escalation.Enabled, Model: cfg.Escalation.Model, Effort: cfg.Escalation.Effort,
 			MaxTurns: clonePolicyInt(cfg.Escalation.MaxTurns), MaxBudgetUSD: clonePolicyFloat(cfg.Escalation.MaxBudgetUSD),
@@ -48,6 +49,7 @@ func SnapshotReviewerExecutionLimits(cfg Config) map[string]model.ReviewerExecut
 	return map[string]model.ReviewerExecutionLimit{
 		"codex":                    {Timeout: ordinaryTimeout},
 		"claude":                   {Timeout: ordinaryTimeout, MaxTurns: cfg.Reviewers.Claude.MaxTurns},
+		"gemini":                   {Timeout: ordinaryTimeout, MaxTurns: cfg.Reviewers.Gemini.MaxTurns},
 		"claude-security":          {Timeout: ordinaryTimeout, MaxTurns: escalationTurns},
 		"claude-escalation":        {Timeout: ordinaryTimeout, MaxTurns: escalationTurns},
 		"claude-cross-examination": {Timeout: model.NewDuration(cfg.CrossExamination.Timeout.Duration), MaxTurns: cfg.CrossExamination.MaxTurns},
@@ -73,6 +75,9 @@ func ApplyReviewPolicy(cfg Config, policy model.AutoFixReviewPolicy) (Config, er
 	cfg.PromptFile = policy.PromptFile
 	cfg.Reviewers.Codex = restorePolicyReviewer(policy.Codex)
 	cfg.Reviewers.Claude = restorePolicyReviewer(policy.Claude)
+	// Legacy snapshots omit Gemini, whose zero value must stay disabled even
+	// when the current configuration explicitly enables it.
+	cfg.Reviewers.Gemini = restorePolicyReviewer(policy.Gemini)
 	cfg.Escalation = Escalation{
 		Enabled: policy.Escalation.Enabled, Model: policy.Escalation.Model, Effort: policy.Escalation.Effort,
 		MaxTurns: clonePolicyInt(policy.Escalation.MaxTurns), MaxBudgetUSD: clonePolicyFloat(policy.Escalation.MaxBudgetUSD),

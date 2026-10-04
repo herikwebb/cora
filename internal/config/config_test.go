@@ -1,12 +1,15 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/herikwebb/cora/internal/model"
 )
 
 func TestApplyReviewPolicyRoundTripsEffectiveConfiguration(t *testing.T) {
@@ -16,6 +19,12 @@ func TestApplyReviewPolicyRoundTripsEffectiveConfiguration(t *testing.T) {
 	cfg.AllowUnsafeChecks = true
 	cfg.Escalation.ForceSecuritySensitive = true
 	cfg.Escalation.AdjudicateDisagreements = true
+	cfg.Reviewers.Gemini.Enabled = true
+	cfg.Reviewers.Gemini.Command = "/opt/tools/gemini"
+	cfg.Reviewers.Gemini.Model = "gemini-custom"
+	cfg.Reviewers.Gemini.MaxTurns = 35
+	cfg.Reviewers.Gemini.MaxConcurrency = 2
+	cfg.MinimumApprovals = 3
 	cfg.Checks = []Check{{
 		Name: "go-test", Command: []string{"go", "test", "./..."}, Timeout: Duration{Duration: 7 * time.Minute},
 		EnvAllowlist: []string{"GONOSUMDB"}, Profile: "go",
@@ -31,6 +40,123 @@ func TestApplyReviewPolicyRoundTripsEffectiveConfiguration(t *testing.T) {
 	}
 	if restored.ValidationProfiles != nil {
 		t.Fatalf("restored policy retained unexpanded profiles: %#v", restored.ValidationProfiles)
+	}
+}
+
+func TestApplyLegacyReviewPolicyKeepsGeminiDisabled(t *testing.T) {
+	policy := SnapshotReviewPolicy(Defaults())
+	encoded, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	delete(legacy, "gemini")
+	encoded, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restoredPolicy model.AutoFixReviewPolicy
+	if err := json.Unmarshal(encoded, &restoredPolicy); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Defaults()
+	cfg.Reviewers.Gemini.Enabled = true
+	cfg.MinimumApprovals = 3
+	restored, err := ApplyReviewPolicy(cfg, restoredPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Reviewers.Gemini.Enabled || restored.MinimumApprovals != 2 {
+		t.Fatalf("legacy policy changed its reviewer requirements: %#v", restored)
+	}
+	if got := SnapshotReviewPolicy(restored); !reflect.DeepEqual(got, restoredPolicy) {
+		t.Fatalf("legacy policy failed to round trip: got %#v, want %#v", got, restoredPolicy)
+	}
+}
+
+func TestSnapshotReviewerExecutionLimitsIncludesGemini(t *testing.T) {
+	cfg := Defaults()
+	cfg.Reviewers.Gemini.Enabled = true
+	cfg.Reviewers.Gemini.MaxTurns = 37
+	cfg.ReviewerTimeout = Duration{Duration: 8 * time.Minute}
+	limit := SnapshotReviewerExecutionLimits(cfg)["gemini"]
+	if limit.MaxTurns != 37 || limit.Timeout.Duration != 8*time.Minute {
+		t.Fatalf("Gemini execution limits = %#v", limit)
+	}
+}
+
+func TestGeminiDefaultsPreserveTwoReviewerConsensus(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Reviewers.Gemini.Enabled || !cfg.Reviewers.Codex.Enabled || !cfg.Reviewers.Claude.Enabled || cfg.MinimumApprovals != 2 {
+		t.Fatalf("default consensus changed: reviewers %#v, minimum approvals %d", cfg.Reviewers, cfg.MinimumApprovals)
+	}
+	want := Reviewer{Command: "gemini", Model: "gemini-2.5-pro", MaxTurns: 50, MaxConcurrency: 1}
+	if cfg.Reviewers.Gemini != want {
+		t.Fatalf("Gemini defaults = %#v, want %#v", cfg.Reviewers.Gemini, want)
+	}
+}
+
+func TestApplyRepositoryEnablesThreeReviewerConsensus(t *testing.T) {
+	cfg, err := ApplyRepository(Defaults(), ".cora/config.toml", []byte(`
+minimum_approvals = 3
+
+[reviewers.gemini]
+enabled = true
+model = "gemini-custom"
+max_turns = 40
+max_concurrency = 2
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Reviewers.Gemini.Enabled || cfg.Reviewers.Gemini.Command != "gemini" || cfg.Reviewers.Gemini.Model != "gemini-custom" || cfg.Reviewers.Gemini.MaxTurns != 40 || cfg.Reviewers.Gemini.MaxConcurrency != 2 || cfg.MinimumApprovals != 3 {
+		t.Fatalf("Gemini configuration not merged: %#v", cfg)
+	}
+}
+
+func TestValidateGeminiOnlyReviewer(t *testing.T) {
+	cfg := Defaults()
+	cfg.Reviewers.Codex.Enabled = false
+	cfg.Reviewers.Claude.Enabled = false
+	cfg.Reviewers.Gemini.Enabled = true
+	cfg.MinimumApprovals = 1
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Gemini-only consensus should be valid: %v", err)
+	}
+	cfg.MinimumApprovals = 2
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "the 1 enabled reviewers") {
+		t.Fatalf("Gemini-only minimum approvals error = %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidGeminiControls(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Reviewer)
+		field  string
+	}{
+		{"empty command", func(reviewer *Reviewer) { reviewer.Command = " " }, "command"},
+		{"empty model", func(reviewer *Reviewer) { reviewer.Model = " " }, "model"},
+		{"zero turns", func(reviewer *Reviewer) { reviewer.MaxTurns = 0 }, "max_turns"},
+		{"negative turns", func(reviewer *Reviewer) { reviewer.MaxTurns = -1 }, "max_turns"},
+		{"zero concurrency", func(reviewer *Reviewer) { reviewer.MaxConcurrency = 0 }, "max_concurrency"},
+		{"effort", func(reviewer *Reviewer) { reviewer.Effort = "high" }, "effort"},
+		{"finalization turns", func(reviewer *Reviewer) { reviewer.FinalizationTurns = 2 }, "finalization_turns"},
+		{"budget", func(reviewer *Reviewer) { reviewer.MaxBudgetUSD = 5 }, "max_budget_usd"},
+		{"negative budget", func(reviewer *Reviewer) { reviewer.MaxBudgetUSD = -1 }, "max_budget_usd"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Reviewers.Gemini.Enabled = true
+			test.mutate(&cfg.Reviewers.Gemini)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "reviewers.gemini."+test.field) {
+				t.Fatalf("Gemini %s validation error = %v", test.name, err)
+			}
+		})
 	}
 }
 

@@ -15,6 +15,9 @@ allow_review_web = false
 # Host checks can read the local filesystem and use the network. Leave this
 # false unless every reviewed change is trusted and the risk is understood.
 allow_unsafe_host_checks = false
+# Keep 2 for the default Codex + Claude consensus. To require all three, set
+# this to 3 and enable [reviewers.gemini] below. Every enabled reviewer must
+# complete, regardless of this approval threshold.
 minimum_approvals = 2
 blocking_severities = ["blocker", "major"]
 
@@ -37,6 +40,16 @@ finalization_turns = 2
 # Optional hard ceiling passed to Claude Code; 0 disables it.
 max_budget_usd = 0
 max_concurrency = 1
+
+# Optional third reviewer; requires Gemini CLI >= 0.46.0 and a cached Google
+# login. API-key use requires allow_api_billing; Vertex AI is unsupported.
+[reviewers.gemini]
+enabled = false
+command = "gemini"
+model = "gemini-2.5-pro"
+max_turns = 50
+max_concurrency = 1
+# effort, finalization_turns, and max_budget_usd are unsupported.
 
 # Security-sensitive changes add a focused pass with this Claude model while
 # retaining the ordinary Opus review. Targeted cross-examination and optional
