@@ -58,8 +58,11 @@ bundled with ChatGPT when `codex` is not on `PATH`. Claude requires first-party
 Claude.ai subscription authentication by default.
 
 For Codex and Claude, `effort` accepts `low`, `medium`, `high`, `xhigh`, or `max`.
-Codex also accepts `none` and `minimal`. An explicit default Codex model keeps
-selection and API-equivalent pricing reproducible when CLI defaults change.
+Codex also accepts `none`, `minimal`, and `ultra`. Ultra runs keep their session
+history so subagents can inherit the parent context; other efforts use ephemeral
+sessions. Sandbox and configuration isolation remain the same. An explicit
+default Codex model keeps selection and API-equivalent pricing reproducible when
+CLI defaults change.
 
 ### Enable Gemini
 

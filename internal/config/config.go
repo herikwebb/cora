@@ -522,6 +522,7 @@ func validateEffort(name, effort string, allowMinimal bool) error {
 	if allowMinimal {
 		allowed["minimal"] = true
 		allowed["none"] = true
+		allowed["ultra"] = true
 	}
 	if !allowed[effort] {
 		return fmt.Errorf("%s must be one of %s", name, effortChoices(allowMinimal))
@@ -531,7 +532,7 @@ func validateEffort(name, effort string, allowMinimal bool) error {
 
 func effortChoices(includeMinimal bool) string {
 	if includeMinimal {
-		return "none, minimal, low, medium, high, xhigh, or max"
+		return "none, minimal, low, medium, high, xhigh, max, or ultra"
 	}
 	return "low, medium, high, xhigh, or max"
 }

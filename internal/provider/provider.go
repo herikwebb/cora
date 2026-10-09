@@ -233,10 +233,13 @@ func codexReviewArgs(cfg config.Reviewer, request Request, rawPath string) []str
 		"--cd", request.WorkDir,
 		"--skip-git-repo-check",
 		"--ignore-rules",
-		"--ephemeral",
-		"--ignore-user-config",
-		"--config", "developer_instructions=" + strconv.Quote(request.Policy),
 	}
+	// Keep ultra parent sessions available for subagent context forks.
+	if cfg.Effort != "ultra" {
+		args = append(args, "--ephemeral")
+	}
+	args = append(args, "--ignore-user-config",
+		"--config", "developer_instructions="+strconv.Quote(request.Policy))
 	if request.RuntimeDir != "" {
 		args = append(args, "--add-dir", request.RuntimeDir)
 	}
@@ -365,9 +368,14 @@ func RunCodexFix(parent context.Context, cfg config.AutoFix, request FixRequest)
 func codexFixArgs(cfg config.AutoFix, request FixRequest, lastMessagePath string) []string {
 	args := []string{
 		"exec", "--sandbox", "workspace-write", "--cd", request.RepoRoot,
-		"--skip-git-repo-check", "--ignore-rules", "--ephemeral", "--ignore-user-config",
-		"--config", "developer_instructions=" + strconv.Quote(request.Policy),
+		"--skip-git-repo-check", "--ignore-rules",
 	}
+	// Keep ultra parent sessions available for subagent context forks.
+	if cfg.Effort != "ultra" {
+		args = append(args, "--ephemeral")
+	}
+	args = append(args, "--ignore-user-config",
+		"--config", "developer_instructions="+strconv.Quote(request.Policy))
 	if cfg.Model != "" {
 		args = append(args, "--model", cfg.Model)
 	}
