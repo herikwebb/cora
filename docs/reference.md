@@ -64,6 +64,20 @@ sessions. Sandbox and configuration isolation remain the same. An explicit
 default Codex model keeps selection and API-equivalent pricing reproducible when
 CLI defaults change.
 
+### Claude ultracode
+
+Set `reviewers.claude.effort = "ultracode"` to enable Claude Code's built-in
+workflow and subagent orchestration at `xhigh` effort. `escalation.effort` also
+accepts `ultracode` for focused security reviews, adjudication, and blocking-finding
+cross-examination. This requires
+Claude Code **2.1.205 or later** so delegated reviewers receive CORA's review
+policy. The default remains `high`.
+
+CORA enables workflows for these runs, including on Pro plans, while Claude
+Code's model and organization restrictions still apply. See Claude Code's
+[effort levels](https://code.claude.com/docs/en/model-config#adjust-effort-level)
+and [workflows](https://code.claude.com/docs/en/workflows) documentation.
+
 ### Enable Gemini
 
 Gemini requires Gemini CLI **0.46.0 or later** and a cached Google login from
@@ -205,6 +219,11 @@ CORA caps tool-enabled inspection at `max_turns - finalization_turns`. If that
 boundary is reached, a second, tools-disabled process receives the reserved
 turns and the best persisted inspection evidence.
 
+For ultracode reviews, `max_turns` limits the parent conversation; it does not
+cap the combined turns of its subagents. The reviewer timeout and optional
+`max_budget_usd` cost ceiling still apply. The finalizer uses `xhigh` effort
+with workflows and all tools disabled.
+
 The finalizer can serialize the evidence into the required schema. It cannot
 change the verdict, context status, findings, reviewed or omitted paths, or
 residual risks. With a cost ceiling, it receives only the known remaining
@@ -223,6 +242,11 @@ Codex ignores user CLI configuration and runs in a network-disabled
 `workspace-write` sandbox around its disposable clone. Claude uses safe mode
 and a strict Bash sandbox: networking, unsandboxed fallback, and source-editing
 tools are unavailable. Sandbox startup failure ends the review.
+
+Claude normally receives `Read`, `Glob`, `Grep`, and `Bash`. Ultracode also
+receives `Agent`, `Workflow`, and `TaskStop` for orchestration. The same sandbox
+and network restrictions apply. Conversation transcript persistence remains
+disabled; Claude Code can still store workflow scripts and execution records.
 
 Codex and Claude may run focused local tests. Each gets private temporary/cache
 directories for tools such as Go and Vitest. Only the parent CORA process may
@@ -356,6 +380,9 @@ Reviewer processes run in parallel and are killed as process groups at their
 deadlines. A user-global FIFO queue shares provider capacity across CORA
 processes and repositories. Configure `max_concurrency` per reviewer for the
 available subscription capacity.
+
+For Claude ultracode, this caps CORA's Claude processes; it does not limit the
+subagents started within each workflow.
 
 `cora status --active` shows queue positions, counts ahead, and best-effort ETAs
 from recent executions. The initial estimate is stored as an absolute deadline,

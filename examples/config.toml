@@ -32,13 +32,17 @@ max_concurrency = 2
 enabled = true
 command = "claude"
 model = "opus"
+# Use "ultracode" for xhigh effort with workflow/subagent orchestration;
+# requires Claude Code >= 2.1.205. Sandbox and network restrictions still apply.
 effort = "high"
+# With ultracode, this limits parent turns, not combined subagent turns.
 max_turns = 50
 # Tool-enabled inspection is capped at max_turns-finalization_turns; the
 # reserve is available only to a separate tools-disabled finalizer.
 finalization_turns = 2
 # Optional hard ceiling passed to Claude Code; 0 disables it.
 max_budget_usd = 0
+# Caps CORA's Claude processes, not ultracode's internal subagents.
 max_concurrency = 1
 
 # Optional third reviewer; requires Gemini CLI >= 0.46.0 and a cached Google
@@ -57,6 +61,7 @@ max_concurrency = 1
 [escalation]
 enabled = true
 model = "fable"
+# Also accepts "ultracode" with the same CLI requirement as above.
 effort = "high"
 # Optional per-escalation overrides. Omit either value to inherit it from
 # [reviewers.claude]. Set max_budget_usd to 0 to disable the inherited ceiling.

@@ -514,27 +514,29 @@ func ApplyProfiles(cfg Config, names []string) (Config, error) {
 	return finalize(cfg)
 }
 
-func validateEffort(name, effort string, allowMinimal bool) error {
+func validateEffort(name, effort string, forCodex bool) error {
 	if effort == "" {
 		return nil
 	}
 	allowed := map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
-	if allowMinimal {
+	if forCodex {
 		allowed["minimal"] = true
 		allowed["none"] = true
 		allowed["ultra"] = true
+	} else {
+		allowed["ultracode"] = true
 	}
 	if !allowed[effort] {
-		return fmt.Errorf("%s must be one of %s", name, effortChoices(allowMinimal))
+		return fmt.Errorf("%s must be one of %s", name, effortChoices(forCodex))
 	}
 	return nil
 }
 
-func effortChoices(includeMinimal bool) string {
-	if includeMinimal {
+func effortChoices(forCodex bool) string {
+	if forCodex {
 		return "none, minimal, low, medium, high, xhigh, max, or ultra"
 	}
-	return "low, medium, high, xhigh, or max"
+	return "low, medium, high, xhigh, max, or ultracode"
 }
 
 func validEnvironmentName(name string) bool {

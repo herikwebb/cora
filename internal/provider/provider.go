@@ -400,7 +400,7 @@ type Claude struct {
 	EscalationCause string
 }
 
-func claudeReviewerSandboxSettings(runtimeDir, recoveryDir string) string {
+func claudeReviewerSandboxSettings(runtimeDir, recoveryDir string, ultracode bool) string {
 	filesystem := map[string]any{}
 	var writable []string
 	if runtimeDir != "" {
@@ -421,6 +421,11 @@ func claudeReviewerSandboxSettings(runtimeDir, recoveryDir string) string {
 				"allowedDomains": []string{}, "deniedDomains": []string{"*"}, "strictAllowlist": true,
 			},
 		},
+	}
+	if ultracode {
+		// Opt in for plans where workflows are off by default. Managed policy
+		// can still disable workflows; this does not override that restriction.
+		settings["enableWorkflows"] = true
 	}
 	encoded, _ := json.Marshal(settings)
 	return string(encoded)
@@ -452,9 +457,14 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	}
 	result.Tool = path
 	versionCtx, cancelVersion := context.WithTimeout(parent, 10*time.Second)
-	version, _, _ := processx.Capture(versionCtx, path, request.WorkDir, env, "--version")
+	version, _, versionResult := processx.Capture(versionCtx, path, request.WorkDir, env, "--version")
 	cancelVersion()
 	result.ToolVersion = strings.TrimSpace(string(version))
+	if c.Config.Effort == "ultracode" && (versionResult.Err != nil || !supportsClaudeUltracode(result.ToolVersion)) {
+		result.Error = "Claude ultracode requires Claude Code >= 2.1.205; run claude update"
+		result.Duration = model.NewDuration(time.Since(started))
+		return result
+	}
 
 	authCtx, cancelAuth := context.WithTimeout(parent, 15*time.Second)
 	authOut, authErrOut, authResult := processx.Capture(authCtx, path, request.WorkDir, env, "auth", "status")
@@ -504,7 +514,7 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 		return result
 	}
 	inspectionTurns := c.Config.MaxTurns - c.Config.FinalizationTurns
-	args := claudeReviewArgs(c.Config, request, compactSchema, effectivePrompt, inspectionTurns, "Read,Glob,Grep,Bash")
+	args := claudeReviewArgs(c.Config, request, compactSchema, effectivePrompt, inspectionTurns, claudeInspectionTools(c.Config.Effort))
 
 	rawPath := filepath.Join(request.RunDir, fileStem(c.Name())+".raw.json")
 	stderrPath := filepath.Join(request.RunDir, fileStem(c.Name())+".stderr.log")
@@ -601,13 +611,43 @@ func (c Claude) Review(parent context.Context, request Request) model.ReviewerRe
 	return result
 }
 
+var claudeVersionPattern = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)(?: \(Claude Code\))?$`)
+
+func supportsClaudeUltracode(version string) bool {
+	parts := claudeVersionPattern.FindStringSubmatch(strings.TrimSpace(version))
+	if len(parts) != 4 {
+		return false
+	}
+	// 2.1.205 adds the subagent policy flag needed for delegated reviews.
+	minimum := []int{2, 1, 205}
+	for i, want := range minimum {
+		got, err := strconv.Atoi(parts[i+1])
+		if err != nil {
+			return false
+		}
+		if got != want {
+			return got > want
+		}
+	}
+	return true
+}
+
+func claudeInspectionTools(effort string) string {
+	const tools = "Read,Glob,Grep,Bash"
+	if effort == "ultracode" {
+		return tools + ",Agent,Workflow,TaskStop"
+	}
+	return tools
+}
+
 func claudeReviewArgs(cfg config.Reviewer, request Request, schema []byte, _ string, maxTurns int, tools string) []string {
+	ultracode := cfg.Effort == "ultracode" && tools != ""
 	args := []string{
 		"-p",
 		"--safe-mode",
 		"--permission-mode", "dontAsk",
 		"--tools", tools,
-		"--settings", claudeReviewerSandboxSettings(request.RuntimeDir, request.RecoveryDir),
+		"--settings", claudeReviewerSandboxSettings(request.RuntimeDir, request.RecoveryDir, ultracode),
 		"--append-system-prompt", request.Policy,
 		"--max-turns", strconv.Itoa(maxTurns),
 		"--no-session-persistence",
@@ -621,7 +661,19 @@ func claudeReviewArgs(cfg config.Reviewer, request Request, schema []byte, _ str
 		args = append(args, "--model", cfg.Model)
 	}
 	if cfg.Effort != "" {
-		args = append(args, "--effort", cfg.Effort)
+		effort := cfg.Effort
+		if effort == "ultracode" {
+			if tools == "" {
+				// Finalization only serializes existing evidence. Keep ultracode's
+				// reasoning level without starting another workflow.
+				effort = "xhigh"
+			} else {
+				// Exposing Workflow does not authorize it in dontAsk mode.
+				args = append(args, "--allowedTools", "Workflow",
+					"--append-subagent-system-prompt", request.Policy)
+			}
+		}
+		args = append(args, "--effort", effort)
 	}
 	return args
 }

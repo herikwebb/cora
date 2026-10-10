@@ -104,7 +104,7 @@ func TestClaudeReviewerSettingsRequireStrictSandbox(t *testing.T) {
 			} `json:"network"`
 		} `json:"sandbox"`
 	}
-	if err := json.Unmarshal([]byte(claudeReviewerSandboxSettings("/tmp/cora-runtime", "/tmp/cora-recovery")), &settings); err != nil {
+	if err := json.Unmarshal([]byte(claudeReviewerSandboxSettings("/tmp/cora-runtime", "/tmp/cora-recovery", false)), &settings); err != nil {
 		t.Fatal(err)
 	}
 	if !settings.Sandbox.Enabled || !settings.Sandbox.FailIfUnavailable || !settings.Sandbox.AutoAllowBashIfSandboxed || settings.Sandbox.AllowUnsandboxedCommands {
